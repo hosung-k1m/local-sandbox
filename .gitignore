@@ -1,0 +1,36 @@
+# Build outputs
+/build/
+/dist/
+
+# Go
+*.test
+*.out
+*.prof
+/coverage.txt
+/coverage.html
+
+# Editor/OS cruft
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Local env / secrets — should never be committed
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*credentials*.json
+*secret*
+auth.json
+config.json
+
+# Local runtime state (BoxedAi state root normally lives at ~/.boxedai,
+# but ignore it here too in case BOXEDAI_HOME is pointed at the repo)
+.boxedai/
+
+# Logs and traces
+*.log
+*.jsonl
+/traces/

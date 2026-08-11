@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BoxedAi evidence dashboard</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; background: #0f1115; color: #d7dde3; margin: 0; }
+  header { padding: 1rem 1.25rem; border-bottom: 1px solid #2a2f3a; display: flex; justify-content: space-between; align-items: baseline; }
+  h1 { font-size: 1.05rem; margin: 0; font-weight: 600; }
+  main { display: grid; grid-template-columns: minmax(20rem, 28rem) 1fr; min-height: calc(100vh - 3.3rem); }
+  aside { border-right: 1px solid #2a2f3a; overflow: auto; }
+  section { padding: 1rem 1.25rem; overflow: auto; }
+  button.session { width: 100%; text-align: left; background: transparent; color: inherit; border: 0; border-bottom: 1px solid #232833; padding: 0.7rem 0.85rem; font: inherit; cursor: pointer; }
+  button.session:hover, button.session.selected { background: #171a21; }
+  .row { display: flex; gap: 0.6rem; align-items: center; justify-content: space-between; }
+  .muted, .attrs { color: #838ea3; }
+  .small { font-size: 0.78rem; }
+  .pill { display: inline-block; padding: 0.06rem 0.42rem; border-radius: 4px; background: #232833; color: #a9c6ff; font-weight: 700; font-size: 0.72rem; }
+  .running, .LOCAL_ONLY, .sealed { color: #7ee2a8; }
+  .provisional, .INCOMPLETE, .sealed_unverified { color: #e2c97e; }
+  .TAMPER_SUSPECTED, .BYPASS_DETECTED, .unavailable { color: #e27e7e; }
+  h2 { font-size: 0.95rem; margin: 1.4rem 0 0.45rem; border-bottom: 1px solid #2a2f3a; padding-bottom: 0.25rem; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.82rem; }
+  th, td { text-align: left; padding: 0.3rem 0.5rem; border-bottom: 1px solid #232833; vertical-align: top; }
+  th { color: #838ea3; font-size: 0.72rem; text-transform: uppercase; }
+  pre { background: #171a21; border: 1px solid #2a2f3a; border-radius: 6px; padding: 0.75rem; overflow-x: auto; }
+  .empty { color: #5a6272; font-style: italic; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } aside { border-right: 0; border-bottom: 1px solid #2a2f3a; max-height: 40vh; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>BoxedAi evidence dashboard</h1>
+  <div id="status" class="muted small">Loading...</div>
+</header>
+<main>
+  <aside id="sessions"></aside>
+  <section>
+    <div id="detail" class="empty">Select a session.</div>
+  </section>
+</main>
+<script>
+let selected = "";
+let sessions = [];
+let selectedData = null;
+
+function esc(v) {
+  return String(v ?? "").replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+}
+
+function fmtAttrs(attrs) {
+  const hidden = new Set([
+    "audit.schema.version", "audit.event.id", "audit.sequence", "audit.session.id",
+    "audit.evidence.class", "audit.producer", "audit.monotonic_ns", "audit.policy.digest",
+    "audit.outcome", "audit.action.id", "audit.parent_action.id", "vm.id",
+  ]);
+  return Object.keys(attrs || {}).filter(k => !hidden.has(k)).sort().map(k => `${k}=${attrs[k]}`).join(" ");
+}
+
+function renderSessions() {
+  const box = document.getElementById("sessions");
+  if (!sessions.length) {
+    box.innerHTML = `<div class="empty" style="padding:1rem;">No sessions recorded.</div>`;
+    return;
+  }
+  box.innerHTML = sessions.map(s => `
+    <button class="session ${s.session_id === selected ? "selected" : ""}" data-id="${esc(s.session_id)}">
+      <div class="row"><strong>${esc(s.session_id)}</strong><span class="${esc(s.state)}">${esc(s.state)}</span></div>
+      <div class="small muted">${esc(s.harness || "-")} ${esc(s.profile || "")} · ${s.event_count} events · seq ${s.last_event_seq || 0}</div>
+      <div class="small ${esc(s.proof.status)}">${esc(s.proof.status)}${s.proof.verdict ? " · " + esc(s.proof.verdict) : ""}</div>
+    </button>`).join("");
+  for (const btn of box.querySelectorAll("button.session")) {
+    btn.addEventListener("click", () => selectSession(btn.dataset.id));
+  }
+}
+
+function proofHTML(proof) {
+  const checks = (proof.checks || []).map(c => `<tr><td>${esc(c.name)}</td><td>${c.passed ? "PASS" : "FAIL"}</td><td>${esc(c.detail || "")}</td></tr>`).join("");
+  const segmentDigest = s => s.otlp_digest ? `recomputed ${s.otlp_digest}` : (s.declared_segment_digest ? `declared ${s.declared_segment_digest}` : "");
+  const chainText = proof.verdict ? `chain valid: ${proof.chain_valid}` : "chain not checked in summary";
+  const segments = (proof.segments || []).map(s => `<tr><td>${s.number}</td><td>${s.sealed}</td><td>${esc(segmentDigest(s))}</td><td>${esc(s.prev_segment_digest)}</td><td>${s.cose_sign1}</td><td>${s.first_sequence || ""}-${s.last_sequence || ""}</td></tr>`).join("");
+  return `
+    <h2>Cryptographic Proof</h2>
+    <table>
+      <tr><th>Status</th><td class="${esc(proof.status)}">${esc(proof.status)}${proof.provisional ? " (unsealed/live evidence is provisional)" : ""}</td></tr>
+      <tr><th>Message</th><td>${esc(proof.message)}</td></tr>
+      <tr><th>Digest / chain</th><td>${esc(proof.digest_algorithm)}; ${esc(chainText)}</td></tr>
+      <tr><th>Signature</th><td>${esc(proof.signature_format)}; ${esc(proof.signature_algorithm)}</td></tr>
+      <tr><th>Recorder fingerprint</th><td>${esc(proof.recorder_key_fingerprint || "")}</td></tr>
+      <tr><th>Verifier verdict</th><td class="${esc(proof.verdict)}">${esc(proof.verdict || "")}</td></tr>
+    </table>
+    <h2>Verifier Checks</h2>
+    <table><thead><tr><th>Check</th><th>Result</th><th>Detail</th></tr></thead><tbody>${checks || `<tr><td colspan="3" class="empty">No verifier checks available.</td></tr>`}</tbody></table>
+    <h2>Segments</h2>
+    <table><thead><tr><th>#</th><th>Sealed</th><th>Segment digest</th><th>Previous declared digest</th><th>COSE Sign1</th><th>Seq</th></tr></thead><tbody>${segments || `<tr><td colspan="6" class="empty">No segments.</td></tr>`}</tbody></table>`;
+}
+
+function timelineHTML(data) {
+  const rows = (data.events || []).map(ev => {
+    const details = [ev.body, fmtAttrs(ev.attrs)].filter(Boolean).join(" · ");
+    return `<tr><td>${ev.seq}</td><td>${esc(ev.ts)}</td><td><span class="pill">${esc(ev.badge)}</span> ${esc(ev.class)}</td><td>${esc(ev.name)}</td><td>${esc(ev.producer)}</td><td>${esc(ev.action_id || "")}</td><td>${esc(ev.parent_action_id || "")}</td><td>${esc(ev.outcome || "")}</td><td class="attrs">${esc(details)}</td></tr>`;
+  }).join("");
+  return `<h2>Timeline</h2><table><thead><tr><th>Seq</th><th>Time</th><th>Class</th><th>Event</th><th>Producer</th><th>Action</th><th>Parent</th><th>Outcome</th><th>Body and attrs</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+
+function renderDetail() {
+  const detail = document.getElementById("detail");
+  if (!selectedData) {
+    detail.innerHTML = `<span class="empty">Select a session.</span>`;
+    return;
+  }
+  detail.className = "";
+  detail.innerHTML = `
+    <div class="row"><h1>${esc(selectedData.session_id || selected)}</h1><span>${selectedData.events.length} events</span></div>
+    <div class="small muted">Policy digest: ${esc(selectedData.policy_digest || "")}</div>
+    ${proofHTML(selectedData.proof)}
+    <h2>Process Tree</h2><pre>${esc(selectedData.process_tree || "No process.executed events.")}</pre>
+    ${timelineHTML(selectedData)}`;
+}
+
+function selectSession(id) {
+  selected = id;
+  renderSessions();
+  fetch(`/api/session?id=${encodeURIComponent(id)}`).then(r => r.json()).then(data => {
+    selectedData = data;
+    renderDetail();
+  });
+}
+
+function refreshSessions() {
+  fetch("/api/sessions").then(r => r.json()).then(data => {
+    sessions = data.sessions || [];
+    document.getElementById("status").textContent = `Updated ${new Date().toLocaleTimeString()}`;
+    if (!selected && sessions.length) selected = sessions[0].session_id;
+    renderSessions();
+    if (selected) selectSession(selected);
+  });
+}
+
+refreshSessions();
+setInterval(refreshSessions, 2500);
+</script>
+</body>
+</html>

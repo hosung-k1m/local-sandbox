@@ -1,0 +1,164 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>BoxedAi session viewer</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: ui-monospace, Menlo, Consolas, monospace; background: #0f1115; color: #d7dde3; margin: 0; padding: 1.5rem; }
+  h1, h2 { font-weight: 600; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+  h2 { font-size: 0.95rem; margin: 1.75rem 0 0.5rem; border-bottom: 1px solid #2a2f3a; padding-bottom: 0.25rem; }
+  .overview { display: flex; flex-wrap: wrap; gap: 1.5rem; padding: 0.75rem 1rem; background: #171a21; border: 1px solid #2a2f3a; border-radius: 6px; }
+  .overview div { min-width: 10rem; }
+  .overview .label { color: #838ea3; font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .overview .value { font-size: 0.95rem; }
+  .verdict { font-weight: 700; padding: 0.1rem 0.5rem; border-radius: 4px; }
+  .verdict-LOCAL_ONLY { background: #1e3a2f; color: #7ee2a8; }
+  .verdict-INCOMPLETE { background: #3a341e; color: #e2c97e; }
+  .verdict-BYPASS_DETECTED, .verdict-TAMPER_SUSPECTED { background: #3a1e1e; color: #e27e7e; }
+  .verdict-VERIFIED { background: #1e2f3a; color: #7ecbe2; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; }
+  th, td { text-align: left; padding: 0.3rem 0.6rem; border-bottom: 1px solid #232833; vertical-align: top; }
+  th { color: #838ea3; font-weight: 600; font-size: 0.75rem; text-transform: uppercase; }
+  .badge { display: inline-block; padding: 0.05rem 0.4rem; border-radius: 4px; font-size: 0.72rem; font-weight: 700; background: #232833; color: #a9c6ff; }
+  .badge-KERNEL { color: #7ee2a8; }
+  .badge-BROKER { color: #e2c97e; }
+  .badge-SELF { color: #e29ee2; }
+  .badge-HARNESS { color: #7ecbe2; }
+  .badge-TARGET { color: #e2a17e; }
+  .badge-INTEG { color: #e27e7e; }
+  .outcome-denied, .outcome-failure { color: #e27e7e; }
+  .outcome-success { color: #7ee2a8; }
+  .attrs { color: #838ea3; font-size: 0.78rem; }
+  pre { background: #171a21; border: 1px solid #2a2f3a; border-radius: 6px; padding: 0.75rem 1rem; overflow-x: auto; font-size: 0.85rem; }
+  .empty { color: #5a6272; font-style: italic; }
+  #filters { margin: 0.75rem 0; display: flex; gap: 0.5rem; }
+  #filters input { background: #171a21; border: 1px solid #2a2f3a; color: #d7dde3; padding: 0.3rem 0.5rem; border-radius: 4px; font-family: inherit; }
+</style>
+</head>
+<body>
+  <h1>BoxedAi session viewer</h1>
+  <div class="overview" id="overview">Loading...</div>
+
+  <h2>Verify verdict</h2>
+  <div id="verify"></div>
+
+  <h2>Timeline</h2>
+  <div id="filters">
+    <input id="filter-name" placeholder="filter: event name">
+    <input id="filter-class" placeholder="filter: evidence class">
+  </div>
+  <table id="timeline">
+    <thead><tr><th>Seq</th><th>Time</th><th>Class</th><th>Event</th><th>Outcome</th><th>Details</th></tr></thead>
+    <tbody></tbody>
+  </table>
+
+  <h2>Process tree</h2>
+  <pre id="process-tree" class="empty">No process.executed events.</pre>
+
+  <h2>File changes</h2>
+  <table id="file-changes"><thead><tr><th>Seq</th><th>Time</th><th>Class</th><th>Event</th><th>Attrs</th></tr></thead><tbody></tbody></table>
+
+  <h2>Network attempts</h2>
+  <table id="network"><thead><tr><th>Seq</th><th>Time</th><th>Class</th><th>Event</th><th>Attrs</th></tr></thead><tbody></tbody></table>
+
+  <h2>Internal tool calls</h2>
+  <table id="tools"><thead><tr><th>Seq</th><th>Time</th><th>Class</th><th>Event</th><th>Outcome</th><th>Attrs</th></tr></thead><tbody></tbody></table>
+
+<script>
+const FILE_EVENTS = new Set(["file.changed", "file.deleted"]);
+const NETWORK_EVENTS = new Set(["network.connected", "network.denied"]);
+const TOOL_EVENTS = new Set(["internal_tool.dispatched", "internal_tool.completed", "internal_tool.failed"]);
+
+function fmtAttrs(attrs) {
+  const hidden = new Set([
+    "audit.schema.version", "audit.event.id", "audit.sequence", "audit.session.id",
+    "audit.evidence.class", "audit.producer", "audit.monotonic_ns", "audit.policy.digest",
+    "audit.outcome", "audit.action.id", "audit.parent_action.id", "vm.id",
+  ]);
+  const parts = Object.keys(attrs || {}).filter(k => !hidden.has(k)).sort().map(k => `${k}=${attrs[k]}`);
+  return parts.join(" ");
+}
+
+function fmtDetails(ev) {
+  const attrs = fmtAttrs(ev.attrs);
+  if (ev.body && attrs) return `${ev.body} · ${attrs}`;
+  return ev.body || attrs || "-";
+}
+
+function rowHTML(ev, cols) {
+  const cells = {
+    seq: ev.seq,
+    ts: ev.ts,
+    class: `<span class="badge badge-${ev.badge}">${ev.badge}</span> <span class="attrs">${ev.class}</span>`,
+    name: ev.name,
+    outcome: `<span class="outcome-${ev.outcome || ''}">${ev.outcome || '-'}</span>`,
+    attrs: `<span class="attrs">${fmtDetails(ev)}</span>`,
+  };
+  return "<tr>" + cols.map(c => `<td>${cells[c]}</td>`).join("") + "</tr>";
+}
+
+function render(data) {
+  const overview = document.getElementById("overview");
+  overview.innerHTML = `
+    <div><div class="label">Session</div><div class="value">${data.session_id || "(unknown)"}</div></div>
+    <div><div class="label">Policy digest</div><div class="value">${data.policy_digest || "(unknown)"}</div></div>
+  `;
+
+  const verifyDiv = document.getElementById("verify");
+  if (data.verify_error) {
+    verifyDiv.innerHTML = `<span class="empty">verify failed: ${data.verify_error}</span>`;
+  } else if (data.verify) {
+    const v = data.verify;
+    verifyDiv.innerHTML = `
+      <span class="verdict verdict-${v.verdict}">${v.verdict}</span>
+      <table>
+        <tr><th>cryptography</th><td>${v.facets.digest_algorithm}; ${v.facets.signature_format}; ${v.facets.signature_algorithm}</td></tr>
+        <tr><th>recorder key fingerprint</th><td>${v.facets.recorder_key_fingerprint}</td></tr>
+        <tr><th>COSE signatures valid</th><td>${v.facets.signature_valid}</td></tr>
+        <tr><th>SHA-256 chain valid</th><td>${v.facets.chain_valid}</td></tr>
+        <tr><th>sequence continuous</th><td>${v.facets.sequence_continuous}</td></tr>
+        <tr><th>close status</th><td>${v.facets.close_status}</td></tr>
+        <tr><th>sensor loss count</th><td>${v.facets.sensor_loss_count}</td></tr>
+        <tr><th>ungated activity count</th><td>${v.facets.ungated_activity_count}</td></tr>
+      </table>`;
+  } else {
+    verifyDiv.innerHTML = `<span class="empty">no verdict available</span>`;
+  }
+
+  document.getElementById("process-tree").textContent = data.process_tree || "No process.executed events.";
+  document.getElementById("process-tree").classList.toggle("empty", !data.process_tree);
+
+  const nameFilter = document.getElementById("filter-name").value.trim();
+  const classFilter = document.getElementById("filter-class").value.trim();
+
+  const timelineBody = document.querySelector("#timeline tbody");
+  const fileBody = document.querySelector("#file-changes tbody");
+  const netBody = document.querySelector("#network tbody");
+  const toolBody = document.querySelector("#tools tbody");
+  timelineBody.innerHTML = "";
+  fileBody.innerHTML = "";
+  netBody.innerHTML = "";
+  toolBody.innerHTML = "";
+
+  for (const ev of data.events || []) {
+    if (nameFilter && ev.name !== nameFilter) continue;
+    if (classFilter && ev.class !== classFilter) continue;
+    timelineBody.insertAdjacentHTML("beforeend", rowHTML(ev, ["seq", "ts", "class", "name", "outcome", "attrs"]));
+    if (FILE_EVENTS.has(ev.name)) fileBody.insertAdjacentHTML("beforeend", rowHTML(ev, ["seq", "ts", "class", "name", "attrs"]));
+    if (NETWORK_EVENTS.has(ev.name)) netBody.insertAdjacentHTML("beforeend", rowHTML(ev, ["seq", "ts", "class", "name", "attrs"]));
+    if (TOOL_EVENTS.has(ev.name)) toolBody.insertAdjacentHTML("beforeend", rowHTML(ev, ["seq", "ts", "class", "name", "outcome", "attrs"]));
+  }
+}
+
+let lastData = null;
+function refresh() {
+  fetch("/api/events").then(r => r.json()).then(data => { lastData = data; render(data); });
+}
+document.getElementById("filter-name").addEventListener("input", () => lastData && render(lastData));
+document.getElementById("filter-class").addEventListener("input", () => lastData && render(lastData));
+refresh();
+</script>
+</body>
+</html>
