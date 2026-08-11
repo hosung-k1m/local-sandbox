@@ -74,14 +74,16 @@ fi
 var stepBakeRuntimeDepsTmpl = template.Must(template.New("bake-step-runtime").Parse(`#!/bin/sh
 set -eu
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y
-apt-get install -y --no-install-recommends ca-certificates curl gnupg git
+mkdir -p /etc/boxedai
 {{if .HasExtraCA}}
 cat > /usr/local/share/ca-certificates/boxedai-extra-ca.crt <<'BOXEDAI_CA_EOF'
 {{.ExtraCAPEM}}
 BOXEDAI_CA_EOF
 update-ca-certificates
+test -L /etc/ssl/certs/boxedai-extra-ca.pem
 {{end}}
+apt-get update -y
+apt-get install -y --no-install-recommends ca-certificates curl gnupg git
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -
 apt-get install -y --no-install-recommends nodejs
 {{if .HasExtraCA}}
@@ -97,6 +99,7 @@ export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/boxedai-extra-ca.crt
 # gateways as a dependency-confusion policy; point it at an internal mirror
 # instead, same rationale as the CA injection above.
 npm config set registry {{.NPMRegistry}}
+printf '%s\n' '{{.NPMRegistry}}' > /etc/boxedai/expected-npm-registry
 {{end}}
 npm install -g @anthropic-ai/claude-code @openai/codex
 # Some npm mirrors leave Claude Code's generated wrapper unusable even though

@@ -30,12 +30,34 @@ make        # builds dist/boxedai and the cross-compiled guest agent
 make test   # runs the full test suite
 ```
 
+On a fresh Block workstation, configure and build everything needed for sandbox
+sessions with one command:
+
+```
+dist/boxedai setup
+```
+
+`setup` checks the macOS host, pinned Lima tool, required host commands, network and
+disk readiness, and the Cloudflare Gateway CA in the macOS keychains. It preserves
+existing `config.json` fields while writing the CA and Block npm registry at mode 0600,
+then builds and verifies the golden image. Re-running it is idempotent and skips an
+already-valid image built with the same corporate configuration. If WARP, a command,
+network access, or disk space needs user action, setup reports the exact gate instead
+of starting a partial build. `dist/boxedai doctor` performs the corresponding
+read-only readiness check.
+
+For integrations, `setup --json` emits `boxedai.setup/v1` NDJSON stage events and one
+final result; `doctor --json` emits one result. Exit code 0 means ready, 2 means user
+action is required, and 1 means setup failed. Machine-readable stdout never includes
+the CA PEM or credentials; image provisioning logs go to stderr.
+
 `make guest` cross-compiles the Linux guest supervisor for both arm64 and amd64 into
 `dist/guest/`; `boxedai run` serves the matching binary to the VM over the broker.
 
 ## Run
 
-Before the first `run` (and again after upgrading BoxedAi), build the golden VM image:
+`setup` builds the golden VM image on first use and rebuilds it when its corporate
+inputs are stale. To force a direct image rebuild without the host preflight, use:
 
 ```
 dist/boxedai build-image                              # bakes Node, Claude Code, Codex,

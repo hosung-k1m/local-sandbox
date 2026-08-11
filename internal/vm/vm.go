@@ -73,9 +73,9 @@ type limactlRunFunc func(context.Context, io.Writer, io.Writer, ...string) error
 // Lima's own readiness wait, then independently checks the boot-complete
 // marker using plain limactl shell commands. Lima's internal readiness SSH
 // command can hang even when these ordinary shell commands work.
-func startAndWaitForBoot(ctx context.Context, name string, bootTimeout time.Duration, run limactlRunFunc) error {
+func startAndWaitForBoot(ctx context.Context, name string, bootTimeout time.Duration, run limactlRunFunc, stdout, stderr io.Writer) error {
 	startCtx, cancelStart := context.WithTimeout(ctx, limaStartCommandTimeout)
-	startErr := run(startCtx, os.Stdout, os.Stderr, "start", "--timeout="+limaStartTimeout.String(), name)
+	startErr := run(startCtx, stdout, stderr, "start", "--timeout="+limaStartTimeout.String(), name)
 	cancelStart()
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -139,7 +139,7 @@ func (vm *VM) Start(ctx context.Context) error {
 	if err := vm.run(ctx, os.Stdout, os.Stderr, limaCreateArgs(vm.Cfg.SessionID, yamlPath)...); err != nil {
 		return fmt.Errorf("vm: limactl create: %w", err)
 	}
-	if err := startAndWaitForBoot(ctx, vm.Cfg.SessionID, sessionBootTimeout, vm.run); err != nil {
+	if err := startAndWaitForBoot(ctx, vm.Cfg.SessionID, sessionBootTimeout, vm.run, os.Stdout, os.Stderr); err != nil {
 		return fmt.Errorf("vm: start instance %s: %w", vm.Cfg.SessionID, err)
 	}
 	return nil
@@ -220,6 +220,10 @@ type BakeVM struct {
 	// Binary is the path to the limactl executable; defaults to
 	// "./bin/limactl" when empty.
 	Binary string
+	// Stdout and Stderr receive Lima lifecycle/provisioning output. Nil means
+	// the corresponding process stream is discarded.
+	Stdout io.Writer
+	Stderr io.Writer
 }
 
 func (b *BakeVM) binary() string {
@@ -237,10 +241,10 @@ func (b *BakeVM) run(ctx context.Context, stdout, stderr io.Writer, args ...stri
 // progress straight to the caller, then independently checking Lima's
 // boot-complete marker.
 func (b *BakeVM) Start(ctx context.Context) error {
-	if err := b.run(ctx, os.Stdout, os.Stderr, limaCreateArgs(b.Name, b.LimaYAMLPath)...); err != nil {
+	if err := b.run(ctx, b.Stdout, b.Stderr, limaCreateArgs(b.Name, b.LimaYAMLPath)...); err != nil {
 		return fmt.Errorf("vm: limactl create: %w", err)
 	}
-	if err := startAndWaitForBoot(ctx, b.Name, bakeBootTimeout, b.run); err != nil {
+	if err := startAndWaitForBoot(ctx, b.Name, bakeBootTimeout, b.run, b.Stdout, b.Stderr); err != nil {
 		return fmt.Errorf("vm: start bake instance %s: %w", b.Name, err)
 	}
 	return nil
@@ -250,7 +254,7 @@ func (b *BakeVM) Start(ctx context.Context) error {
 // to signal and drain: the bake boot never runs one, so there is no sentinel
 // file to write or grace window to wait out.
 func (b *BakeVM) Stop(ctx context.Context) error {
-	if err := runLimactl(ctx, b.binary(), os.Stdout, os.Stderr, "stop", "-f", b.Name); err != nil {
+	if err := runLimactl(ctx, b.binary(), b.Stdout, b.Stderr, "stop", "-f", b.Name); err != nil {
 		return fmt.Errorf("vm: limactl stop: %w", err)
 	}
 	return nil
@@ -259,7 +263,7 @@ func (b *BakeVM) Stop(ctx context.Context) error {
 // Delete destroys the bake instance. Callers must copy the golden disk out of
 // ~/.lima/<Name>/disk (see internal/image) before calling this.
 func (b *BakeVM) Delete(ctx context.Context) error {
-	if err := runLimactl(ctx, b.binary(), os.Stdout, os.Stderr, "delete", b.Name); err != nil {
+	if err := runLimactl(ctx, b.binary(), b.Stdout, b.Stderr, "delete", b.Name); err != nil {
 		return fmt.Errorf("vm: limactl delete: %w", err)
 	}
 	return nil
@@ -278,16 +282,35 @@ func (b *BakeVM) Verify(ctx context.Context) error {
 	return verifyBake(ctx, b.Name, b.run)
 }
 
-func verifyBake(ctx context.Context, name string, run limactlRunFunc) error {
-	var verificationStdout strings.Builder
-	var verificationStderr strings.Builder
-	if err := run(ctx, &verificationStdout, &verificationStderr,
+const bakeVerificationScript = `
+command -v claude
+command -v codex
+claude --version
+codex --version
+if test -f /usr/local/share/ca-certificates/boxedai-extra-ca.crt; then
+  test -s /usr/local/share/ca-certificates/boxedai-extra-ca.crt
+  test -L /etc/ssl/certs/boxedai-extra-ca.pem
+fi
+if test -f /etc/boxedai/expected-npm-registry; then
+  npm config get registry > /run/boxedai-npm-registry
+  cmp -s /etc/boxedai/expected-npm-registry /run/boxedai-npm-registry
+fi
+`
+
+func bakeVerificationArgs(name string) []string {
+	return []string{
 		"shell", name, "--",
 		"sudo", "systemd-run",
 		"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
 		"--uid=agent",
-		guestClaudeExecutable, "--version",
-	); err != nil {
+		"/bin/sh", "-eu", "-c", bakeVerificationScript,
+	}
+}
+
+func verifyBake(ctx context.Context, name string, run limactlRunFunc) error {
+	var verificationStdout strings.Builder
+	var verificationStderr strings.Builder
+	if err := run(ctx, &verificationStdout, &verificationStderr, bakeVerificationArgs(name)...); err != nil {
 		var provisioningStdout strings.Builder
 		var provisioningStderr strings.Builder
 		logErr := run(ctx, &provisioningStdout, &provisioningStderr,
@@ -316,7 +339,7 @@ func verifyBake(ctx context.Context, name string, run limactlRunFunc) error {
 		if len(diagnostics) != 0 {
 			detail = "\n" + strings.Join(diagnostics, "\n")
 		}
-		return fmt.Errorf("vm: bake VM %s: Claude Code executable verification failed%s: %w", name, detail, err)
+		return fmt.Errorf("vm: bake VM %s: required component verification failed%s: %w", name, detail, err)
 	}
 	// Cleaning cloud-init before verification would delete its provisioning
 	// log, which is the decisive diagnostic when a CLI install fails. It also

@@ -38,6 +38,12 @@ type Manifest struct {
 	// CodexPackage is the npm package Build installed for the "codex"
 	// harness, "@openai/codex".
 	CodexPackage string `json:"codex_package"`
+	// ExtraCADigest identifies the corporate CA baked into the guest without
+	// storing another copy of the certificate in the image manifest.
+	ExtraCADigest string `json:"extra_ca_digest,omitempty"`
+	// NPMRegistry records the registry used to install the harness CLIs so
+	// setup can rebuild an image when corporate configuration changes.
+	NPMRegistry string `json:"npm_registry,omitempty"`
 }
 
 // Well-known package/manifest constants recorded in every built Manifest.
