@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -47,8 +48,8 @@ func runBakeCleanup(action func(context.Context) error) error {
 // newBakeVM builds the bakeVM driver for a given instance name and rendered
 // lima.yaml path. A package-level var, like internal/session's vmFactory, so
 // tests can substitute a fake.
-var newBakeVM = func(name, yamlPath string) bakeVM {
-	return &vm.BakeVM{Name: name, LimaYAMLPath: yamlPath}
+var newBakeVM = func(name, yamlPath string, stdout, stderr io.Writer) bakeVM {
+	return &vm.BakeVM{Name: name, LimaYAMLPath: yamlPath, Stdout: stdout, Stderr: stderr}
 }
 
 // bakeInstanceDiskPath returns the host path to a stopped bake instance's
@@ -96,6 +97,12 @@ func newBuildSuffix() (string, error) {
 // deliberate, operator-driven actions, not something to design real locking
 // around yet.
 func Build(ctx context.Context, arch, extraCAPEM, npmRegistry string) (Manifest, error) {
+	return BuildWithOutput(ctx, arch, extraCAPEM, npmRegistry, os.Stdout, os.Stderr)
+}
+
+// BuildWithOutput is Build with explicit writers for Lima's provisioning
+// output. Machine-readable callers use stderr so stdout remains valid JSON.
+func BuildWithOutput(ctx context.Context, arch, extraCAPEM, npmRegistry string, stdout, stderr io.Writer) (Manifest, error) {
 	dir := archDir(arch)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return Manifest{}, fmt.Errorf("image: create %s: %w", dir, err)
@@ -130,7 +137,7 @@ func Build(ctx context.Context, arch, extraCAPEM, npmRegistry string) (Manifest,
 		return Manifest{}, err
 	}
 
-	bv := newBakeVM(instanceName, yamlPath)
+	bv := newBakeVM(instanceName, yamlPath, stdout, stderr)
 
 	// Start bounds Lima's unreliable internal readiness wait, then blocks on
 	// independent shell probes until Lima's boot-complete marker exists. It
@@ -193,6 +200,8 @@ func Build(ctx context.Context, arch, extraCAPEM, npmRegistry string) (Manifest,
 		UbuntuImageURL:    ubuntuImageURL(arch),
 		ClaudeCodePackage: claudeCodePackage,
 		CodexPackage:      codexPackage,
+		ExtraCADigest:     valueDigest(extraCAPEM),
+		NPMRegistry:       npmRegistry,
 	}
 	if err := writeManifest(arch, m); err != nil {
 		return Manifest{}, fmt.Errorf(
@@ -206,6 +215,14 @@ func Build(ctx context.Context, arch, extraCAPEM, npmRegistry string) (Manifest,
 	}
 
 	return m, nil
+}
+
+func valueDigest(value string) string {
+	if value == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(value))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // writeManifest marshals m as indented JSON and writes it to

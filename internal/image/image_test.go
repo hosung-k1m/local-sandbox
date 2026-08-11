@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"testing"
@@ -46,7 +47,7 @@ func withFakeBake(t *testing.T, fake *fakeBakeVM, diskFixture string) {
 	t.Helper()
 	origNewBakeVM := newBakeVM
 	origDiskPath := bakeInstanceDiskPath
-	newBakeVM = func(name, yamlPath string) bakeVM { return fake }
+	newBakeVM = func(name, yamlPath string, stdout, stderr io.Writer) bakeVM { return fake }
 	bakeInstanceDiskPath = func(name string) (string, error) { return diskFixture, nil }
 	t.Cleanup(func() {
 		newBakeVM = origNewBakeVM
@@ -75,7 +76,7 @@ func TestBuildSuccess(t *testing.T) {
 	fake := &fakeBakeVM{}
 	withFakeBake(t, fake, diskFixture)
 
-	m, err := Build(context.Background(), "arm64", "", "")
+	m, err := Build(context.Background(), "arm64", "fixture-ca", "https://registry.example.internal/npm/")
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -99,6 +100,9 @@ func TestBuildSuccess(t *testing.T) {
 	}
 	if m.ClaudeCodePackage != claudeCodePackage || m.CodexPackage != codexPackage {
 		t.Errorf("package fields = %+v, want %s/%s", m, claudeCodePackage, codexPackage)
+	}
+	if m.ExtraCADigest != valueDigest("fixture-ca") || m.NPMRegistry != "https://registry.example.internal/npm/" {
+		t.Errorf("corporate image inputs = %+v", m)
 	}
 
 	// The disk was actually copied (not just referenced).

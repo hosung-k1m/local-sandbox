@@ -74,6 +74,8 @@ func newRootCmd() *cobra.Command {
 	root.Flags().BoolVar(&web, "web", false, "serve the global evidence dashboard")
 	root.Flags().StringVar(&addr, "addr", "127.0.0.1:0", "web dashboard listen address (with --web)")
 	root.AddCommand(
+		newSetupCmd(),
+		newDoctorCmd(),
 		newRunCmd(),
 		newBuildImageCmd(),
 		newSessionsCmd(),

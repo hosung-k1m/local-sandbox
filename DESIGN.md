@@ -40,7 +40,8 @@ supervisor (root in VM), host broker, host recorder.
 
 ```
 cmd/boxedai            CLI entrypoint (thin main)
-internal/cli           cobra commands: build-image, run, sessions, view, diff, verify, apply, stop
+internal/cli           cobra commands: setup, doctor, build-image, run, sessions, view, diff, verify, apply, stop
+internal/setup         host preflight, corporate config, idempotent image setup
 internal/session       session lifecycle orchestration, IDs, session dir, state file
 internal/image         golden VM image build/resolve, manifest, digest verification
 internal/policy        profiles (review/develop/restricted), capability model   [SCAFFOLDED]
@@ -57,7 +58,7 @@ guest/provision        provisioning shell scripts embedded into lima.yaml
 ```
 
 Dependency direction (no cycles):
-`cli → session → {vm, image, snapshot, broker, recorder, view, verify}`; `cli → image`
+`cli → setup → {session, image}`; `cli → session → {vm, image, snapshot, broker, recorder, view, verify}`; `cli → image`
 (`build-image` calls it directly); `image → vm` (drives `vm.BakeConfig`/`vm.BakeVM` to
 provision the bake boot); `broker → {evidence, policy}`; `vm → {evidence, policy}`;
 `recorder → evidence`; `verify → evidence` (verify reads raw files; it must NOT import
@@ -72,7 +73,7 @@ State root `~/.boxedai/` (override: env `BOXEDAI_HOME`):
 ~/.boxedai/
   keys/recorder.key            Ed25519 private key (0600), PEM PKCS8
   keys/recorder.pub            Ed25519 public key, PEM PKIX
-  config.json                  host config (upstream creds refs, adapter allowlists)
+  config.json                  host config (upstream refs, adapters, corporate CA/npm settings; 0600)
   images/<arch>/disk.img       golden VM disk, built by `boxedai build-image` (internal/image)
   images/<arch>/manifest.json  tag, build timestamp, disk sha256 digest (see below)
   sessions/<session-id>/
@@ -109,7 +110,9 @@ one-off, throwaway bake VM, provisions it (see "VM (internal/vm) and guest super
 below for exactly which steps run at bake time), stops it, and copies its disk out to
 `images/<arch>/disk.img` with a `manifest.json` recording `{tag, arch, built_at,
 disk_path, disk_digest ("sha256:..."), ubuntu_image_url, claude_code_package,
-codex_package}`. `boxedai run` calls `image.Resolve(arch)` before doing anything else
+codex_package, extra_ca_digest, npm_registry}`. `boxedai setup` uses the last two
+fields to skip a valid current image and rebuild one whose corporate inputs are stale.
+`boxedai run` calls `image.Resolve(arch)` before doing anything else
 (before session dir creation, before VM boot): it reads the manifest, recomputes the
 on-disk disk's sha256, and fails fast with a "run `boxedai build-image` first" error if
 the manifest is missing, malformed, the disk is missing, or the recomputed digest does
@@ -407,12 +410,13 @@ already-baked image:
 Bake-time (`boxedai build-image`, system scripts, root, network open throughout — no
 lockdown; the bake boot never runs a workload):
 1. Create unprivileged user `agent` (uid 4242, no sudo), home `/home/agent`.
-2. Install runtime deps: nodejs 22 (NodeSource), git. Install BOTH harness CLIs
+2. If configured, install and activate the corporate CA before the first network
+   operation. Then install runtime deps: nodejs 22 (NodeSource), git. Install BOTH harness CLIs
    unconditionally — `@anthropic-ai/claude-code` and `@openai/codex` via npm --global —
    so the image is harness-agnostic and no session ever installs anything at boot
    regardless of which one it requests. Corporate CA injection (`extra_ca_pem`, read
    from `~/.boxedai/config.json` at build-image time) is trusted into
-   /usr/local/share/ca-certificates before npm runs, plus exported via
+   /usr/local/share/ca-certificates before apt, curl, or npm runs, plus exported via
    `NODE_EXTRA_CA_CERTS` since Node ignores the system store update-ca-certificates
    just updated.
 3. Install tetragon (release tarball, systemd unit, JSON export to
@@ -425,7 +429,8 @@ lockdown; the bake boot never runs a workload):
    rsyslog's systemd unit. No ruleset is written and rsyslog is not started yet — the
    ruleset needs a real session's broker IP, which does not exist at bake time.
 
-`build-image` then stops the bake VM, copies its disk to `images/<arch>/disk.img`,
+`build-image` verifies both harness CLIs plus any configured CA and npm registry,
+then stops the bake VM, copies its disk to `images/<arch>/disk.img`,
 hashes it, and writes `manifest.json` (see "Host filesystem layout" above) — this is
 the golden image `boxedai run` boots from via `image.Resolve`.
 
@@ -541,6 +546,9 @@ leave the session marked incomplete (state file `session.state` = one of
 ## CLI (internal/cli)
 
 ```
+boxedai setup [--arch arm64|amd64] [--json] configure corporate CA/npm settings and
+            idempotently build or reuse the verified golden image
+boxedai doctor [--arch arm64|amd64] [--json] read-only host/config/image readiness
 boxedai --web [--addr 127.0.0.1:0]        serve global local evidence dashboard
 boxedai build-image [--arch arm64|amd64]  build/rebuild the golden VM image (required
             before `run` will work, and again after upgrading); default arch is the host's
@@ -555,6 +563,16 @@ boxedai verify <session> [--json]         run verifier, print verdict + facets
 boxedai apply <session>     apply diff to original repo (asks confirmation)
 boxedai stop <session>      kill switch
 ```
+
+`setup --json` writes newline-delimited `boxedai.setup/v1` objects to stdout:
+`type:"stage"` events for `preflight`, `configure`, and `image`, followed by exactly
+one `type:"result"`. Lima provisioning output goes to stderr so stdout remains valid
+NDJSON. `doctor --json` writes exactly one result object. Results carry `command`,
+`status` (`ready|action_required|failed`), `ready`, `arch`, `home`, `checks`, optional
+`actions`, optional image metadata, and optional `error:{code,message}`; they never
+contain the CA PEM or credentials. Exit status is 0 for ready, 2 for a retryable user
+action gate, and 1 for an operational failure. `BOXEDAI_HOME` governs configuration,
+images, and sessions for both commands.
 
 Anything after a literal `--` is harness passthrough argv, not a positional
 (harness/path) argument: it is appended to the claude/codex CLI invocation inside the

@@ -59,7 +59,7 @@ func TestStartAndWaitForBootUsesShellWhenLimaStartTimesOut(t *testing.T) {
 		}
 	}
 
-	if err := startAndWaitForBoot(context.Background(), "test-instance", time.Second, run); err != nil {
+	if err := startAndWaitForBoot(context.Background(), "test-instance", time.Second, run, io.Discard, io.Discard); err != nil {
 		t.Fatalf("startAndWaitForBoot: %v", err)
 	}
 
@@ -136,13 +136,7 @@ func TestVerifyBakeVerifiesCleansCloudInitThenSyncs(t *testing.T) {
 	}
 
 	want := [][]string{
-		{
-			"shell", "test-bake", "--",
-			"sudo", "systemd-run",
-			"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
-			"--uid=agent",
-			guestClaudeExecutable, "--version",
-		},
+		bakeVerificationArgs("test-bake"),
 		{"shell", "test-bake", "--", "sudo", "cloud-init", "clean", "--logs", "--seed"},
 		{"shell", "test-bake", "--", "sudo", "sync"},
 	}
@@ -175,8 +169,8 @@ func TestVerifyBakeFetchesProvisioningLogAfterExecutableFailure(t *testing.T) {
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("verifyBake error = %v, want wrapped %v", err, wantErr)
 	}
-	if !strings.Contains(err.Error(), "Claude Code executable verification failed") {
-		t.Errorf("verifyBake error = %q, want executable verification context", err)
+	if !strings.Contains(err.Error(), "required component verification failed") {
+		t.Errorf("verifyBake error = %q, want component verification context", err)
 	}
 	for _, want := range []string{"verification output", "verification error", "npm install failed", "tail warning"} {
 		if !strings.Contains(err.Error(), want) {
@@ -184,13 +178,7 @@ func TestVerifyBakeFetchesProvisioningLogAfterExecutableFailure(t *testing.T) {
 		}
 	}
 	wantCalls := [][]string{
-		{
-			"shell", "test-bake", "--",
-			"sudo", "systemd-run",
-			"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
-			"--uid=agent",
-			guestClaudeExecutable, "--version",
-		},
+		bakeVerificationArgs("test-bake"),
 		{"shell", "test-bake", "--", "sudo", "tail", "-n", "500", "/var/log/cloud-init-output.log"},
 	}
 	if len(calls) != len(wantCalls) {
@@ -695,6 +683,11 @@ func TestBakeProvisionScripts_NPMTrustsExtraCA(t *testing.T) {
 	got := b.String()
 	if !strings.Contains(got, "export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/boxedai-extra-ca.crt") {
 		t.Errorf("bake provisioning with extra CA missing NODE_EXTRA_CA_CERTS export, got:\n%s", got)
+	}
+	caIndex := strings.Index(got, "update-ca-certificates")
+	firstNetworkIndex := strings.Index(got, "apt-get update -y")
+	if caIndex == -1 || firstNetworkIndex == -1 || caIndex > firstNetworkIndex {
+		t.Errorf("corporate CA trust must be installed before the first network operation")
 	}
 }
 
