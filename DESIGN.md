@@ -234,8 +234,15 @@ NewRecorder(dir string, key SigningKey, session SessionMeta) (Recorder, error)
 Behavior:
 1. Assign `audit.sequence` monotonically from 1; assign producer/class per channel table.
 2. Marshal each event as an OTLP `LogRecord` inside a single-record `LogsData`,
-   append length-delimited (protodelim) to the open `.otlp` WAL file, fsync per batch.
-3. Emit failure = session-fatal: surface the error; callers must stop the session.
+   append length-delimited (protodelim) to the open `.otlp` WAL file, fsync per commit
+   group: one fsync covers every record appended since the previous one, lands no later
+   than ~50ms after the first unsynced append, and always precedes a seal. Emit returns
+   once its record is appended, so a burst costs one fsync instead of one per record —
+   per-record fsync capped host ingest near 230 events/second, which a fork storm
+   outruns, and the events that could not be handed over died with the guest.
+3. Emit failure = session-fatal: surface the error; callers must stop the session. A
+   group fsync that fails is sticky: it fails the next Emit, seal, and Close, because a
+   record whose fsync failed may never have reached disk.
 4. Seal on: size threshold (default 8 MiB), explicit call, Close.
 5. Segment manifest JSON: `{schema:"boxedai.segment/v1", session_id, segment_number,
    first_sequence, last_sequence, record_count, prev_segment_digest ("sha256:..." or

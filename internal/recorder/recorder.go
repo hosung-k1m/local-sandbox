@@ -23,6 +23,19 @@ import (
 // segmentSizeThreshold is the default WAL size (bytes) that triggers an automatic seal.
 const segmentSizeThreshold = 8 << 20 // 8 MiB
 
+// fsyncMaxLatency bounds how long an appended record may sit unsynced before the group
+// commit fsyncs it (DESIGN.md Recorder behavior 2, "fsync per commit group"). One fsync
+// costs several milliseconds on this class of host, so paying it per record capped
+// ingest near 230 events/second — a rate a fork storm outruns, and the events the guest
+// could not hand over in time died with it. A group covers everything appended since the
+// last fsync, which turns a burst into a single sync while leaving a quiet session's
+// single event durable inside this bound.
+var fsyncMaxLatency = 50 * time.Millisecond
+
+// syncSegment is the recorder's fsync, in a var so tests can count commit groups and
+// prove a failed one is sticky and session-fatal.
+var syncSegment = func(f *os.File) error { return f.Sync() }
+
 // eventClassClamped is the recorder-internal integrity note emitted when a producer's
 // requested evidence class is clamped to its channel maximum. It is not part of the
 // producer event catalog (only the recorder emits it); see the deviation note.
@@ -41,8 +54,9 @@ const (
 )
 
 // Recorder ingests evidence events, serializes them into signed OTLP segments, and
-// seals segments on demand. Emit never silently drops: a non-nil error means the
-// event was not durably recorded and the session must fail closed.
+// seals segments on demand. Emit never silently drops: a non-nil error means the event —
+// or one appended just before it, whose commit group failed to fsync — was not durably
+// recorded and the session must fail closed.
 type Recorder interface {
 	evidence.Emitter                             // Emit(ch, ev) error
 	SealSegment(reason string) error             // rotate: seal current WAL, open next
@@ -90,6 +104,11 @@ type recorder struct {
 	prevDigest    string // segment_digest of the previously sealed segment ("" for first)
 	manifestPaths []string
 	closed        bool
+
+	// Commit-group state, also guarded by mu.
+	unsynced  int64       // records appended to the current segment since the last fsync
+	syncTimer *time.Timer // armed while unsynced > 0; fires the group commit
+	syncErr   error       // sticky: a failed group fsync fails every later Emit/seal/Close
 }
 
 // NewRecorder creates a recorder writing segments under <dir>/segments/. dir is the
@@ -130,8 +149,10 @@ func NewRecorder(dir string, key SigningKey, meta SessionMeta) (Recorder, error)
 
 // Emit assigns sequence/producer/class, writes the record (plus a clamp integrity
 // note if the requested class was out of allowance), and rotates the segment if the
-// size threshold is crossed. Any marshal/write/fsync failure is returned; the event
-// must be treated as not recorded.
+// size threshold is crossed. Any marshal or write failure is returned, as is a commit
+// group whose fsync failed behind an earlier Emit; the event must be treated as not
+// recorded. The record's own fsync lands with its commit group — within
+// fsyncMaxLatency, or at the next seal, whichever comes first.
 func (r *recorder) Emit(ch evidence.Channel, ev evidence.Event) error {
 	if err := ev.Validate(); err != nil {
 		return err
@@ -261,6 +282,7 @@ func (r *recorder) openSegmentLocked() error {
 	r.f = f
 	r.segPath = path
 	r.segBytes = 0
+	r.unsynced = 0
 	r.firstSeq = 0
 	r.lastSeq = 0
 	r.recordCount = 0
@@ -271,8 +293,12 @@ func (r *recorder) openSegmentLocked() error {
 }
 
 // writeLocked assigns the next sequence, marshals the record length-delimited, writes
-// it in one shot, fsyncs, and updates per-segment counters. Callers must hold mu.
+// it in one shot, joins the open commit group (arming the fsync deadline if it is the
+// first unsynced record), and updates per-segment counters. Callers must hold mu.
 func (r *recorder) writeLocked(rr resolvedRecord) error {
+	if r.syncErr != nil {
+		return r.syncErr
+	}
 	r.seq++
 	seq := r.seq
 
@@ -294,8 +320,11 @@ func (r *recorder) writeLocked(rr resolvedRecord) error {
 	if err != nil {
 		return fmt.Errorf("recorder: write record seq %d: %w", seq, err)
 	}
-	if err := r.f.Sync(); err != nil {
-		return fmt.Errorf("recorder: fsync segment: %w", err)
+	r.unsynced++
+	if r.syncTimer == nil {
+		// Deadline runs from the first unsynced append, so no record waits longer
+		// than fsyncMaxLatency however quiet the session is.
+		r.syncTimer = time.AfterFunc(fsyncMaxLatency, r.commitGroup)
 	}
 
 	r.segBytes += int64(n)
@@ -315,6 +344,39 @@ func (r *recorder) writeLocked(rr resolvedRecord) error {
 	return nil
 }
 
+// commitGroup ends the open commit group once its fsync deadline expires. It has no
+// caller to return an error to, so a failure is left in syncErr, which fails the next
+// Emit, seal and Close — the session still stops on evidence that is not durable.
+func (r *recorder) commitGroup() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.syncLocked() //nolint:errcheck // recorded in syncErr for the next caller
+}
+
+// syncLocked fsyncs the open segment if anything has been appended since the last fsync,
+// ending the current commit group and disarming its deadline. A failed fsync is sticky:
+// it may have left an earlier record unwritten on disk while reporting success to a
+// caller, so it fails every later operation rather than being retried into silence.
+// Callers must hold mu.
+func (r *recorder) syncLocked() error {
+	if r.syncTimer != nil {
+		r.syncTimer.Stop()
+		r.syncTimer = nil
+	}
+	if r.syncErr != nil {
+		return r.syncErr
+	}
+	if r.unsynced == 0 || r.f == nil {
+		return nil
+	}
+	if err := syncSegment(r.f); err != nil {
+		r.syncErr = fmt.Errorf("recorder: fsync segment: %w", err)
+		return r.syncErr
+	}
+	r.unsynced = 0
+	return nil
+}
+
 // sealLocked closes the current WAL, digests its exact bytes, writes and COSE-signs
 // the manifest, and (when openNext) opens the successor segment and records a
 // segment.sealed integrity event into it. Callers must hold mu.
@@ -324,7 +386,9 @@ func (r *recorder) sealLocked(reason string, openNext bool) error {
 	}
 	sealedNum := r.segNum
 
-	if err := r.f.Sync(); err != nil {
+	// A seal always closes the open commit group first: the manifest digests bytes
+	// that reached disk, never bytes that were still only in the page cache.
+	if err := r.syncLocked(); err != nil {
 		return fmt.Errorf("recorder: fsync before seal: %w", err)
 	}
 	if err := r.f.Close(); err != nil {

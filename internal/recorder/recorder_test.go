@@ -11,7 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"boxedai/internal/evidence"
 
@@ -250,6 +253,121 @@ func TestEmitAfterCloseFails(t *testing.T) {
 	}
 	if err := rec.Emit(evidence.ChannelController, evidence.Event{Name: evidence.EventSessionStopped}); err == nil {
 		t.Fatal("Emit after Close should error")
+	}
+}
+
+// newTestRecorder builds a recorder in a fresh temp dir, for tests that only care
+// about the write path.
+func newTestRecorder(t *testing.T) Recorder {
+	t.Helper()
+	root := t.TempDir()
+	key, err := LoadOrGenerateKey(filepath.Join(root, "keys"))
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey: %v", err)
+	}
+	rec, err := NewRecorder(filepath.Join(root, "evidence"), key, SessionMeta{SessionID: "bx-group-commit"})
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	return rec
+}
+
+// countSyncs replaces the recorder's fsync with a counter for the duration of the test.
+func countSyncs(t *testing.T, fail error) *atomic.Int64 {
+	t.Helper()
+	var syncs atomic.Int64
+	old := syncSegment
+	syncSegment = func(f *os.File) error {
+		syncs.Add(1)
+		if fail != nil {
+			return fail
+		}
+		return f.Sync()
+	}
+	t.Cleanup(func() { syncSegment = old })
+	return &syncs
+}
+
+// TestEmitGroupCommitsARunOfRecordsWithOneFsync is the ingest-throughput guard: an
+// fsync per record capped the host near 230 events/second, so a fork storm outran the
+// recorder and the guest died holding the events it could not hand over. A commit group
+// covers every record appended since the last fsync.
+func TestEmitGroupCommitsARunOfRecordsWithOneFsync(t *testing.T) {
+	oldLatency := fsyncMaxLatency
+	fsyncMaxLatency = time.Hour // no timed commit interferes with the burst
+	t.Cleanup(func() { fsyncMaxLatency = oldLatency })
+	syncs := countSyncs(t, nil)
+
+	rec := newTestRecorder(t)
+	for i := 0; i < 200; i++ {
+		if err := rec.Emit(evidence.ChannelGuestSupervisor, evidence.Event{
+			Name: evidence.EventProcessExecuted, Class: evidence.ClassKernelObserved, Outcome: evidence.OutcomeSuccess,
+			Attrs: map[string]any{evidence.AttrProcessPID: int64(i)},
+		}); err != nil {
+			t.Fatalf("Emit %d: %v", i, err)
+		}
+	}
+	if got := syncs.Load(); got != 0 {
+		t.Fatalf("fsyncs during the burst = %d, want the group still open", got)
+	}
+	if _, err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	// Close ends the open group before digesting, so the manifest covers synced bytes.
+	if got := syncs.Load(); got != 1 {
+		t.Fatalf("fsyncs for 200 records = %d, want exactly 1 commit group", got)
+	}
+}
+
+// TestEmitFsyncsWithinTheLatencyBound proves the group is bounded in time as well as by
+// seals: a quiet session's single event must not sit unsynced indefinitely.
+func TestEmitFsyncsWithinTheLatencyBound(t *testing.T) {
+	oldLatency := fsyncMaxLatency
+	fsyncMaxLatency = 10 * time.Millisecond
+	t.Cleanup(func() { fsyncMaxLatency = oldLatency })
+	syncs := countSyncs(t, nil)
+
+	rec := newTestRecorder(t)
+	if err := rec.Emit(evidence.ChannelController, evidence.Event{
+		Name: evidence.EventSessionStarted, Class: evidence.ClassIntegrity, Outcome: evidence.OutcomeSuccess,
+	}); err != nil {
+		t.Fatalf("Emit: %v", err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for syncs.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("no group commit within the fsync latency bound")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if _, err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+}
+
+// TestFailedGroupCommitIsStickyAndFatal keeps the fail-closed contract: a record whose
+// fsync failed may never have reached disk, so it must not be papered over by a later
+// successful sync. Emit already returned nil for it, so the error surfaces on the next
+// Emit and again on Close, which is what marks the session incomplete.
+func TestFailedGroupCommitIsStickyAndFatal(t *testing.T) {
+	oldLatency := fsyncMaxLatency
+	fsyncMaxLatency = time.Hour
+	t.Cleanup(func() { fsyncMaxLatency = oldLatency })
+	countSyncs(t, errors.New("input/output error"))
+
+	rec := newTestRecorder(t)
+	event := evidence.Event{Name: evidence.EventSessionStarted, Class: evidence.ClassIntegrity, Outcome: evidence.OutcomeSuccess}
+	if err := rec.Emit(evidence.ChannelController, event); err != nil {
+		t.Fatalf("first Emit: %v", err)
+	}
+	rec.(*recorder).commitGroup() // the fsync deadline, fired deterministically
+
+	err := rec.Emit(evidence.ChannelController, event)
+	if err == nil || !strings.Contains(err.Error(), "fsync segment") {
+		t.Fatalf("Emit after a failed group commit = %v, want the fsync error", err)
+	}
+	if _, err := rec.Close(); err == nil || !strings.Contains(err.Error(), "fsync") {
+		t.Fatalf("Close after a failed group commit = %v, want the fsync error", err)
 	}
 }
 
