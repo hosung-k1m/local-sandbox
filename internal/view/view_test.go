@@ -19,6 +19,7 @@ import (
 
 	"boxedai/internal/evidence"
 	"boxedai/internal/session"
+	"boxedai/internal/verify"
 )
 
 // testEvent describes one synthetic evidence record to write into a segment
@@ -279,6 +280,36 @@ func TestBuildWebPayloadIncludesProofAndActionTimeline(t *testing.T) {
 	}
 }
 
+func TestBuildProofStateSurfacesTrustRecordFacets(t *testing.T) {
+	report := verify.Report{
+		Verdict: verify.VerdictLocalOnly,
+		Facets: verify.Facets{
+			TrustRecordStatus:    "verified",
+			TrustRecordProfile:   "boxedai.trust-record/v1",
+			TrustRecordAssurance: "Level 0 (software-only)",
+			TrustRecordSignature: true,
+			TrustRecordDerived:   true,
+		},
+	}
+
+	proof := buildProofState(t.TempDir(), session.StateSealed, report, nil)
+	if proof.TrustRecordStatus != "verified" || proof.TrustRecordProfile != "boxedai.trust-record/v1" {
+		t.Fatalf("trust record status/profile = %q/%q", proof.TrustRecordStatus, proof.TrustRecordProfile)
+	}
+	if proof.TrustRecordAssurance != "Level 0 (software-only)" || proof.TrustRecordSignature == nil || !*proof.TrustRecordSignature || proof.TrustRecordDerived == nil || !*proof.TrustRecordDerived {
+		t.Fatalf("trust record facets = %+v", proof)
+	}
+	encoded, err := json.Marshal(proof)
+	if err != nil {
+		t.Fatalf("marshal proof: %v", err)
+	}
+	for _, want := range []string{`"trust_record_signature_valid":true`, `"trust_record_cross_derived":true`} {
+		if !strings.Contains(string(encoded), want) {
+			t.Errorf("proof JSON missing %s: %s", want, encoded)
+		}
+	}
+}
+
 func TestBuildWebPayloadUsesRunningLifecycleStateForProof(t *testing.T) {
 	sessionDir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(sessionDir, "session.state"), []byte(session.StateRunning), 0o644); err != nil {
@@ -530,6 +561,71 @@ func TestDashboardAPIRejectsUnknownSessionWithoutCreatingIt(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(home, "sessions", id)); !os.IsNotExist(err) {
 		t.Fatalf("unknown session path was created: %v", err)
+	}
+}
+
+// TestAssetsServedByBothMuxes verifies the shared vanilla-JS/CSS client
+// (registerAssets) is wired into both the single-session viewer mux and the
+// dashboard mux with the right content types, and that each mux's thin HTML
+// shell references /assets/app.js and /assets/processes.js.
+func TestAssetsServedByBothMuxes(t *testing.T) {
+	muxes := map[string]*http.ServeMux{
+		"web":       newWebMux(t.TempDir()),
+		"dashboard": newDashboardMux(),
+	}
+	for name, mux := range muxes {
+		t.Run(name, func(t *testing.T) {
+			cssRec := httptest.NewRecorder()
+			mux.ServeHTTP(cssRec, httptest.NewRequest(http.MethodGet, "/assets/app.css", nil))
+			if cssRec.Code != http.StatusOK {
+				t.Fatalf("/assets/app.css status = %d, want 200", cssRec.Code)
+			}
+			if ct := cssRec.Header().Get("Content-Type"); ct != "text/css; charset=utf-8" {
+				t.Errorf("/assets/app.css Content-Type = %q, want text/css; charset=utf-8", ct)
+			}
+			if !strings.Contains(cssRec.Body.String(), "BoxedAi") {
+				t.Errorf("/assets/app.css body missing BoxedAi marker")
+			}
+
+			jsRec := httptest.NewRecorder()
+			mux.ServeHTTP(jsRec, httptest.NewRequest(http.MethodGet, "/assets/app.js", nil))
+			if jsRec.Code != http.StatusOK {
+				t.Fatalf("/assets/app.js status = %d, want 200", jsRec.Code)
+			}
+			if ct := jsRec.Header().Get("Content-Type"); ct != "application/javascript; charset=utf-8" {
+				t.Errorf("/assets/app.js Content-Type = %q, want application/javascript; charset=utf-8", ct)
+			}
+			if !strings.Contains(jsRec.Body.String(), "BoxedAi") {
+				t.Errorf("/assets/app.js body missing BoxedAi marker")
+			}
+
+			procRec := httptest.NewRecorder()
+			mux.ServeHTTP(procRec, httptest.NewRequest(http.MethodGet, "/assets/processes.js", nil))
+			if procRec.Code != http.StatusOK {
+				t.Fatalf("/assets/processes.js status = %d, want 200", procRec.Code)
+			}
+			if ct := procRec.Header().Get("Content-Type"); ct != "application/javascript; charset=utf-8" {
+				t.Errorf("/assets/processes.js Content-Type = %q, want application/javascript; charset=utf-8", ct)
+			}
+			if procRec.Body.Len() == 0 {
+				t.Errorf("/assets/processes.js body is empty")
+			}
+			if !strings.Contains(procRec.Body.String(), "BoxedAiProc") {
+				t.Errorf("/assets/processes.js body missing BoxedAiProc marker")
+			}
+
+			indexRec := httptest.NewRecorder()
+			mux.ServeHTTP(indexRec, httptest.NewRequest(http.MethodGet, "/", nil))
+			if indexRec.Code != http.StatusOK {
+				t.Fatalf("/ status = %d, want 200", indexRec.Code)
+			}
+			if !strings.Contains(indexRec.Body.String(), "/assets/app.js") {
+				t.Errorf("/ body missing reference to /assets/app.js: %s", indexRec.Body.String())
+			}
+			if !strings.Contains(indexRec.Body.String(), "/assets/processes.js") {
+				t.Errorf("/ body missing reference to /assets/processes.js: %s", indexRec.Body.String())
+			}
+		})
 	}
 }
 

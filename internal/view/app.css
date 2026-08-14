@@ -1,0 +1,954 @@
+/* BoxedAi web UI — shared stylesheet for the single-session viewer
+   (web.html) and the global dashboard (dashboard.html). Plain CSS, no
+   preprocessor, no build step (DESIGN.md "Viewer": "embedded HTML pages
+   (no build step, vanilla JS)"). Loaded by both pages from /assets/app.css.
+   Sections below are ordered: tokens, base/reset, then components in the
+   order they appear on screen. */
+
+/* ---- design tokens ---- */
+:root {
+  color-scheme: dark;
+
+  /* surfaces / ink */
+  --bg: #0d0d0d;
+  --surface: #1a1a19;
+  --surface-2: #232321;
+  --border: rgba(255, 255, 255, 0.10);
+  --grid: #2c2c2a;
+  --ink: #ffffff;
+  --ink-2: #c3c2b7;
+  --ink-3: #898781;
+
+  /* categorical (evidence-class identity only — never reused for status) */
+  --c-kernel: #3987e5;
+  --c-broker: #d95926;
+  --c-harness: #199e70;
+  --c-self: #c98500;
+  --c-target: #d55181;
+  --c-integ: #9085e9;
+
+  /* status (outcomes/health/verdicts — never used for bare identity) */
+  --s-good: #0ca30c;
+  --s-warn: #fab219;
+  --s-serious: #ec835a;
+  --s-crit: #d03b3b;
+  --info: #3987e5;
+
+  --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+/* ---- base / reset ---- */
+* {
+  box-sizing: border-box;
+}
+html, body {
+  height: 100%;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.45;
+}
+#app {
+  min-height: 100%;
+}
+button, input, select {
+  font: inherit;
+  color: inherit;
+  background: transparent;
+}
+button {
+  cursor: pointer;
+}
+:focus-visible {
+  outline: 2px solid var(--info);
+  outline-offset: 1px;
+}
+a {
+  color: var(--info);
+}
+table {
+  border-collapse: collapse;
+  width: 100%;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 4px 8px;
+}
+h1, h2, h3 {
+  margin: 0;
+  font-weight: 600;
+}
+
+.hidden {
+  display: none !important;
+}
+.mono-num {
+  font-variant-numeric: tabular-nums;
+}
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.empty {
+  color: var(--ink-3);
+  font-style: italic;
+}
+.meta {
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.spacer {
+  flex: 1 1 auto;
+}
+
+/* ---- buttons / inputs (shared primitives) ---- */
+.btn {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+}
+.btn:hover {
+  background: var(--surface-2);
+}
+.btn.small {
+  padding: 2px 8px;
+  font-size: 11.5px;
+}
+.btn.active {
+  border-color: var(--info);
+  color: var(--info);
+}
+.btn.link {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--info);
+  text-decoration: underline;
+}
+input[type="text"],
+input[type="search"],
+input[type="number"] {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+input[type="checkbox"] {
+  accent-color: var(--info);
+}
+.toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+}
+.copy-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  text-align: left;
+}
+.copy-btn:hover {
+  color: var(--info);
+}
+.copied-flash {
+  color: var(--s-good);
+}
+
+/* ---- chips: one visual language for every colored pill (evidence class,
+   outcome, verdict, proof/session status). JS resolves a value to a CSS
+   color (usually `var(--c-*)`/`var(--s-*)`) and sets it as the --chip-color
+   custom property; unknown values fall back to --ink-3 via the default. ---- */
+.chip {
+  --chip-color: var(--ink-3);
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border-radius: 4px;
+  font-weight: 700;
+  font-size: 0.72rem;
+  padding: 2px 6px;
+  line-height: 1.5;
+  white-space: nowrap;
+  color: var(--chip-color);
+  background: color-mix(in srgb, var(--chip-color) 14%, transparent);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--chip-color) 35%, transparent);
+}
+.chip.selectable {
+  cursor: pointer;
+}
+.chip.selectable:not(.on) {
+  --chip-color: var(--ink-3);
+  color: var(--ink-2);
+}
+.chip.big {
+  font-size: 0.95rem;
+  padding: 4px 10px;
+}
+/* Plain colored inline text (no pill chrome) for table cells like outcome. */
+.ktext {
+  --chip-color: var(--ink-3);
+  color: var(--chip-color);
+  font-weight: 600;
+}
+/* Small live/running indicator dot; disabled under reduced motion. */
+.pulse-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--info);
+  animation: pulse 1.6s ease-in-out infinite;
+}
+.pulse-text {
+  animation: pulse 1.6s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse-dot, .pulse-text {
+    animation: none;
+  }
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+/* ---- sticky top bar: wordmark, session id, verdict/status chips, counts,
+   live toggle, refresh. Wrapped together with the tab bar in one sticky
+   block so header height changes (wrapping) never desync offsets. ---- */
+.topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  background: var(--bg);
+}
+.hdr {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.hdr .wordmark {
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+.hdr-banner {
+  padding: 6px 16px;
+  background: color-mix(in srgb, var(--s-serious) 16%, var(--bg));
+  color: var(--s-serious);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+/* ---- tab bar ---- */
+.tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 2px;
+  padding: 0 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+}
+.tab-btn {
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 10px;
+  color: var(--ink-2);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.tab-btn:hover {
+  color: var(--ink);
+}
+.tab-btn.active {
+  color: var(--ink);
+  border-bottom-color: var(--info);
+}
+.tab-count {
+  color: var(--ink-3);
+  font-size: 11px;
+}
+.tab-btn.active .tab-count {
+  color: var(--info);
+}
+
+/* ---- filter engine: search box, facet chip rows, name popover, pid input,
+   presets, results line with removable active-filter chips. ---- */
+.filterbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.filterbar input[type="search"] {
+  min-width: 16rem;
+  flex: 1 1 16rem;
+}
+.filterbar input[type="number"] {
+  width: 7rem;
+}
+.facet-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  flex-basis: 100%;
+}
+.facet-label {
+  color: var(--ink-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-right: 2px;
+}
+.popover-wrap {
+  position: relative;
+  display: inline-block;
+}
+.popover {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: 0;
+  z-index: 20;
+  min-width: 18rem;
+  max-height: 22rem;
+  overflow: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  padding: 8px;
+}
+.popover-group {
+  margin-bottom: 6px;
+}
+.popover-group-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--ink-2);
+  font-weight: 700;
+  padding: 3px 4px;
+}
+.popover label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 4px 2px 18px;
+  border-radius: 4px;
+}
+.popover label:hover {
+  background: var(--surface-2);
+}
+.results-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 16px;
+  color: var(--ink-2);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+.active-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+.active-chip button {
+  background: none;
+  border: none;
+  color: inherit;
+  padding: 0;
+  font-weight: 700;
+}
+
+/* ---- generic scrollable table area: sticky header, bounded height. ---- */
+.table-wrap {
+  max-height: 70vh;
+  overflow: auto;
+  border-bottom: 1px solid var(--border);
+}
+.table-wrap table {
+  font-size: 12.5px;
+}
+.table-wrap th {
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  color: var(--ink-3);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--border);
+  z-index: 1;
+}
+.table-wrap tbody tr {
+  border-bottom: 1px solid var(--grid);
+  height: 30px;
+}
+.table-wrap tbody tr.clickable:hover {
+  background: var(--surface-2);
+  cursor: pointer;
+}
+.table-wrap td.summary-cell {
+  max-width: 1px; /* forces the ellipsis column to actually shrink */
+  width: 100%;
+}
+.table-wrap .kv {
+  color: var(--ink-3);
+}
+.table-more {
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---- timeline row expansion ---- */
+tr.detail-row td {
+  background: var(--surface);
+  padding: 10px 16px;
+}
+.detail-body {
+  margin-bottom: 8px;
+}
+.kv-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin-bottom: 8px;
+}
+.kv-grid .k {
+  color: var(--ink-3);
+}
+.kv-grid .v {
+  word-break: break-all;
+}
+.detail-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+/* ---- files tab ---- */
+.subtoolbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  border-bottom: 1px solid var(--border);
+  color: var(--ink-2);
+  font-size: 12px;
+}
+
+/* ---- network tab summary strip ---- */
+.summary-strip {
+  padding: 8px 16px;
+  color: var(--ink-2);
+  font-size: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---- actions tab: chain groups ---- */
+.action-group {
+  border-bottom: 1px solid var(--grid);
+}
+.action-group-hdr {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 16px;
+  background: var(--surface);
+  width: 100%;
+  border: none;
+  text-align: left;
+}
+.action-group-hdr:hover {
+  background: var(--surface-2);
+}
+.action-group-hdr .caret {
+  color: var(--ink-3);
+  width: 1em;
+  display: inline-block;
+}
+.action-group-members {
+  padding-left: 0;
+}
+
+/* ---- proof tab ---- */
+.proof-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.proof-message {
+  color: var(--ink-2);
+  padding: 0 16px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.facts-grid {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 6px 16px;
+  padding: 16px;
+  border-bottom: 1px solid var(--border);
+}
+.facts-grid .k {
+  color: var(--ink-3);
+}
+.facts-grid .v ul {
+  margin: 0;
+  padding-left: 1.1em;
+}
+.proof-section-title {
+  padding: 10px 16px 4px;
+  color: var(--ink-2);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.segment-strip {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 4px 16px 12px;
+}
+.segment-chip {
+  --chip-color: var(--s-warn);
+  border-radius: 4px;
+  padding: 3px 8px;
+  font-weight: 700;
+  font-size: 0.75rem;
+  color: var(--chip-color);
+  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--chip-color) 45%, transparent);
+}
+.segment-connector {
+  color: var(--ink-3);
+}
+.segment-connector.linked {
+  color: var(--s-good);
+}
+
+/* ---- processes tab (phase-1 fallback) ---- */
+.processes-fallback pre {
+  margin: 12px 16px;
+  padding: 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: auto;
+  font-size: 12px;
+}
+.processes-fallback .note {
+  padding: 12px 16px 0;
+  color: var(--ink-3);
+}
+
+/* ---- dashboard layout ---- */
+body[data-page="dashboard"] #app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+.dash-layout {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+.dash-sidebar {
+  flex: 0 0 300px;
+  width: 300px;
+  border-right: 1px solid var(--border);
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.dash-sidebar-hdr {
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+  z-index: 5;
+}
+.dash-sidebar-hdr h1 {
+  font-size: 0.95rem;
+}
+.dash-sidebar-hdr .counts {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  margin: 2px 0 6px;
+}
+.dash-sidebar-hdr input[type="search"] {
+  width: 100%;
+}
+.session-list {
+  overflow: auto;
+}
+.session-card {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: none;
+  border-bottom: 1px solid var(--grid);
+  border-left: 3px solid transparent;
+  padding: 8px 12px;
+  background: none;
+}
+.session-card:hover {
+  background: var(--surface-2);
+}
+.session-card.selected {
+  background: var(--surface-2);
+  border-left-color: var(--info);
+}
+.session-card .row1 {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  word-break: break-all;
+}
+.session-card .row2 {
+  color: var(--ink-3);
+  font-size: 11.5px;
+  margin-top: 3px;
+}
+.session-card .row3 {
+  margin-top: 4px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.dash-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.dash-main .empty {
+  padding: 24px;
+}
+
+@media (max-width: 900px) {
+  .dash-layout {
+    flex-direction: column;
+    height: auto;
+  }
+  .dash-sidebar {
+    width: 100%;
+    flex: 0 0 auto;
+    max-height: 40vh;
+    border-right: 0;
+    border-bottom: 1px solid var(--border);
+  }
+}
+
+/* ---- processes tab (phase 2) ---- */
+/* Fork/exec process explorer (internal/view/processes.js). Reuses existing
+   tokens/components (.chip, .ktext, .pulse-dot, .btn, .toggle, .kv-grid,
+   .detail-actions, .copy-btn, .mono-num, .ellipsis, .empty, .meta) as-is;
+   only new proc-* component classes are defined below. */
+.proc-hint {
+  padding: 6px 16px;
+  color: var(--ink-3);
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--border);
+}
+.proc-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+.proc-viewswitch {
+  display: inline-flex;
+}
+.proc-viewswitch .btn {
+  border-radius: 0;
+}
+.proc-viewswitch .btn:first-child {
+  border-radius: 6px 0 0 6px;
+}
+.proc-viewswitch .btn:last-child {
+  border-radius: 0 6px 6px 0;
+  margin-left: -1px;
+}
+.proc-search {
+  width: 220px;
+  max-width: 40vw;
+}
+
+.proc-layout {
+  display: flex;
+  flex: 1 1 auto;
+  min-height: 0;
+  /* The tab pane is an ordinary auto-height block, so `flex: 1 1 auto` here
+     has nothing to grow into: without a definite height the graph's
+     `height: 100%` collapses to the SVG default (~150px) and the tree never
+     scrolls internally. 70vh is the same viewport budget .table-wrap gives
+     the tables on every other tab. */
+  height: 70vh;
+}
+.proc-main {
+  flex: 1 1 auto;
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+.proc-side {
+  flex: 0 0 340px;
+  width: 340px;
+  overflow: auto;
+  border-left: 1px solid var(--border);
+  padding: 12px 16px;
+}
+@media (max-width: 900px) {
+  .proc-layout {
+    flex-direction: column;
+  }
+  .proc-side {
+    width: 100%;
+    flex: 0 0 auto;
+    max-height: 50vh;
+    border-left: 0;
+    border-top: 1px solid var(--border);
+  }
+}
+
+/* ---- tree ---- */
+.proc-tree-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+}
+.proc-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 10px 3px calc(10px + var(--depth, 0) * 18px);
+  border-bottom: 1px solid var(--grid);
+  cursor: pointer;
+}
+.proc-row:hover {
+  background: var(--surface-2);
+}
+.proc-row-taskchip,
+.proc-row-taskmore {
+  cursor: default;
+}
+.proc-row-taskmore:hover {
+  background: none;
+}
+.proc-row-taskmini {
+  color: var(--ink-3);
+}
+.proc-row-taskmore {
+  color: var(--ink-3);
+  font-style: italic;
+}
+/* Match declared before selected so a selected+matching row's stronger
+   border wins the tie (equal specificity, later rule wins). */
+.proc-row-match {
+  box-shadow: inset 3px 0 0 0 color-mix(in srgb, var(--info) 55%, transparent);
+}
+.proc-row-selected {
+  background: var(--surface-2);
+  box-shadow: inset 3px 0 0 0 var(--info);
+}
+.proc-caret-btn,
+.proc-caret-spacer {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  flex: 0 0 16px;
+}
+.proc-caret-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--ink-3);
+  font-size: 10px;
+}
+.proc-caret-btn:hover {
+  color: var(--ink);
+}
+.proc-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--chip-color);
+  fill: var(--chip-color);
+  flex: 0 0 auto;
+}
+.proc-pid {
+  min-width: 4.5em;
+  color: var(--ink-2);
+}
+.proc-bin {
+  font-weight: 700;
+  white-space: nowrap;
+}
+.proc-bin-task {
+  font-weight: 400;
+  font-style: italic;
+  color: var(--ink-3);
+}
+.proc-argv {
+  min-width: 0;
+  flex: 1 1 auto;
+  color: var(--ink-3);
+}
+.proc-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  margin-left: auto;
+  white-space: nowrap;
+}
+.proc-empty {
+  padding: 16px;
+}
+.proc-empty-root {
+  padding: 24px;
+}
+
+/* ---- detail panel ---- */
+.proc-detail-hdr {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.proc-detail-pid {
+  font-weight: 700;
+}
+.proc-detail-bin {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink-2);
+}
+.proc-detail-close {
+  margin-left: auto;
+}
+.proc-argv-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+}
+.proc-argv-wrap {
+  min-width: 0;
+  flex: 1 1 auto;
+  white-space: pre-wrap;
+}
+.proc-section-title {
+  padding: 10px 0 4px;
+  color: var(--ink-2);
+  font-size: 0.85rem;
+  font-weight: 600;
+}
+.proc-execchain {
+  margin: 0 0 10px;
+  padding-left: 1.2em;
+  color: var(--ink-2);
+}
+.proc-execchain li {
+  margin-bottom: 4px;
+}
+.proc-rawevents {
+  max-height: 160px;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+.proc-rawevent-row {
+  padding: 3px 8px;
+  border-bottom: 1px solid var(--grid);
+  color: var(--ink-3);
+  font-size: 11.5px;
+}
+.proc-rawevent-row:last-child {
+  border-bottom: none;
+}
+
+/* ---- graph ---- */
+.proc-graph-wrap {
+  position: relative;
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: hidden;
+}
+.proc-graph-svg {
+  width: 100%;
+  height: 100%;
+  display: block;
+  cursor: grab;
+}
+.proc-graph-grabbing {
+  cursor: grabbing;
+}
+.proc-graph-controls {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+}
+.proc-gnode {
+  cursor: pointer;
+}
+.proc-gnode-rect {
+  fill: var(--surface);
+}
+.proc-gtext {
+  fill: var(--ink);
+  font-size: 11px;
+  dominant-baseline: middle;
+}
+.proc-gtext-exit {
+  fill: var(--ink-3);
+  font-size: 11px;
+  dominant-baseline: middle;
+}
+.proc-gedge {
+  fill: none;
+  stroke-width: 1.5px;
+}
+.proc-graph-toomany {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 32px 16px;
+  color: var(--ink-3);
+  text-align: center;
+}

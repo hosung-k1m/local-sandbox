@@ -25,6 +25,15 @@ var indexHTML []byte
 //go:embed dashboard.html
 var dashboardHTML []byte
 
+//go:embed app.css
+var appCSS []byte
+
+//go:embed app.js
+var appJS []byte
+
+//go:embed processes.js
+var processesJS []byte
+
 // webEvent is one events row shaped for the web UI's JSON payload.
 type webEvent struct {
 	Seq            int64          `json:"seq"`
@@ -77,18 +86,23 @@ type dashboardPayload struct {
 // proofState exposes cryptographic proof status without implying that live
 // open-segment evidence has already been sealed.
 type proofState struct {
-	Status              string         `json:"status"` // sealed | sealed_unverified | provisional | unavailable
-	Provisional         bool           `json:"provisional"`
-	UnsealedTail        bool           `json:"unsealed_tail"`
-	Message             string         `json:"message"`
-	DigestAlgorithm     string         `json:"digest_algorithm"`
-	ChainValid          bool           `json:"chain_valid"`
-	SignatureFormat     string         `json:"signature_format"`
-	SignatureAlgorithm  string         `json:"signature_algorithm"`
-	RecorderFingerprint string         `json:"recorder_key_fingerprint,omitempty"`
-	Verdict             string         `json:"verdict,omitempty"`
-	Checks              []verify.Check `json:"checks,omitempty"`
-	Segments            []proofSegment `json:"segments"`
+	Status               string         `json:"status"` // sealed | sealed_unverified | provisional | unavailable
+	Provisional          bool           `json:"provisional"`
+	UnsealedTail         bool           `json:"unsealed_tail"`
+	Message              string         `json:"message"`
+	DigestAlgorithm      string         `json:"digest_algorithm"`
+	ChainValid           bool           `json:"chain_valid"`
+	SignatureFormat      string         `json:"signature_format"`
+	SignatureAlgorithm   string         `json:"signature_algorithm"`
+	RecorderFingerprint  string         `json:"recorder_key_fingerprint,omitempty"`
+	Verdict              string         `json:"verdict,omitempty"`
+	TrustRecordStatus    string         `json:"trust_record_status,omitempty"`
+	TrustRecordProfile   string         `json:"trust_record_profile,omitempty"`
+	TrustRecordAssurance string         `json:"trust_record_assurance,omitempty"`
+	TrustRecordSignature *bool          `json:"trust_record_signature_valid,omitempty"`
+	TrustRecordDerived   *bool          `json:"trust_record_cross_derived,omitempty"`
+	Checks               []verify.Check `json:"checks,omitempty"`
+	Segments             []proofSegment `json:"segments"`
 }
 
 // proofSegment is the digest/signature state for one segment file.
@@ -143,6 +157,14 @@ func ServeWeb(sessionDir, addr string) error {
 
 // ServeWebListener serves a single-session viewer on an already-bound listener.
 func ServeWebListener(sessionDir string, ln net.Listener) error {
+	return http.Serve(ln, newWebMux(sessionDir))
+}
+
+// newWebMux builds the single-session viewer's handler: the thin HTML shell
+// and its JSON event feed, plus the shared /assets/* client (registerAssets).
+// Factored out of ServeWebListener so tests can exercise it directly via
+// httptest, the same way newDashboardMux already is.
+func newWebMux(sessionDir string) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
@@ -163,7 +185,27 @@ func ServeWebListener(sessionDir string, ln net.Listener) error {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
-	return http.Serve(ln, mux)
+	registerAssets(mux)
+	return mux
+}
+
+// registerAssets serves the vanilla-JS/CSS client shared by the single-session
+// viewer and the dashboard (see app.js/app.css) at /assets/*. Both pages'
+// thin HTML shells load these two files; nothing else in the JSON API or
+// evidence pipeline changes.
+func registerAssets(mux *http.ServeMux) {
+	mux.HandleFunc("/assets/app.css", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		w.Write(appCSS)
+	})
+	mux.HandleFunc("/assets/app.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Write(appJS)
+	})
+	mux.HandleFunc("/assets/processes.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Write(processesJS)
+	})
 }
 
 // ServeDashboard serves the global session dashboard on addr.
@@ -229,6 +271,7 @@ func newDashboardMux() *http.ServeMux {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
+	registerAssets(mux)
 	return mux
 }
 
@@ -485,6 +528,11 @@ func buildProofState(sessionDir string, state session.State, report verify.Repor
 		proof.ChainValid = report.Facets.ChainValid
 		proof.RecorderFingerprint = report.Facets.RecorderFingerprint
 		proof.Verdict = string(report.Verdict)
+		proof.TrustRecordStatus = report.Facets.TrustRecordStatus
+		proof.TrustRecordProfile = report.Facets.TrustRecordProfile
+		proof.TrustRecordAssurance = report.Facets.TrustRecordAssurance
+		proof.TrustRecordSignature = &report.Facets.TrustRecordSignature
+		proof.TrustRecordDerived = &report.Facets.TrustRecordDerived
 		proof.Checks = report.Checks
 	}
 	switch {
