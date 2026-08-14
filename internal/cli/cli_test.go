@@ -3,14 +3,17 @@ package cli
 import (
 	"bytes"
 	"context"
+	"io"
 	"reflect"
 	"runtime"
 	"strings"
 	"testing"
 
+	"boxedai/internal/evidence"
 	"boxedai/internal/image"
 	"boxedai/internal/policy"
 	"boxedai/internal/session"
+	"boxedai/internal/view"
 )
 
 // allSubcommands is every subcommand exposed by the root command.
@@ -285,5 +288,92 @@ func TestBuildImageRejectsUnknownArch(t *testing.T) {
 	}
 	if called {
 		t.Error("buildImage must not be invoked when arch validation fails")
+	}
+}
+
+// Flag parsing for `view` must build the right view.Filter, defaulting to
+// hiding process.created noise; viewTimeline is stubbed so no session
+// directory is ever read.
+func TestViewFlagsMapToFilter(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+		want view.Filter
+	}{
+		{
+			name: "defaults hide process.created noise",
+			args: []string{"view", "bx-test"},
+			want: view.Filter{ExcludeNames: []string{evidence.EventProcessCreated}},
+		},
+		{
+			name: "--all disables default noise hiding",
+			args: []string{"view", "bx-test", "--all"},
+			want: view.Filter{},
+		},
+		{
+			name: "--agent-activity sets the preset instead of ExcludeNames",
+			args: []string{"view", "bx-test", "--agent-activity"},
+			want: view.Filter{AgentActivity: true},
+		},
+		{
+			name: "--name/--class/--since pass through alongside default hiding",
+			args: []string{"view", "bx-test", "--name", "tool.requested", "--class", "harness_observed", "--since", "2026-01-01T00:00:00Z"},
+			want: view.Filter{
+				Name: "tool.requested", Class: "harness_observed", Since: "2026-01-01T00:00:00Z",
+				ExcludeNames: []string{evidence.EventProcessCreated},
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got view.Filter
+			var called bool
+			restore := viewTimeline
+			viewTimeline = func(_ string, filter view.Filter, _ io.Writer) error {
+				called = true
+				got = filter
+				return nil
+			}
+			t.Cleanup(func() { viewTimeline = restore })
+
+			root := newRootCmd()
+			var out bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&out)
+			root.SetArgs(tc.args)
+			if err := root.Execute(); err != nil {
+				t.Fatalf("execute view: %v", err)
+			}
+			if !called {
+				t.Fatal("viewTimeline was never invoked")
+			}
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Fatalf("Filter mismatch:\n got %+v\nwant %+v", got, tc.want)
+			}
+		})
+	}
+}
+
+// --all and --agent-activity are mutually exclusive: the CLI must reject the
+// combination before ever invoking viewTimeline.
+func TestViewAllAndAgentActivityMutuallyExclusive(t *testing.T) {
+	var called bool
+	restore := viewTimeline
+	viewTimeline = func(_ string, _ view.Filter, _ io.Writer) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { viewTimeline = restore })
+
+	root := newRootCmd()
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"view", "bx-test", "--all", "--agent-activity"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("expected error for --all combined with --agent-activity")
+	}
+	if called {
+		t.Error("viewTimeline must not be invoked when validation fails")
 	}
 }

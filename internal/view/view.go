@@ -10,6 +10,7 @@
 package view
 
 import (
+	"sort"
 	"strconv"
 	"strings"
 
@@ -21,9 +22,73 @@ import (
 // Filter narrows Timeline (and the web timeline) to a subset of events. Empty
 // fields are unconstrained.
 type Filter struct {
-	Name  string // exact event name, e.g. "process.executed"
-	Class string // exact evidence class, e.g. "kernel_observed"
-	Since string // RFC3339 timestamp; only events with ts >= Since are included
+	Name          string   // exact event name, e.g. "process.executed"
+	Class         string   // exact evidence class, e.g. "kernel_observed"
+	Since         string   // RFC3339 timestamp; only events with ts >= Since are included
+	ExcludeNames  []string // event names to omit, e.g. noisy "process.created" churn
+	AgentActivity bool     // the --agent-activity preset: restrict to agentActivityNames
+}
+
+// agentActivityNames is the include-set for the --agent-activity preset:
+// event names that represent what the agent itself did (tool calls, executed
+// processes with argv, file changes, network attempts, model calls) plus
+// rare lifecycle/context events, excluding process-table churn
+// (process.created, process.exited) that carries no actionable content.
+var agentActivityNames = map[string]bool{
+	evidence.EventToolRequested:       true,
+	evidence.EventToolCompleted:       true,
+	evidence.EventProcessExecuted:     true,
+	evidence.EventFileChanged:         true,
+	evidence.EventFileDeleted:         true,
+	evidence.EventNetworkConnected:    true,
+	evidence.EventNetworkDenied:       true,
+	evidence.EventModelRequested:      true,
+	evidence.EventModelCompleted:      true,
+	evidence.EventSessionGranted:      true,
+	evidence.EventSessionStarted:      true,
+	evidence.EventSessionStopped:      true,
+	evidence.EventSessionSealed:       true,
+	evidence.EventPolicyLoaded:        true,
+	evidence.EventSensorStarted:       true,
+	evidence.EventSensorLoss:          true,
+	evidence.EventSensorRestarted:     true,
+	evidence.EventCredentialIssued:    true,
+	evidence.EventCredentialRevoked:   true,
+	evidence.EventWorkspaceManifested: true,
+}
+
+// AgentActivityNames returns the --agent-activity include-set, sorted. It is
+// exported so web.go can serve it to the client as webPayload's
+// agent_activity_names field: the CLI's SQL exclusion
+// (excludeNamesForAgentActivity, below) and the web viewer's client-side
+// Timeline filter both derive from this single Go-side definition instead of
+// keeping two hand-maintained copies of the name list in sync. The
+// guest-agent-binary process.executed drop (isGuestAgentBinaryExec in
+// timeline.go) is a per-event attrs predicate, not a static name set, so it
+// is mirrored — not shared — in app.js; keep the two in sync by hand if
+// either changes.
+func AgentActivityNames() []string {
+	out := make([]string, 0, len(agentActivityNames))
+	for name := range agentActivityNames {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// excludeNamesForAgentActivity returns every catalog event name not in
+// agentActivityNames, expressing the --agent-activity preset through the
+// same Filter.ExcludeNames plumbing queryEvents already uses for default
+// noise-hiding.
+func excludeNamesForAgentActivity() []string {
+	out := make([]string, 0, len(evidence.Catalog))
+	for name := range evidence.Catalog {
+		if !agentActivityNames[name] {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // classBadges maps evidence classes to the short, human-readable badges shown

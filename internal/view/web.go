@@ -54,13 +54,14 @@ type webEvent struct {
 // vanilla JS derives the file-changes, network-attempts and internal-tool-call
 // views from Events client-side.
 type webPayload struct {
-	SessionID    string         `json:"session_id"`
-	PolicyDigest string         `json:"policy_digest"`
-	Verify       *verify.Report `json:"verify,omitempty"`
-	VerifyError  string         `json:"verify_error,omitempty"`
-	Proof        proofState     `json:"proof"`
-	ProcessTree  string         `json:"process_tree"`
-	Events       []webEvent     `json:"events"`
+	SessionID          string         `json:"session_id"`
+	PolicyDigest       string         `json:"policy_digest"`
+	Verify             *verify.Report `json:"verify,omitempty"`
+	VerifyError        string         `json:"verify_error,omitempty"`
+	Proof              proofState     `json:"proof"`
+	ProcessTree        string         `json:"process_tree"`
+	Events             []webEvent     `json:"events"`
+	AgentActivityNames []string       `json:"agent_activity_names"` // the --agent-activity include-set (view.AgentActivityNames), single-sourced for the client's matching toggle
 }
 
 // dashboardSession is one row in the global dashboard session list.
@@ -428,10 +429,11 @@ func buildWebPayload(sessionDir string) (webPayload, error) {
 	}
 
 	payload := webPayload{
-		SessionID:    sessionID,
-		PolicyDigest: policyDigest,
-		ProcessTree:  tree,
-		Events:       events,
+		SessionID:          sessionID,
+		PolicyDigest:       policyDigest,
+		ProcessTree:        tree,
+		Events:             events,
+		AgentActivityNames: AgentActivityNames(),
 	}
 	state := loadSessionState(sessionDir)
 	if report, err := verify.Verify(sessionDir); err != nil {

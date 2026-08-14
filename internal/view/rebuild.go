@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	logsv1 "go.opentelemetry.io/proto/otlp/logs/v1"
@@ -204,6 +205,18 @@ func queryEvents(db *sql.DB, filter Filter) ([]eventRow, error) {
 	if filter.Since != "" {
 		query += " AND ts >= ?"
 		args = append(args, filter.Since)
+	}
+	excludeNames := filter.ExcludeNames
+	if filter.AgentActivity {
+		excludeNames = append(append([]string(nil), excludeNames...), excludeNamesForAgentActivity()...)
+	}
+	if len(excludeNames) > 0 {
+		placeholders := make([]string, len(excludeNames))
+		for i, name := range excludeNames {
+			placeholders[i] = "?"
+			args = append(args, name)
+		}
+		query += " AND name NOT IN (" + strings.Join(placeholders, ",") + ")"
 	}
 	query += " ORDER BY seq ASC"
 

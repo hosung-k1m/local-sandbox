@@ -166,6 +166,14 @@ func TestRebuildProjectsEvents(t *testing.T) {
 	if row1.Body != "npm install" {
 		t.Errorf("row 1 body = %q, want %q", row1.Body, "npm install")
 	}
+
+	excluded, err := queryEvents(db, Filter{ExcludeNames: []string{evidence.EventProcessExecuted}})
+	if err != nil {
+		t.Fatalf("queryEvents with ExcludeNames: %v", err)
+	}
+	if len(excluded) != 1 || excluded[0].Name != evidence.EventSessionGranted {
+		t.Errorf("queryEvents with ExcludeNames = %+v, want only %s", excluded, evidence.EventSessionGranted)
+	}
 }
 
 func TestTimelineOutput(t *testing.T) {
@@ -179,6 +187,11 @@ func TestTimelineOutput(t *testing.T) {
 		{
 			seq: 2, name: evidence.EventEffectApproved, class: evidence.ClassBrokerMediated,
 			producer: evidence.ChannelBroker, outcome: evidence.OutcomeSuccess, body: "pr-comment approved",
+			attrs: map[string]any{
+				"vm.id":                  "vm-0123456789abcdef0123456789abcdef",
+				"process.parent_exec_id": "cGFyZW50LWV4ZWMtaWQtYmFzZTY0LXBheWxvYWQtZm9yLXRlc3Rpbmc=",
+				"harness.tool.input":     strings.Repeat("x", 250),
+			},
 		},
 	})
 
@@ -191,9 +204,15 @@ func TestTimelineOutput(t *testing.T) {
 	for _, want := range []string{
 		evidence.EventNetworkDenied, evidence.EventEffectApproved,
 		"[KERNEL]", "[BROKER]", "network.address=93.184.216.34:443",
+		"harness.tool.input=" + strings.Repeat("x", 200) + "...",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("Timeline output missing %q; got:\n%s", want, out)
+		}
+	}
+	for _, notWant := range []string{"vm.id=", "process.parent_exec_id=", strings.Repeat("x", 201)} {
+		if strings.Contains(out, notWant) {
+			t.Errorf("Timeline output should not contain %q; got:\n%s", notWant, out)
 		}
 	}
 
@@ -208,6 +227,122 @@ func TestTimelineOutput(t *testing.T) {
 	}
 	if !strings.Contains(filtered, evidence.EventEffectApproved) {
 		t.Errorf("filtered Timeline output missing %q; got:\n%s", evidence.EventEffectApproved, filtered)
+	}
+}
+
+// TestTimelineDefaultHidesProcessCreatedNoise exercises the CLI's default
+// filter (ExcludeNames: []string{"process.created"}): the noisy events must
+// be hidden and a trailer must report how many were hidden.
+func TestTimelineDefaultHidesProcessCreatedNoise(t *testing.T) {
+	sessionDir := t.TempDir()
+	events := []testEvent{
+		{seq: 1, name: evidence.EventSessionGranted, class: evidence.ClassIntegrity, producer: evidence.ChannelController, outcome: evidence.OutcomeSuccess},
+	}
+	for i := 0; i < 3; i++ {
+		events = append(events, testEvent{
+			seq: int64(2 + i), name: evidence.EventProcessCreated, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess,
+		})
+	}
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", events)
+
+	var buf bytes.Buffer
+	if err := Timeline(sessionDir, Filter{ExcludeNames: []string{evidence.EventProcessCreated}}, &buf); err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	out := buf.String()
+	if strings.Contains(out, "[KERNEL]") {
+		t.Errorf("default Timeline output contains hidden process.created rows; got:\n%s", out)
+	}
+	if !strings.Contains(out, "showing 1 of 4 events (3 process.created hidden; --all to show)") {
+		t.Errorf("Timeline output missing trailer; got:\n%s", out)
+	}
+}
+
+// TestTimelineAllShowsEverythingWithNoTrailer exercises the --all case: an
+// empty Filter must show every event and print no trailer.
+func TestTimelineAllShowsEverythingWithNoTrailer(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{seq: 1, name: evidence.EventSessionGranted, class: evidence.ClassIntegrity, producer: evidence.ChannelController, outcome: evidence.OutcomeSuccess},
+		{seq: 2, name: evidence.EventProcessCreated, class: evidence.ClassKernelObserved, producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess},
+	})
+
+	var buf bytes.Buffer
+	if err := Timeline(sessionDir, Filter{}, &buf); err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, evidence.EventProcessCreated) {
+		t.Errorf("--all Timeline output should include %q; got:\n%s", evidence.EventProcessCreated, out)
+	}
+	if strings.Contains(out, "showing") {
+		t.Errorf("--all Timeline output should have no trailer; got:\n%s", out)
+	}
+}
+
+// TestTimelineAgentActivityPreset exercises Filter.AgentActivity: it must
+// include real agent activity, exclude process.created/process.exited churn,
+// and drop process.executed rows for the guest agent's own binary (hook
+// subprocesses observing themselves) in both shapes Claude Code actually
+// produces: a direct exec, and — the common case — invoked via a shell
+// wrapper (process.binary=/bin/sh, process.argv containing the full guest
+// agent path), since Claude Code runs hooks through `sh -c`.
+func TestTimelineAgentActivityPreset(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{
+			seq: 1, name: evidence.EventToolRequested, class: evidence.ClassHarnessObserved,
+			producer: evidence.ChannelWorkload, outcome: evidence.OutcomeSuccess,
+		},
+		{
+			seq: 2, name: evidence.EventProcessCreated, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess,
+		},
+		{
+			seq: 3, name: evidence.EventProcessExited, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess,
+		},
+		{
+			seq: 4, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "npm ci",
+			attrs: map[string]any{"process.binary": "/usr/bin/npm"},
+		},
+		{
+			// Direct exec of the guest agent binary.
+			seq: 5, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "boxedai-guest-agent righthook",
+			attrs: map[string]any{"process.binary": "/usr/local/bin/boxedai-guest-agent"},
+		},
+		{
+			// Real shape: Claude Code invokes hooks via a shell, so tetragon/procfs
+			// observe /bin/sh with the guest agent invocation in argv, not as
+			// process.binary.
+			seq: 6, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "sh -c '/usr/local/bin/boxedai-guest-agent lefthook'",
+			attrs: map[string]any{"process.binary": "/bin/sh", "process.argv": `-c "/usr/local/bin/boxedai-guest-agent lefthook"`},
+		},
+	})
+
+	var buf bytes.Buffer
+	if err := Timeline(sessionDir, Filter{AgentActivity: true}, &buf); err != nil {
+		t.Fatalf("Timeline: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, evidence.EventToolRequested) {
+		t.Errorf("agent-activity output missing %q; got:\n%s", evidence.EventToolRequested, out)
+	}
+	if strings.Contains(out, evidence.EventProcessCreated) || strings.Contains(out, evidence.EventProcessExited) {
+		t.Errorf("agent-activity output should exclude process.created/process.exited; got:\n%s", out)
+	}
+	if !strings.Contains(out, "npm ci") {
+		t.Errorf("agent-activity output missing real process.executed row; got:\n%s", out)
+	}
+	if strings.Contains(out, "boxedai-guest-agent") {
+		t.Errorf("agent-activity output should drop every guest-agent-binary process.executed row (direct exec and shell wrapper); got:\n%s", out)
+	}
+	if !strings.Contains(out, "showing 2 of 6 events (4 hidden; --all to show)") {
+		t.Errorf("Timeline output missing trailer; got:\n%s", out)
 	}
 }
 
@@ -278,6 +413,23 @@ func TestBuildWebPayloadIncludesProofAndActionTimeline(t *testing.T) {
 	if ev.Attrs["tool.name"] != "github/repo_view" {
 		t.Errorf("attrs = %+v, want tool.name", ev.Attrs)
 	}
+	// The web viewer's client-side agent-activity toggle mirrors this include-set
+	// from the payload rather than hand-maintaining a second copy in app.js.
+	if !containsStr(payload.AgentActivityNames, evidence.EventToolRequested) {
+		t.Errorf("AgentActivityNames = %v, want it to include %s", payload.AgentActivityNames, evidence.EventToolRequested)
+	}
+	if containsStr(payload.AgentActivityNames, evidence.EventProcessCreated) {
+		t.Errorf("AgentActivityNames = %v, should not include %s", payload.AgentActivityNames, evidence.EventProcessCreated)
+	}
+}
+
+func containsStr(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
 
 func TestBuildProofStateSurfacesTrustRecordFacets(t *testing.T) {

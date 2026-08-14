@@ -230,6 +230,23 @@ function nameGroup(name) {
 
 var PROCESS_CREATED = "process.created";
 
+// GUEST_AGENT_BINARY_PATH/isGuestAgentBinaryExec mirror
+// internal/view/timeline.go's guestAgentBinaryPath/isGuestAgentBinaryExec for
+// the "Agent activity" preset (the include-set itself is served from Go as
+// ctx.agentActivityNames, see setSessionViewPayload). Claude Code invokes
+// hooks via a shell, so the common shape is process.binary=/bin/sh with the
+// full guest-agent path in process.argv, not process.binary itself; this
+// predicate — unlike the static name set — can't be served from the Go side
+// without a redundant per-event server-side flag, so it is mirrored by hand
+// here. Keep it in sync with timeline.go if either changes.
+var GUEST_AGENT_BINARY_PATH = "/usr/local/bin/boxedai-guest-agent";
+function isGuestAgentBinaryExec(ev) {
+  if (ev.name !== "process.executed") return false;
+  if (attrRaw(ev, "process.binary") === GUEST_AGENT_BINARY_PATH) return true;
+  var argv = attrRaw(ev, "process.argv");
+  return typeof argv === "string" && argv.indexOf(GUEST_AGENT_BINARY_PATH) !== -1;
+}
+
 var HASH_DEBOUNCE_MS = 200;
 var SEARCH_DEBOUNCE_MS = 150;
 var POLL_MS = 3000;
@@ -253,6 +270,7 @@ function defaultState() {
     producers: [], // selected producer strings; [] = unconstrained
     pid: "",
     hideNoise: true, // "Hide process noise" preset, default ON
+    agentActivity: false, // "Agent activity" preset, opt-in; implies hideNoise (see computeTimelineFilter)
     errorsOnly: false,
     filesMode: "latest", // "all" | "latest"
     actionsMode: "chain", // "flat" | "chain"
@@ -283,6 +301,7 @@ function serializeStateForHash(state) {
     prod: state.producers,
     pid: state.pid,
     noise: state.hideNoise,
+    aa: state.agentActivity,
     err: state.errorsOnly,
   };
   if (state.selectedSession) out.sess = state.selectedSession;
@@ -326,6 +345,7 @@ function restoreStateFromHash(state) {
   if (Array.isArray(obj.prod)) state.producers = obj.prod.filter(isStr);
   if (typeof obj.pid === "string") state.pid = obj.pid;
   if (typeof obj.noise === "boolean") state.hideNoise = obj.noise;
+  if (typeof obj.aa === "boolean") state.agentActivity = obj.aa;
   if (typeof obj.err === "boolean") state.errorsOnly = obj.err;
   if (typeof obj.sess === "string") state.selectedSession = obj.sess;
 }
@@ -351,6 +371,7 @@ function clearFilters(state) {
   state.producers = [];
   state.pid = "";
   state.hideNoise = true;
+  state.agentActivity = false;
   state.errorsOnly = false;
 }
 
@@ -456,10 +477,17 @@ function bump(map, key) {
 // value in one facet narrows the others without hiding the remaining
 // options within that same facet (e.g. selecting KERNEL still shows how
 // many BROKER/HARNESS/... events are available). Free-text search, the pid
-// filter, and the errors-only/hide-noise presets are not enumerable facets
-// (no per-value picklist), so they gate everything as plain AND conditions
-// — this stays a single O(n) walk with O(1) per-event work.
-function computeTimelineFilter(model, state) {
+// filter, and the errors-only/hide-noise/agent-activity presets are not
+// enumerable facets (no per-value picklist), so they gate everything as plain
+// AND conditions — this stays a single O(n) walk with O(1) per-event work.
+//
+// agentActivityNames is the --agent-activity include-set served by the
+// server (payload.agent_activity_names, see ctx.agentActivityNames) so both
+// the CLI and this client-side filter derive the name list from one Go-side
+// definition (internal/view/view.go's agentActivityNames); it is a Set of
+// event names, unrelated to the per-event isGuestAgentBinaryExec predicate
+// applied alongside it below.
+function computeTimelineFilter(model, state, agentActivityNames) {
   var events = model.events;
   var searchQ = state.search.trim().toLowerCase();
   var pidQ = state.pid.trim();
@@ -467,6 +495,7 @@ function computeTimelineFilter(model, state) {
   var wantNames = new Set(state.names);
   var wantOutcomes = new Set(state.outcomes);
   var wantProducers = new Set(state.producers);
+  var activityNames = agentActivityNames || new Set();
 
   var indices = [];
   var classCounts = new Map();
@@ -501,7 +530,17 @@ function computeTimelineFilter(model, state) {
 
     if (!okClass || !okName || !okOutcome || !okProducer) continue;
 
-    if (state.hideNoise && ev.name === PROCESS_CREATED) {
+    // agent-activity is a stronger preset than hide-noise (it implies hiding
+    // process.created/process.exited too, plus the guest agent's own hook
+    // subprocess execs), so it takes over the noise-hiding slot entirely
+    // rather than stacking with it — matching the CLI's --agent-activity,
+    // which is mutually exclusive with --all/no-filter in the same spirit.
+    if (state.agentActivity) {
+      if (!activityNames.has(ev.name) || isGuestAgentBinaryExec(ev)) {
+        hiddenNoise++;
+        continue;
+      }
+    } else if (state.hideNoise && ev.name === PROCESS_CREATED) {
       hiddenNoise++;
       continue;
     }
@@ -560,7 +599,8 @@ function activeFilterChips(state) {
   state.producers.forEach(function (p) { chips.push({ kind: "producer", value: p, label: "producer " + p }); });
   if (state.pid) chips.push({ kind: "pid", value: "", label: "pid " + state.pid });
   if (state.errorsOnly) chips.push({ kind: "errorsOnly", value: "", label: "errors only" });
-  if (!state.hideNoise) chips.push({ kind: "noiseShown", value: "", label: "process.created shown" });
+  if (state.agentActivity) chips.push({ kind: "agentActivity", value: "", label: "agent activity only" });
+  else if (!state.hideNoise) chips.push({ kind: "noiseShown", value: "", label: "process.created shown" });
   return chips;
 }
 function clearActiveFilter(state, kind, value) {
@@ -572,6 +612,7 @@ function clearActiveFilter(state, kind, value) {
     case "producer": toggleInArray(state.producers, value); break;
     case "pid": state.pid = ""; break;
     case "errorsOnly": state.errorsOnly = false; break;
+    case "agentActivity": state.agentActivity = false; break;
     case "noiseShown": state.hideNoise = true; break;
   }
 }
@@ -644,7 +685,10 @@ function timelineFilterBarHtml(ctx, filtered) {
       (s.namePopoverOpen ? '<div class="popover" data-role="name-popover">' + nameGroupPopoverHtml(s, filtered.nameCounts) + "</div>" : "") +
     "</div>" +
     '<input type="text" inputmode="numeric" placeholder="pid" value="' + esc(s.pid) + '" data-act="pid" size="6">' +
-    '<label class="toggle"><input type="checkbox" data-act="hide-noise"' + (s.hideNoise ? " checked" : "") + "> hide process noise</label>" +
+    '<label class="toggle"><input type="checkbox" data-act="hide-noise"' + (s.hideNoise || s.agentActivity ? " checked" : "") +
+      (s.agentActivity ? " disabled" : "") + "> hide process noise</label>" +
+    '<label class="toggle"><input type="checkbox" data-act="agent-activity"' + (s.agentActivity ? " checked" : "") +
+      "> agent activity</label>" +
     '<label class="toggle"><input type="checkbox" data-act="errors-only"' + (s.errorsOnly ? " checked" : "") + "> errors only</label>" +
     '<button type="button" class="btn small" data-act="clear-filters">clear filters</button>' +
     '<span class="spacer"></span>' +
@@ -685,7 +729,9 @@ function nameGroupPopoverHtml(state, nameCounts) {
 
 function timelineResultsLineHtml(ctx, filtered, total) {
   var bits = ["showing " + numFmt(filtered.indices.length) + " of " + numFmt(total) + " events"];
-  if (filtered.hiddenNoise > 0) {
+  if (filtered.hiddenNoise > 0 && ctx.state.agentActivity) {
+    bits.push(numFmt(filtered.hiddenNoise) + ' hidden (agent activity) <button type="button" class="btn link" data-act="show-noise">show everything</button>');
+  } else if (filtered.hiddenNoise > 0) {
     bits.push(numFmt(filtered.hiddenNoise) + ' process.created hidden <button type="button" class="btn link" data-act="show-noise">show</button>');
   }
   var chips = activeFilterChips(ctx.state).map(function (c) {
@@ -833,7 +879,7 @@ function renderTimelineFilterbarOnly(ctx) {
 }
 
 function updateTimelineTab(ctx, appendMode) {
-  var filtered = computeTimelineFilter(ctx.model, ctx.state);
+  var filtered = computeTimelineFilter(ctx.model, ctx.state, ctx.agentActivityNames);
   ctx.timelineFiltered = filtered;
   var total = ctx.model.events.length;
   var displayIdx = timelineDisplayIndices(filtered, ctx.state);
@@ -863,6 +909,9 @@ function bindTimelineEvents(ctx, container) {
     var t = e.target;
     if (t.matches('[data-act="hide-noise"]')) {
       ctx.state.hideNoise = t.checked;
+    } else if (t.matches('[data-act="agent-activity"]')) {
+      ctx.state.agentActivity = t.checked;
+      if (t.checked) ctx.state.hideNoise = true; // agent-activity supersedes hide-noise, see computeTimelineFilter
     } else if (t.matches('[data-act="errors-only"]')) {
       ctx.state.errorsOnly = t.checked;
     } else if (t.matches('[data-act="toggle-name"]')) {
@@ -893,7 +942,7 @@ function bindTimelineEvents(ctx, container) {
       if (act === "toggle-name-popover") { ctx.state.namePopoverOpen = !ctx.state.namePopoverOpen; renderTimelineFilterbarOnly(ctx); return; }
       if (act === "clear-filters") { clearFilters(ctx.state); resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
       if (act === "tl-sort") { ctx.state.sort = ctx.state.sort === "asc" ? "desc" : "asc"; resetTimelineChunk(ctx.state); updateTimelineTab(ctx); return; }
-      if (act === "show-noise") { ctx.state.hideNoise = false; resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
+      if (act === "show-noise") { ctx.state.hideNoise = false; ctx.state.agentActivity = false; resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
       if (act === "clear-chip") { clearActiveFilter(ctx.state, btn.dataset.kind, btn.dataset.value); resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
       if (act === "tl-more") {
         var d1 = timelineDisplayIndices(ctx.timelineFiltered, ctx.state);
@@ -1623,6 +1672,7 @@ function createSessionView(rootEl, opts) {
     state: defaultState(),
     payload: null,
     model: null,
+    agentActivityNames: new Set(), // repopulated per payload in setSessionViewPayload from payload.agent_activity_names
     root: rootEl,
     els: {},
     mode: opts.mode || "standalone",
@@ -1759,6 +1809,7 @@ function setSessionViewPayload(ctx, payload) {
   }
 
   ctx.payload = payload;
+  ctx.agentActivityNames = new Set(payload.agent_activity_names || []);
   ctx.lastUpdatedAt = new Date().toISOString();
   ctx.prevSummary = newSummary;
 
