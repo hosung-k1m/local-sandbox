@@ -19,9 +19,11 @@ const configPath = "/etc/boxedai/agent.json"
 // session cgroup, drain, final flush").
 const stopSentinel = "/etc/boxedai/stop"
 
-// processSensorReadyPath is created only after the process sensor parses a
-// fresh Tetragon process lifecycle event. Procfs is diagnostic-only and never
-// establishes workload launch readiness.
+// processSensorReadyPath is created once the process sensor can actually observe
+// processes: after a fresh Tetragon lifecycle event, or — as the bounded fallback
+// when Tetragon cannot satisfy that gate in time — on the procfs watcher's first
+// scan, whose sensor.started/sensor.restarted evidence marks the coverage
+// incomplete and drives an INCOMPLETE verdict.
 // VM.WaitHealthy requires it before launching the harness.
 const processSensorReadyPath = "/run/boxedai/process-sensor-ready"
 

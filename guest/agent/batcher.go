@@ -10,10 +10,11 @@ import (
 )
 
 const (
-	// batchFlushInterval and batchMaxSize implement DESIGN.md's "batched
-	// (flush every ~500ms or 50 events)".
+	// batchFlushInterval and batchMaxCoalesced implement DESIGN.md's "ordered
+	// micro-batches": flush as soon as the queue goes idle, at most
+	// batchMaxCoalesced events per POST, with the timed flush as the floor.
 	batchFlushInterval = 500 * time.Millisecond
-	batchMaxSize       = 50
+	batchMaxCoalesced  = 500
 
 	backoffInitial = 1 * time.Second
 	backoffMax     = 30 * time.Second
@@ -53,11 +54,12 @@ func (b *Batcher) Add(ev evidence.Event) {
 	b.incoming <- batchItem{event: ev}
 }
 
-// AddAndFlush queues an event, triggers an immediate flush, and waits until
-// the broker accepts the batch. Tetragon lifecycle events use this path so the
-// watcher cannot advance past an exec/exit line while that observation still
-// sits in the guest's timed batch. Cancellation stops the wait but leaves the
-// already-queued event available to the batcher's final drain.
+// AddAndFlush queues an event and waits until the broker has accepted it and
+// everything queued ahead of it. Integrity events that the caller must not
+// outrun use this path (sensor.loss before the mechanism it describes changes);
+// high-rate observations use Add and rely on the queue's FIFO order instead, so
+// one round trip per event cannot cap the sensor's throughput. Cancellation
+// stops the wait but leaves the already-queued event available to the final drain.
 func (b *Batcher) AddAndFlush(ctx context.Context, ev evidence.Event) error {
 	flushed := make(chan struct{})
 	select {
@@ -73,9 +75,10 @@ func (b *Batcher) AddAndFlush(ctx context.Context, ev evidence.Event) error {
 	}
 }
 
-// Run drains the incoming queue, flushing batches on size or interval,
-// until ctx is cancelled, then makes a bounded best-effort final drain
-// before returning.
+// Run drains the incoming queue, flushing whatever is queued as soon as the
+// queue goes idle (with the interval tick as the floor and batchMaxCoalesced as
+// the per-POST ceiling), until ctx is cancelled, then makes a bounded
+// best-effort final drain before returning.
 func (b *Batcher) Run(ctx context.Context) {
 	ticker := time.NewTicker(batchFlushInterval)
 	defer ticker.Stop()
@@ -86,21 +89,43 @@ func (b *Batcher) Run(ctx context.Context) {
 	nextAttempt := time.Now()
 
 	trySend := func() {
-		if len(pending) == 0 || time.Now().Before(nextAttempt) {
-			return
+		for len(pending) > 0 && !time.Now().Before(nextAttempt) {
+			chunk := nextChunk(pending)
+			if err := b.submit(chunk); err != nil {
+				log.Printf("agent: submit %d events failed, will retry: %v", len(chunk), err)
+				nextAttempt = time.Now().Add(backoff)
+				backoff = min(backoff*2, backoffMax)
+				return
+			}
+			pending = pending[len(chunk):]
+			backoff = backoffInitial
 		}
-		if err := b.submit(pending); err != nil {
-			log.Printf("agent: submit %d events failed, will retry: %v", len(pending), err)
-			nextAttempt = time.Now().Add(backoff)
-			backoff = min(backoff*2, backoffMax)
-			return
+		// Waiters are satisfied only once nothing is left queued ahead of them.
+		if len(pending) == 0 {
+			for _, waiter := range flushWaiters {
+				close(waiter)
+			}
+			flushWaiters = nil
 		}
-		pending = nil
-		for _, waiter := range flushWaiters {
-			close(waiter)
+	}
+
+	// coalesce absorbs everything already queued into the pending batch, up to
+	// batchMaxCoalesced. It only takes what is buffered, so a lone event is not
+	// delayed while a burst of consecutive events becomes a single POST. One POST
+	// per event was the guest's throughput ceiling (~30 events/s), far below the
+	// rate a fork storm writes Tetragon lines.
+	coalesce := func() {
+		for len(pending) < batchMaxCoalesced {
+			select {
+			case item := <-b.incoming:
+				pending = append(pending, item.event)
+				if item.flushed != nil {
+					flushWaiters = append(flushWaiters, item.flushed)
+				}
+			default:
+				return
+			}
 		}
-		flushWaiters = nil
-		backoff = backoffInitial
 	}
 
 	for {
@@ -110,9 +135,8 @@ func (b *Batcher) Run(ctx context.Context) {
 			if item.flushed != nil {
 				flushWaiters = append(flushWaiters, item.flushed)
 			}
-			if item.flushed != nil || len(pending) >= batchMaxSize {
-				trySend()
-			}
+			coalesce()
+			trySend()
 		case <-ticker.C:
 			trySend()
 		case <-ctx.Done():
@@ -139,19 +163,50 @@ func (b *Batcher) finalDrain(pending *[]evidence.Event, flushWaiters *[]chan str
 			draining = false
 		}
 	}
-	for attempt := 1; attempt <= finalDrainAttempts && len(*pending) > 0; attempt++ {
-		if err := b.submit(*pending); err != nil {
-			log.Printf("agent: final drain attempt %d/%d failed: %v", attempt, finalDrainAttempts, err)
+	// Consecutive failures are what bound the drain: a chunk that lands resets
+	// the count, so a backlog larger than one POST still gets delivered whole.
+	failures := 0
+	for len(*pending) > 0 && failures < finalDrainAttempts {
+		chunk := nextChunk(*pending)
+		if err := b.submit(chunk); err != nil {
+			failures++
+			log.Printf("agent: final drain attempt %d/%d failed: %v", failures, finalDrainAttempts, err)
 			time.Sleep(finalDrainDelay)
 			continue
 		}
-		*pending = nil
-		for _, waiter := range *flushWaiters {
-			close(waiter)
-		}
-		*flushWaiters = nil
+		*pending = (*pending)[len(chunk):]
+		failures = 0
 	}
 	if len(*pending) > 0 {
 		log.Printf("agent: final drain gave up with %d events undelivered", len(*pending))
+		b.reportUndelivered(len(*pending))
+		return
 	}
+	for _, waiter := range *flushWaiters {
+		close(waiter)
+	}
+	*flushWaiters = nil
+}
+
+// reportUndelivered spends the agent's last act on saying that count events are being
+// abandoned. Nothing else will: the process is exiting, so those events are gone, and a
+// gap nobody reported is the worst outcome available — a fork storm that outran the
+// pipeline used to seal as a clean session at 8% fidelity. One event fits in whatever
+// grace is left even when the backlog did not, and the loss makes verification report
+// INCOMPLETE with the count in the reason.
+func (b *Batcher) reportUndelivered(count int) {
+	loss := newSensorLossEvent("process", fmt.Sprintf("%d event(s) undelivered at teardown: the guest agent exited with them still queued for the broker", count))
+	if err := b.submit([]evidence.Event{loss}); err != nil {
+		log.Printf("agent: could not report %d undelivered events: %v", count, err)
+	}
+}
+
+// nextChunk is the leading slice of events one POST may carry, so a large
+// backlog is delivered as several bounded batches instead of one body the
+// broker's ingest limit would reject outright.
+func nextChunk(pending []evidence.Event) []evidence.Event {
+	if len(pending) > batchMaxCoalesced {
+		return pending[:batchMaxCoalesced]
+	}
+	return pending
 }

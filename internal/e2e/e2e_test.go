@@ -47,20 +47,23 @@ func (f *fakeGuestVM) Start(context.Context) error { return nil }
 
 // WaitHealthy reports the guest sensor coming up, exactly as the real guest
 // agent does on startup (DESIGN.md provisioning step 6), then returns healthy.
+// The mechanism is tetragon because this fixture stands in for an undegraded
+// session: procfs coverage is a sensor invariant failure by design (verify check 8),
+// which would make every clean run of this pipeline INCOMPLETE.
 func (f *fakeGuestVM) WaitHealthy(context.Context, time.Duration) error {
 	return f.postEvents([]evidence.Event{{
 		Name:    evidence.EventSensorStarted,
 		Class:   evidence.ClassIntegrity,
 		Outcome: evidence.OutcomeSuccess,
 		Body:    "guest sensor started",
-		Attrs:   map[string]any{"sensor.mechanism": "procfs"},
+		Attrs:   map[string]any{"sensor.mechanism": "tetragon"},
 	}})
 }
 
 // LaunchHarness mutates the mounted workspace (so the diff is non-empty) and
 // forwards a realistic guest event batch as the supervisor: a process executed
-// with pid/parent/cgroup/exec identity, its exit, and a workspace file change
-// carrying a content digest. It returns a clean exit code.
+// with pid/parent/cgroup/exec identity and a tetragon observer, its exit, and a
+// workspace file change carrying a content digest. It returns a clean exit code.
 func (f *fakeGuestVM) LaunchHarness(context.Context) (int, error) {
 	content := []byte("written by the sandboxed workload\n")
 	if err := os.WriteFile(filepath.Join(f.cfg.WorkspacePath, workloadFile), content, 0o644); err != nil {
@@ -77,6 +80,7 @@ func (f *fakeGuestVM) LaunchHarness(context.Context) (int, error) {
 				evidence.AttrProcessPPID:     int64(1),
 				evidence.AttrProcessCgroupID: "boxedai-session.slice",
 				evidence.AttrProcessExecID:   "exec-0001",
+				"observer":                   "tetragon",
 			},
 		},
 		{
@@ -87,6 +91,7 @@ func (f *fakeGuestVM) LaunchHarness(context.Context) (int, error) {
 				evidence.AttrProcessPID:    int64(4242),
 				evidence.AttrProcessExecID: "exec-0001",
 				"process.exit_code":        int64(0),
+				"observer":                 "tetragon",
 			},
 		},
 		{
@@ -279,8 +284,8 @@ func TestEndToEndHostPipeline(t *testing.T) {
 	if err != nil {
 		t.Fatalf("decode trust record: %v", err)
 	}
-	if len(record.Evidence.SensorMechanisms) != 1 || record.Evidence.SensorMechanisms[0] != "procfs" {
-		t.Errorf("sensor mechanisms = %v, want [procfs]", record.Evidence.SensorMechanisms)
+	if len(record.Evidence.SensorMechanisms) != 1 || record.Evidence.SensorMechanisms[0] != "tetragon" {
+		t.Errorf("sensor mechanisms = %v, want [tetragon]", record.Evidence.SensorMechanisms)
 	}
 	if res.Verdict != string(verify.VerdictLocalOnly) {
 		t.Errorf("Result.Verdict hint = %q, want %q", res.Verdict, verify.VerdictLocalOnly)

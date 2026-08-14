@@ -455,6 +455,31 @@ func TestVerify_Incomplete_IntegrityClassSensorLossIsCounted(t *testing.T) {
 	}
 }
 
+// TestCheckLifecycleEventsToleratesLateDrainedKernelEvents pins the ordering
+// contract the teardown drain depends on: a process observation the guest posted
+// while the controller was already sealing is physically sequenced after
+// session.sealed, its own timestamp still showing when it happened. Refusing or
+// dropping it would destroy real evidence, so lifecycle ordering covers only the
+// four controller events among themselves.
+func TestCheckLifecycleEventsToleratesLateDrainedKernelEvents(t *testing.T) {
+	controller := map[string]any{evidence.AttrProducer: string(evidence.ChannelController)}
+	records := []record{
+		{seq: 1, name: evidence.EventSessionGranted, attrs: controller},
+		{seq: 2, name: evidence.EventSessionStarted, attrs: controller},
+		{seq: 3, name: evidence.EventSessionStopped, attrs: controller},
+		{seq: 4, name: evidence.EventSessionSealed, attrs: controller},
+		{seq: 5, name: evidence.EventProcessExited, attrs: map[string]any{
+			evidence.AttrProducer:      string(evidence.ChannelGuestSupervisor),
+			evidence.AttrEvidenceClass: string(evidence.ClassKernelObserved),
+			"observer":                 "tetragon",
+		}},
+	}
+	ok, closeStatus, detail := checkLifecycleEvents(records, 1)
+	if !ok || closeStatus != "sealed" {
+		t.Fatalf("checkLifecycleEvents = %v, close status %q (%s), want ok and sealed", ok, closeStatus, detail)
+	}
+}
+
 func TestCheckSensor_ProcfsCoverageIsIncomplete(t *testing.T) {
 	guestIntegrity := map[string]any{
 		evidence.AttrProducer:      string(evidence.ChannelGuestSupervisor),

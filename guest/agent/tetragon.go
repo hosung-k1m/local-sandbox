@@ -4,12 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
+	"os"
 	"strconv"
 	"sync"
 	"time"
-
-	"boxedai/internal/evidence"
 )
+
+// readinessMetricsRetryInterval throttles the Tetragon loss-metrics scrape the
+// readiness gate performs, so an endpoint that is refusing connections (or
+// hanging) cannot be re-probed on every accepted source line.
+var readinessMetricsRetryInterval = 1 * time.Second
 
 // tetragonProcess is the subset of Tetragon's process JSON export fields
 // the guest agent uses to build process.executed/process.exited evidence.
@@ -108,9 +113,6 @@ func parseForkTracepoint(event *tetragonTracepointEvent) (ProcInfo, bool, error)
 	}
 	parentPID := int64(*event.Args[0].UintArg)
 	childPID := int64(*event.Args[1].UintArg)
-	if parentPID == 0 || childPID == 0 || event.Process.ExecID == "" {
-		return ProcInfo{}, true, fmt.Errorf("agent: malformed boxedai-process-fork parent identity")
-	}
 	// Tetragon only attaches the forking parent as `process` once it has
 	// observed that parent's execve. Processes discovered via its startup procfs
 	// scan (early-boot system daemons that predate Tetragon) surface with the
@@ -118,8 +120,18 @@ func parseForkTracepoint(event *tetragonTracepointEvent) (ProcInfo, bool, error)
 	// process.ExecID is not the parent's and the fork is not attributable to a
 	// real parent. Those are never the workload (which starts after Tetragon)
 	// and are uid-filtered downstream regardless, so skip rather than treat the
-	// unresolved context as corruption and kill the watcher.
-	if parentPID != int64(event.Process.Pid) {
+	// unresolved context as corruption and kill the watcher. Rapid nested forks
+	// hit the same enrichment gap from the other direction and must be skipped
+	// for the same reason: a workload subprocess (git spawning children that fork
+	// grandchildren) can fork before Tetragon has cached the intermediate
+	// execve, and the tracepoint then arrives structurally valid with an
+	// unenriched context — empty exec_id, or zero pids where the identity should
+	// be. That shape IS the workload, but the fork observation is only
+	// supplementary lineage: the child's own process_exec still arrives with a
+	// full identity, so exec/exit coverage is unaffected and the honest cost is
+	// one unattributable fork rather than a degraded sensor. A malformed *shape*
+	// (above) stays fatal, because that is corruption rather than a known gap.
+	if parentPID == 0 || childPID == 0 || event.Process.ExecID == "" || parentPID != int64(event.Process.Pid) {
 		return ProcInfo{}, false, nil
 	}
 	return ProcInfo{
@@ -184,23 +196,34 @@ func tetragonEventTime(source time.Time) time.Time {
 }
 
 // runTetragonWatcher tails cfg.TetragonLog and forwards process.executed/
-// process.exited events for the workload to batch. Each accepted source line
-// is flushed before the watcher advances, preserving Tetragon's exec/exit
-// source order without inferring cross-channel causality. Filesystem delivery
-// and broker scheduling remain independent of PostToolUse, so this does not
-// establish a cross-channel causal guarantee. It returns when ctx is cancelled
-// or the log becomes unreadable. ready is called only after fresh built-in
-// lifecycle and boxedai-process-fork policy observations have both been parsed.
-func runTetragonWatcher(ctx context.Context, cfg Config, batch *Batcher, ready func(), lossBaseline float64) error {
-	return runTetragonWatcherWithMetrics(ctx, cfg, batch, ready, func(ctx context.Context) (bool, error) {
-		return tetragonMetricsLost(ctx, tetragonMetricsURL, lossBaseline)
+// process.exited events for the workload to batch. Accepted source lines are
+// queued in read order and the batcher POSTs them in that order, preserving
+// Tetragon's exec/exit source order without inferring cross-channel causality.
+// Filesystem delivery and broker scheduling remain independent of PostToolUse, so
+// this does not establish a cross-channel causal guarantee. It returns when ctx is
+// cancelled or the log becomes unreadable. ready is called only after fresh built-in
+// lifecycle and boxedai-process-fork policy observations have both been parsed, and two
+// loss-metric scrapes agree the readiness-blocking counters have stopped moving.
+func runTetragonWatcher(ctx context.Context, cfg Config, batch *Batcher, ready func()) error {
+	return runTetragonWatcherWithMetrics(ctx, cfg, batch, ready, func(ctx context.Context) (float64, error) {
+		return tetragonLossTotal(ctx, tetragonMetricsURL, tetragonReadinessLossMetrics)
 	})
 }
 
-func runTetragonWatcherWithMetrics(ctx context.Context, cfg Config, batch *Batcher, ready func(), metricsLost func(context.Context) (bool, error)) error {
+func runTetragonWatcherWithMetrics(ctx context.Context, cfg Config, batch *Batcher, ready func(), lossTotal func(context.Context) (float64, error)) error {
 	watchCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var readyOnce sync.Once
+	readyPublished := false
+	var lastReadinessProbe time.Time
+	// The readiness loss gate is self-anchoring: the first scrape only records where
+	// the counters are, and readiness needs a later scrape showing they have not moved
+	// since. A fresh VM keeps accruing benign loss counts while it boots, so a delta
+	// means "the counters have not settled yet", not "the sensor is broken" — re-anchor
+	// and look again. Failing the watcher on that delta (and on every retry after it)
+	// is what degraded healthy fresh boots to procfs before the workload launched, at a
+	// cost of ~40s and an INCOMPLETE verdict. A counter that never settles is genuine
+	// ongoing loss, and runProcessSensor's bounded fallback then degrades honestly.
+	readinessLossBaseline := -1.0
 	seenExec, seenExit, seenFork := false, false, false
 	var watcherErr error
 	var errOnce sync.Once
@@ -211,23 +234,37 @@ func runTetragonWatcherWithMetrics(ctx context.Context, cfg Config, batch *Batch
 		})
 	}
 	markReady := func() {
-		if !seenExec || !seenExit || !seenFork {
+		if readyPublished || !seenExec || !seenExit || !seenFork {
 			return
 		}
-		readyOnce.Do(func() {
-			lost, err := metricsLost(watchCtx)
-			if err != nil {
-				fail(fmt.Errorf("agent: Tetragon metrics unavailable at readiness: %w", err))
-				return
+		// A metrics endpoint that is not answering yet means Tetragon is still
+		// coming up, not that the authoritative sensor is broken: retry on a
+		// later lifecycle observation instead of ending the watch. The throttle
+		// keeps a hung endpoint from stalling every accepted source line, and
+		// runProcessSensor's bounded readiness fallback keeps a metrics endpoint
+		// that never answers from stalling the session forever.
+		if time.Since(lastReadinessProbe) < readinessMetricsRetryInterval {
+			return
+		}
+		lastReadinessProbe = time.Now()
+		total, err := lossTotal(watchCtx)
+		if err != nil {
+			log.Printf("agent: Tetragon metrics unavailable at readiness, retrying: %v", err)
+			return
+		}
+		// Any movement re-anchors, in either direction: growth is a VM still settling,
+		// and a drop is Tetragon having restarted its counters.
+		if total != readinessLossBaseline {
+			if readinessLossBaseline >= 0 {
+				log.Printf("agent: Tetragon loss counters still moving at readiness (%v, was %v), re-baselining", total, readinessLossBaseline)
 			}
-			if lost {
-				fail(fmt.Errorf("agent: Tetragon loss metric is nonzero at readiness"))
-				return
-			}
-			ready()
-		})
+			readinessLossBaseline = total
+			return
+		}
+		readyPublished = true
+		ready()
 	}
-	err := tailFollowReadyStrict(watchCtx, cfg.TetragonLog, nil, func(line string) {
+	handleLine := func(line string) {
 		tl, err := parseTetragonLine([]byte(line))
 		if err != nil {
 			fail(fmt.Errorf("agent: malformed complete Tetragon JSON line: %w", err))
@@ -262,9 +299,7 @@ func runTetragonWatcherWithMetrics(ctx context.Context, cfg Config, batch *Batch
 				Observer: "tetragon",
 			})
 			event.Time = tetragonEventTime(tl.Time)
-			if err := addLifecycleEvent(watchCtx, batch, event); err != nil {
-				fail(err)
-			}
+			batch.Add(event)
 		case tl.ProcessExit != nil:
 			resolved, err := validateBuiltinLifecycle(tl.ProcessExit.Process, cfg.WorkloadUID)
 			if err != nil {
@@ -286,9 +321,7 @@ func runTetragonWatcherWithMetrics(ctx context.Context, cfg Config, batch *Batch
 				Observer: "tetragon",
 			}, tetragonExitStatus(*tl.ProcessExit))
 			event.Time = tetragonEventTime(tl.Time)
-			if err := addLifecycleEvent(watchCtx, batch, event); err != nil {
-				fail(err)
-			}
+			batch.Add(event)
 		case tl.ProcessTracepoint != nil:
 			pi, relevant, err := parseForkTracepoint(tl.ProcessTracepoint)
 			if err != nil {
@@ -305,21 +338,72 @@ func runTetragonWatcherWithMetrics(ctx context.Context, cfg Config, batch *Batch
 			}
 			event := newProcessCreatedEvent(pi)
 			event.Time = tetragonEventTime(tl.Time)
-			if err := addLifecycleEvent(watchCtx, batch, event); err != nil {
-				fail(err)
-			}
+			batch.Add(event)
 		}
-	})
+	}
+	// consumed follows the tailer's line-boundary position so the teardown drain
+	// below knows where reading stopped. -1 means it never attached at all.
+	consumed := int64(-1)
+	// Rotation/truncation is recoverable: the tailer reattaches at the start of
+	// the replacement file, so coverage resumes, but lines appended to the old
+	// file after the last read are unrecoverable. Record that as loss +
+	// restarted rather than ending the watch (which used to SIGKILL the
+	// workload) — Tetragon's own rotation defaults hit a busy session within
+	// minutes even though the session-time unit now pins them far out. Both
+	// events go through the same queue as the lines before them, so they land in
+	// the timeline exactly where the gap happened.
+	err := tailFollowReadyReattach(watchCtx, cfg.TetragonLog, nil, handleLine, func() {
+		batch.Add(newSensorLossEvent("process", fmt.Sprintf("Tetragon export %s changed generation (rotated or truncated); reattached at the start of the replacement", cfg.TetragonLog)))
+		batch.Add(newSensorRestartedEvent("process", "tetragon"))
+	}, func(offset int64) { consumed = offset })
 	if watcherErr != nil {
 		return watcherErr
+	}
+	if ctx.Err() != nil {
+		drainTetragonExport(cfg.TetragonLog, consumed, batch, handleLine)
 	}
 	return err
 }
 
-var lifecycleDeliveryTimeout = 2 * time.Second
+// tetragonDrainWindow bounds the teardown catch-up read. It has to stay well
+// inside the host's 5s kill-switch grace (vm.stopGrace), after which the instance
+// is force-stopped and anything still unposted is gone anyway.
+var tetragonDrainWindow = 2 * time.Second
 
-func addLifecycleEvent(ctx context.Context, batch *Batcher, event evidence.Event) error {
-	flushCtx, cancel := context.WithTimeout(ctx, lifecycleDeliveryTimeout)
-	defer cancel()
-	return batch.AddAndFlush(flushCtx, event)
+// tetragonBacklogTolerance is how many unread export bytes at teardown are
+// treated as the export's own tail rather than a backlog. Teardown itself makes
+// Tetragon write: the `limactl shell` that touches the stop sentinel, the
+// liveness probe, a partial line mid-write. Reporting those as loss would make
+// every single session INCOMPLETE, so the threshold sits above that handful of
+// records and far below the tens of megabytes a real fork storm leaves behind.
+var tetragonBacklogTolerance int64 = 64 << 10
+
+// drainTetragonExport finishes reading the export once the watch has stopped for
+// teardown. The tailer stops wherever the stop sentinel found it, so without this
+// every line Tetragon had already written but nobody had read would be dropped —
+// silently, which is the worse half: a fork storm outran the guest, ~9% of its
+// process events became evidence, and verification still passed its sensor
+// invariants. Whatever remains unread after the bounded window is reported as
+// sensor.loss, so an undrained backlog surfaces as an INCOMPLETE verdict.
+func drainTetragonExport(path string, from int64, batch *Batcher, handleLine func(line string)) {
+	if from < 0 {
+		// Never attached, so nothing was ever in this watcher's reach; the
+		// readiness path already recorded that as its own loss.
+		return
+	}
+	offset, err := readLinesFrom(path, from, time.Now().Add(tetragonDrainWindow), handleLine)
+	if err != nil {
+		log.Printf("agent: drain Tetragon export at teardown: %v", err)
+	}
+	info, statErr := os.Stat(path)
+	if statErr != nil {
+		return
+	}
+	unread := info.Size() - offset
+	if unread <= tetragonBacklogTolerance {
+		return
+	}
+	batch.Add(newSensorLossEvent("process", fmt.Sprintf(
+		"Tetragon export backlog not drained at teardown: %d unread byte(s) in %s after %s",
+		unread, path, tetragonDrainWindow)))
 }

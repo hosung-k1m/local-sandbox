@@ -553,9 +553,9 @@ sequences them in arrival order; a harness tool-use id does not authenticate a
 specific kernel process, and Tetragon's JSON export supplies no broker-visible
 watermark proving that every causally earlier process event has arrived. BoxedAi
 therefore does not reorder or delay `tool.completed` based on workload-supplied
-process metadata. The guest does synchronously flush each Tetragon fork/exec/exit line
-before advancing to the next line, removing the ordinary 500ms batch delay and
-preserving that sensor's source order, but this is not a cross-channel causal
+process metadata. The guest does preserve that sensor's source order — every Tetragon
+fork/exec/exit line is queued in read order and POSTed in that order, a burst of
+consecutive lines coalesced into one batch — but this is not a cross-channel causal
 watermark: the JSON tailer installs an fsnotify directory watch before seeking the
 export to EOF and retains polling only as a fallback, but kernel notification and
 broker scheduling remain independent of the harness hook channel. `tool.completed`
@@ -663,28 +663,79 @@ or downloads beyond the guest agent binary itself):
    defeats size-based rotation detection).
 4. Enable+start guest agent systemd unit now that egress is locked down, so its first
    packet is already governed by the ruleset above. Immediately before that start,
-   stop Tetragon, remove the baked export log, restart the service, and wait boundedly
-   for it to remain active and create the fresh export path. Leave the log absent on
-   failure so launch readiness cannot be published. The agent
+   stop Tetragon, remove the baked export log, write a `tetragon.service` drop-in
+   re-pinning the bake-time ExecStart (so an already-built golden image gets the
+   rotation flags of bake-time step 3 without a rebuild), restart the service, and
+   wait boundedly (30s) for it to remain active and create the fresh export path.
+   Leave the log absent on failure so Tetragon readiness cannot be published. The agent
    POSTs sensor.started. The
    process watcher writes `/run/boxedai/process-sensor-ready` only after fresh valid
-   `sched_process_fork`, built-in exec, and built-in exit observations plus a clean
-   Tetragon loss-metrics scrape. Procfs never publishes readiness. Merely attaching
-   at Tetragon EOF is not ready.
+   `sched_process_fork`, built-in exec, and built-in exit observations plus two
+   Tetragon loss-metrics scrapes (at least a second apart) that agree the
+   readiness-blocking counters have stopped moving. Merely attaching at Tetragon EOF is
+   not ready. Counters that are still moving re-anchor the gate's baseline and the gate
+   looks again instead of failing the watcher: a fresh VM keeps accruing benign loss
+   counts for as long as it is booting, so a delta means "not settled yet", not "sensor
+   broken". For the same reason the readiness-blocking set is narrowed to counters that
+   only move on genuine event loss (ring buffer lost/errors/queue, notify overflow,
+   rate-limit drops); the wider set, including the boot-noisy per-process lookup misses,
+   still governs ongoing loss detection once readiness is established.
+   Procfs publishes readiness only as a bounded fallback: if Tetragon has not
+   satisfied that gate within 30s of the agent starting, the process sensor degrades
+   to procfs (sensor.loss with the reason, then sensor.restarted with
+   `mechanism=procfs` and the incomplete-coverage attribute) and procfs publishes the
+   marker instead, so a session always launches with honestly labelled coverage
+   rather than never launching. That window applies only until readiness is first
+   established: readiness is a once-per-session gate, so the moment the marker exists —
+   by either mechanism — the fallback is retired for the rest of the session, and every
+   later coverage question belongs to the health monitor. A fallback that stayed armed
+   past its own success degrades a sensor that is demonstrably working. The guest agent unit never gives up restarting
+   (`RestartSec=2`, `StartLimitIntervalSec=0`): a crash-looped supervisor that
+   systemd retires permanently can publish no readiness at all. Launch stays
+   fail-closed only when NEITHER mechanism can observe processes.
 
 Guest agent duties (root daemon):
-- Health: require Tetragon for launch readiness. After loss, synchronously stop the
-  workload and report sensor loss; procfs may continue for diagnostics only.
+- Health: prefer Tetragon, and require it for un-degraded launch readiness. Sensor
+  degradation NEVER stops the workload: after loss the agent reports sensor.loss,
+  switches to procfs (which keeps recording fork/exec/exit with explicit incomplete
+  coverage), and keeps trying to recover to Tetragon (sensor.restarted). Killing a
+  running session because one sensor hiccuped destroys more evidence than the
+  degraded coverage costs, and the verifier already returns INCOMPLETE for any
+  sensor.loss or procfs coverage, so the honesty is preserved in the verdict rather
+  than in a SIGKILL. The workload is stopped only for the kill switch (stop sentinel
+  or broker signal) and when NEITHER mechanism can observe processes at all; the
+  guest-side stop tolerates a `boxedai-session.service` that is not loaded (the
+  harness has not launched yet, or already exited and was collected).
+- Loss is declared conservatively, not on a single bad observation: the health
+  monitor requires several consecutive failed polls before flipping to procfs, and
+  a Tetragon metrics endpoint that is not answering yet is "not up" rather than
+  instant failure. A slow broker is likewise not loss — events stay queued for the
+  batcher's retry while the watcher keeps reading the export. The ongoing loss gate is
+  anchored at readiness rather than at agent start: the counters are monotonic, so a
+  baseline captured while the VM was still booting would make settled boot noise look
+  like session loss for the rest of the session, and loss before readiness cannot be
+  workload evidence loss because readiness is what gates the launch.
 - Periodically launch a root-owned no-op process and treat Tetragon freshness from
   export growth observed after those probes, not from service activity or the last
   health check. Root events are filtered from workload evidence. While using procfs,
   an existing export establishes only a size baseline; recovery to Tetragon requires
   subsequent post-baseline growth.
-- Tail the Tetragon JSON export using fsnotify with a polling fallback. Any export
-  rotation, truncation, or generation change is sensor loss. In the dedicated VM,
+- Tail the Tetragon JSON export using fsnotify with a polling fallback. An export
+  rotation, truncation, or generation change is sensor loss, but a recoverable one:
+  the tailer reattaches from the start of the new file and reports
+  sensor.loss + sensor.restarted rather than dying (the strict, fail-on-generation
+  tailer remains available for callers that genuinely want it). In the dedicated VM,
   scope lifecycle evidence to the exact workload uid; no unavailable cgroup filter
   is claimed. Forward process.created/process.executed/process.exited in source-log
   order to `POST /v1/events` with token S.
+- Forward evidence in ordered micro-batches: every event is queued in observation
+  order and POSTed in that order, coalescing whatever is already queued into a single
+  batch (at most 500 events), flushing as soon as the queue goes idle so a lone event
+  waits for nothing, with the ~500ms timed flush left as the floor. Order survives
+  because one batcher submits sequentially from a FIFO queue. Round-tripping one POST
+  per source line is what pinned process evidence at roughly 30 events/second, well
+  under a fork storm's rate, so the export outgrew the guest and its unread tail was
+  dropped without a word.
 - Periodic content scan of /workspace (every 2s) → file.changed (capped sha256
   digest) / file.deleted, forwarded as kernel_observed with `observer=scan`. A
   scan is used, not fsnotify: inotify does not deliver events on the virtiofs
@@ -696,7 +747,16 @@ Guest agent duties (root daemon):
   (`observer=nftables`), workload-scoped and rate-limited (see session-time provisioning
   step 3, above).
 - On `/etc/boxedai/stop` sentinel or broker signal: freeze the session cgroup, drain,
-  final flush.
+  final flush. Draining includes the Tetragon export itself: the process watcher reads
+  whatever it has not reached yet through to EOF, bounded so it stays inside the 5s
+  kill-switch grace. If unread export bytes still remain beyond a small teardown
+  tolerance (the export's own tail — the shell that wrote the sentinel, the liveness
+  probe, a partial line), the watcher records sensor.loss naming the undrained
+  backlog, so an export the guest could not keep up with becomes an INCOMPLETE verdict
+  instead of silently discarded evidence. The same honesty covers the send queue: if the
+  bounded final drain still holds events when the agent exits, it spends its last act on
+  a single-event sensor.loss POST naming how many are being abandoned — one event fits
+  in a grace the backlog itself did not.
 - Hook mode (not a daemon duty; runs as the workload uid): `lefthook`/`righthook`
   subcommands invoked by the harness's PreToolUse/PostToolUse hooks read the hook
   JSON from stdin and emit one `tool.requested`/`tool.completed` event via
@@ -842,10 +902,13 @@ exist.
 | Condition                          | Response                                   |
 |------------------------------------|--------------------------------------------|
 | Guest agent unhealthy before launch| Do not start workload; abort + INCOMPLETE  |
+| Tetragon loss during a session     | sensor.loss, degrade to procfs, keep recovering; workload untouched; verify=INCOMPLETE |
+| No process sensor at all           | Stop workload; sensor.loss; INCOMPLETE     |
 | Direct egress attempt              | nftables deny + network.denied event       |
 | Tool not granted by profile        | 403 + authorization.decided(deny) event    |
 | Effect without approval            | 403 + effect.denied event                  |
 | Recorder write failure             | Session-fatal, never silent                |
+| Broker shutdown grace expires      | Force-close connections; log; still seal + write the record |
 | Kill switch                        | Revoke → freeze → seal → destroy           |
 | Crash/missing seal                 | session.state=incomplete; verify=INCOMPLETE|
 
@@ -856,13 +919,38 @@ exist.
 - No Landlock; filesystem policy is systemd hardening (ProtectSystem=strict etc.).
 - Tetragon network/file TracingPolicies not shipped; network evidence = nftables logs,
   file evidence = periodic /workspace scan + final manifest (authoritative).
-- Tetragon may fail to load in the Lima vz guest (BPF/BTF/kernel); strict sessions
-  then abort before workload launch. Procfs may record diagnostic observations with
-  `correlation=none`, unknown exit status, and explicit incomplete coverage, but
-  cannot satisfy readiness. Neither sensor currently supplies trusted tool/process
+- Tetragon may fail to load in the Lima vz guest (BPF/BTF/kernel), or lose its export
+  mid-session. Such a session still runs: after the bounded readiness window (or on
+  loss) the sensor degrades to procfs, which records `correlation=none`, unknown exit
+  status, and explicit incomplete coverage, and offline verification returns
+  INCOMPLETE for the whole session. This is a deliberate trade — availability with an
+  honest verdict instead of a killed workload — and it means a `LOCAL_ONLY` verdict,
+  not merely a completed session, is the thing that attests full kernel process
+  coverage. Neither sensor currently supplies trusted tool/process
   correlation or a completion watermark, so process/tool lifecycle ordering is not
-  guaranteed even though Tetragon source events bypass the guest's timed batch.
+  guaranteed even though each sensor's own source order is. Fork observations whose
+  parent Tetragon has not enriched yet are skipped without a loss marker, so
+  `process.created` lineage is best-effort wherever forks nest faster than Tetragon's
+  exec cache fills; the forking subprocess's own exec/exit still lands, which is what
+  the sensor invariants check.
   Honestly recorded; hardening tetragon-in-vz is deferred.
+- A kernel event drained at teardown can be physically sequenced after
+  `session.sealed` while its own timestamp shows the earlier moment it happened. The
+  verifier's lifecycle ordering check deliberately covers only the four controller
+  lifecycle events among themselves: refusing or dropping a late-arriving kernel
+  observation would destroy real evidence to protect a cosmetic ordering.
+- The teardown export drain is bounded, and "did the guest catch up" is decided by a
+  byte tolerance (64 KiB of unread export is treated as the tail Tetragon writes about
+  teardown itself). A backlog smaller than that is neither drained nor reported.
+- Group-commit fsync means a host crash (as opposed to a workload or VM crash) can lose
+  the last records appended to the open segment — up to ~50ms of them. Such a session
+  never recorded `session.sealed` either, so verification already returns INCOMPLETE;
+  every sealed segment's digest is computed over bytes that were fsynced first.
+- Export rotation is pushed far out rather than truly disabled (Tetragon's rotation is
+  lumberjack-backed, where a max size of 0 means 100 MB, not "never"). A session that
+  somehow outgrows the pinned size still rotates, and the reattach that follows is
+  recorded as sensor.loss + sensor.restarted, which is a real coverage gap: lines
+  written to the old file between the last read and the reattach are not recovered.
 - Live file.changed granularity is the 2s scan interval; changes fully created and
   deleted within one interval are only caught by the authoritative final diff.
 - Evidence at rest is not encrypted (FileVault assumed).

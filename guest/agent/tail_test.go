@@ -227,6 +227,98 @@ func TestStrictTailFailsOnFileGenerationChange(t *testing.T) {
 	}
 }
 
+// TestTailFollowReattachReportsGenerationChangeAndResumes covers the tetragon
+// export path: a lumberjack-style rotation (rename aside, create fresh) must be
+// reported to the caller and then recovered from, not treated as the end of the
+// tail. Strict callers keep the old fail-fast behavior (see the test above).
+func TestTailFollowReattachReportsGenerationChangeAndResumes(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.log")
+	if err := os.WriteFile(path, []byte("historical\n"), 0o600); err != nil {
+		t.Fatalf("write initial log: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan struct{})
+	reattached := make(chan struct{}, 4)
+	lines := make(chan string, 4)
+	offsets := make(chan int64, 8)
+	errs := make(chan error, 1)
+	go func() {
+		errs <- tailFollowReadyReattach(ctx, path, func() {
+			close(ready)
+		}, func(line string) {
+			lines <- line
+		}, func() {
+			reattached <- struct{}{}
+		}, func(offset int64) {
+			offsets <- offset
+		})
+	}()
+
+	select {
+	case <-ready:
+	case <-time.After(time.Second):
+		t.Fatal("tailer did not establish its initial EOF position")
+	}
+	// The attach position is reported so a caller can measure, at shutdown, how
+	// much of the file it never reached.
+	select {
+	case got := <-offsets:
+		if got != int64(len("historical\n")) {
+			t.Fatalf("attach offset = %d, want %d", got, len("historical\n"))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("tailer did not report its attach offset")
+	}
+	if err := os.Rename(path, filepath.Join(dir, "events.log.1")); err != nil {
+		t.Fatalf("rotate log: %v", err)
+	}
+	if err := os.WriteFile(path, []byte("after-rotation\n"), 0o600); err != nil {
+		t.Fatalf("write replacement: %v", err)
+	}
+
+	select {
+	case <-reattached:
+	case err := <-errs:
+		t.Fatalf("recoverable tailer ended on rotation: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("rotation was not reported to onGeneration")
+	}
+	select {
+	case got := <-lines:
+		if got != "after-rotation" {
+			t.Fatalf("line = %q, want the replacement file read from its start", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("tailer did not resume reading after the rotation")
+	}
+	waitForOffset(t, offsets, int64(len("after-rotation\n")))
+	cancel()
+	if err := <-errs; err != nil {
+		t.Fatalf("tailFollowReadyReattach: %v", err)
+	}
+}
+
+// waitForOffset waits for the tailer to report want, skipping the earlier
+// positions it reports on the way there (the attach EOF, then 0 for the
+// replacement file it reattaches to).
+func waitForOffset(t *testing.T, offsets <-chan int64, want int64) {
+	t.Helper()
+	deadline := time.After(2 * time.Second)
+	for {
+		select {
+		case got := <-offsets:
+			if got == want {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("tailer never reported offset %d", want)
+		}
+	}
+}
+
 func TestTailFollowReadsSameInodeTruncateAndFastRegrowFromStart(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "events.log")
 	if err := os.WriteFile(path, []byte("historical-content\n"), 0o600); err != nil {
