@@ -27,11 +27,28 @@ const (
 // stateFileName is the per-session state marker file.
 const stateFileName = "session.state"
 
+// errorFileName holds the human-readable reason a session ended in failure
+// (DESIGN.md "Crash safety").
+const errorFileName = "session.error"
+
 // writeState writes the state marker for a session dir at 0600.
 func writeState(sessionDir string, s State) error {
 	path := filepath.Join(sessionDir, stateFileName)
 	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {
 		return fmt.Errorf("session: write state: %w", err)
+	}
+	return nil
+}
+
+// writeError records why a session failed, at 0600. Without it, an abort between
+// recorder creation and the first evidence record — a failed `--repo` clone, say —
+// leaves only policy.json, an empty sealed segment, and session.state=incomplete
+// on disk, and the reason survives nowhere but the CLI's own stderr. The text is
+// exactly what the CLI prints, which by contract never contains credentials.
+func writeError(sessionDir string, runErr error) error {
+	path := filepath.Join(sessionDir, errorFileName)
+	if err := os.WriteFile(path, []byte(runErr.Error()+"\n"), 0o600); err != nil {
+		return fmt.Errorf("session: write error breadcrumb: %w", err)
 	}
 	return nil
 }

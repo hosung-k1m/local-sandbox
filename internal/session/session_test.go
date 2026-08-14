@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -62,6 +63,8 @@ type fakeVM struct {
 	stopContextBounded   bool
 	deleteContextBounded bool
 	emitLifecycle        bool
+	hangIngestOnStop     bool
+	releaseIngest        func()
 	started              bool
 	healthy              bool
 	launched             bool
@@ -162,7 +165,36 @@ func (f *fakeVM) Stop(ctx context.Context) error {
 	f.stopped = true
 	f.stopContextErr = ctx.Err()
 	_, f.stopContextBounded = ctx.Deadline()
+	if f.hangIngestOnStop {
+		f.startHangingIngest()
+	}
 	return f.stopErr
+}
+
+// startHangingIngest leaves an /v1/events POST in flight whose body never ends, so
+// the broker still has an ingest handler running when teardown shuts it down. That is
+// the shape of the real failure: a guest final drain still posting while the
+// controller wants the broker gone.
+func (f *fakeVM) startHangingIngest() {
+	body, writer := io.Pipe()
+	f.releaseIngest = func() { _ = writer.Close() }
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/events", f.cfg.BrokerPort), body)
+	if err != nil {
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+f.cfg.SupervisorToken)
+	req.Header.Set("Content-Type", "application/json")
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+		}
+	}()
+	if _, err := writer.Write([]byte(`{"events":[`)); err != nil {
+		return
+	}
+	// The handler has to be reading that body before teardown calls Stop.
+	time.Sleep(50 * time.Millisecond)
 }
 
 func (f *fakeVM) Delete(ctx context.Context) error {
@@ -377,6 +409,55 @@ func TestRunVMStopFailureLeavesSessionIncomplete(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(res.SessionDir, trustrecord.FileName)); !errors.Is(statErr, os.ErrNotExist) {
 		t.Errorf("trust record stat error = %v, want absent after failed drain", statErr)
+	}
+	// The reason has to survive on disk: a session that fails before or during
+	// teardown is otherwise attributable only from whatever consumed the CLI's
+	// stderr (DESIGN.md "Crash safety").
+	breadcrumb, readErr := os.ReadFile(filepath.Join(res.SessionDir, "session.error"))
+	if readErr != nil {
+		t.Fatalf("read session.error: %v", readErr)
+	}
+	if !strings.Contains(string(breadcrumb), wantErr.Error()) {
+		t.Errorf("session.error = %q, want the failure reason", breadcrumb)
+	}
+}
+
+// TestRunSealsEvidenceWhenTheBrokerWillNotShutDown is the teardown regression
+// guard: a storm-sized guest drain left an ingest handler in flight, `stop broker`
+// returned a deadline error, and teardown abandoned the trust record and marked a
+// perfectly completed session incomplete. The broker is now force-closed and the
+// error only logged — the seal, the record, and the sealed state all still happen.
+// It deliberately pays the broker's real shutdown grace once.
+func TestRunSealsEvidenceWhenTheBrokerWillNotShutDown(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BOXEDAI_HOME", home)
+	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	withResolveImage(t, func(arch string) (image.Manifest, error) { return fakeManifest, nil })
+
+	repo := t.TempDir()
+	writeFile(t, filepath.Join(repo, "README.md"), "# fixture repo\n")
+	var fake *fakeVM
+	r := &Runner{newVM: func(cfg vm.Config) vmController {
+		fake = &fakeVM{cfg: cfg, emitLifecycle: true, hangIngestOnStop: true}
+		return fake
+	}}
+
+	res, err := r.Run(context.Background(), RunOptions{Harness: "exec", RepoPath: repo, Profile: policy.ProfileDevelop, Cmd: "true"})
+	if fake != nil && fake.releaseIngest != nil {
+		fake.releaseIngest()
+	}
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.State != StateSealed {
+		t.Errorf("State = %q, want %q despite the broker shutdown", res.State, StateSealed)
+	}
+	if _, statErr := os.Stat(filepath.Join(res.SessionDir, trustrecord.FileName)); statErr != nil {
+		t.Errorf("trust record stat error = %v, want it written despite the broker shutdown", statErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(res.SessionDir, "session.error")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("session.error stat error = %v, want no error breadcrumb for a sealed session", statErr)
 	}
 }
 

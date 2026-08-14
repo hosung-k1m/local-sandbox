@@ -538,6 +538,74 @@ func TestStartRevokeStopLifecycle(t *testing.T) {
 	}
 }
 
+// blockingEmitter is a real Emitter that parks inside Emit, so a test knows exactly
+// when an ingest handler is in flight rather than guessing with a sleep.
+type blockingEmitter struct {
+	entered chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func (e *blockingEmitter) Emit(evidence.Channel, evidence.Event) error {
+	e.once.Do(func() { close(e.entered) })
+	<-e.release
+	return nil
+}
+
+// TestStopForceClosesAnIngestHandlerThatOutlastsTheGrace is the teardown
+// regression guard: Shutdown only waits, so a guest still POSTing its final drain
+// held teardown open for the whole grace and then kept emitting into a recorder the
+// controller was already sealing. Stop now force-closes and reports it, and the
+// caller finishes sealing.
+func TestStopForceClosesAnIngestHandlerThatOutlastsTheGrace(t *testing.T) {
+	original := shutdownGrace
+	shutdownGrace = 50 * time.Millisecond
+	t.Cleanup(func() { shutdownGrace = original })
+
+	emitter := &blockingEmitter{entered: make(chan struct{}), release: make(chan struct{})}
+	b := mustBroker(t, Config{Emitter: emitter})
+	port, err := b.Start(context.Background())
+	if err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	defer close(emitter.release)
+
+	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/events", port),
+		strings.NewReader(`{"events":[{"name":"process.exited","outcome":"success"}]}`))
+	if err != nil {
+		t.Fatalf("build ingest request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.SupervisorToken())
+	req.Header.Set("Content-Type", "application/json")
+	go func() {
+		// The force-close below kills this connection mid-flight, so its error is
+		// the expected outcome, not a test failure.
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			drain(resp)
+		}
+	}()
+	select {
+	case <-emitter.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("ingest handler never reached the recorder")
+	}
+
+	stopped := make(chan error, 1)
+	go func() { stopped <- b.Stop() }()
+	select {
+	case err := <-stopped:
+		if err == nil || !strings.Contains(err.Error(), "force-closed") {
+			t.Fatalf("Stop error = %v, want a force-close report", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Stop never returned while an ingest handler was in flight")
+	}
+	// The listener is gone, so nothing can post evidence after this point.
+	if _, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/v1/healthz", port)); err == nil {
+		t.Fatal("broker still serving after Stop force-closed it")
+	}
+}
+
 func TestDistinctTokens(t *testing.T) {
 	b := mustBroker(t, Config{Emitter: &fakeEmitter{}})
 	if b.WorkloadToken() == b.SupervisorToken() {

@@ -842,9 +842,24 @@ Startup order (fail-closed at every step):
    limactl delete and print the summary
    (files changed, network denials, tools used, evidence path, verify hint).
 
+Teardown never abandons the seal for a shutdown problem. Stopping the broker is
+bounded: in-flight guest POSTs get a short grace, then the remaining connections are
+force-closed, so a slow ingest handler cannot hold teardown open (and cannot keep
+emitting into a recorder that is being closed). A broker that fails to shut down inside
+that window is logged, not fatal — the output manifest/diff, session.stopped,
+session.sealed, the recorder Close, and the trust-record write all still run, and a
+session whose evidence sealed and whose record was written ends `sealed`. Only a
+failure that actually breaks the evidence (a recorder, seal, or trust-record error)
+marks the session incomplete.
+
 Crash safety: a deferred cleanup handler must revoke tokens, seal what exists, and
 leave the session marked incomplete (state file `session.state` = one of
-`created|running|sealed|incomplete`).
+`created|running|sealed|incomplete`). Any run that ends in an error also writes the
+reason to `session.error` (0600, human-readable). Without it an abort between recorder
+creation and the first evidence record — a failed `--repo` clone, for instance — leaves
+only `policy.json`, an empty sealed segment, and `session.state=incomplete` on disk,
+with the cause surviving nowhere but the CLI's own stderr. The file holds exactly the
+error text the CLI prints, which by contract never contains credentials.
 
 ## CLI (internal/cli)
 

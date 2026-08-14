@@ -53,10 +53,13 @@ const (
 	maxModelBody  = 64 << 20 // 64 MiB
 	maxArgsBody   = 1 << 20  // 1 MiB
 	maxEventsBody = 16 << 20 // 16 MiB
-	shutdownGrace = 5 * time.Second
 	decisionAllow = "allow"
 	decisionDeny  = "deny"
 )
+
+// shutdownGrace is how long Stop waits for in-flight requests before force-closing
+// what is left. A var so tests can shrink it instead of paying the real grace.
+var shutdownGrace = 5 * time.Second
 
 // Upstream is a model provider endpoint plus the real host credential injected into
 // proxied requests. Read from host config/env by the caller; never exposed to the guest.
@@ -209,12 +212,23 @@ func (b *Broker) Start(ctx context.Context) (int, error) {
 	return port, nil
 }
 
-// Stop gracefully shuts down the server, waiting up to shutdownGrace for in-flight
-// requests to drain.
+// Stop shuts the server down: in-flight requests get shutdownGrace to drain, and
+// whatever is still open afterwards is force-closed. Shutdown alone only waits, so
+// one slow ingest handler (a guest final drain, a streaming proxy response) used to
+// hold teardown open for the whole grace and then leave that handler still emitting
+// into a recorder the caller was about to seal. The returned error says the grace
+// expired; the caller logs it and finishes sealing (DESIGN.md "Teardown never
+// abandons the seal for a shutdown problem").
 func (b *Broker) Stop() error {
 	ctx, cancel := context.WithTimeout(context.Background(), shutdownGrace)
 	defer cancel()
-	return b.srv.Shutdown(ctx)
+	if err := b.srv.Shutdown(ctx); err != nil {
+		if closeErr := b.srv.Close(); closeErr != nil {
+			return fmt.Errorf("broker: force close after %s shutdown grace (%v): %w", shutdownGrace, err, closeErr)
+		}
+		return fmt.Errorf("broker: %s shutdown grace expired, connections force-closed: %w", shutdownGrace, err)
+	}
+	return nil
 }
 
 // Revoke invalidates both bearer tokens; every authenticated route then returns 401.

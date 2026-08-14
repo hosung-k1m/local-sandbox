@@ -306,8 +306,15 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 			if e := emit(credentialEvent(evidence.EventCredentialRevoked, "supervisor")); e != nil {
 				failTeardown(e)
 			}
+			// A broker that would not shut down inside its grace is now
+			// force-closed by Stop, so there is nothing left to fail closed about
+			// and nothing left that can still write evidence. Report it and keep
+			// going: the seal, the trust record, and the final state below are
+			// what the session's integrity actually rests on, and abandoning them
+			// over a stuck HTTP handler turned completed sessions into INCOMPLETE
+			// ones (DESIGN.md "Teardown never abandons the seal").
 			if e := br.Stop(); e != nil {
-				failTeardown(fmt.Errorf("session: stop broker: %w", e))
+				progress("teardown", "broker did not shut down cleanly: "+e.Error())
 			}
 		}
 
@@ -391,6 +398,14 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 
 		if runErr == nil && teardownErr != nil {
 			runErr = teardownErr
+		}
+		// Leave the reason on disk for any failed run (DESIGN.md "Crash safety"),
+		// so an abort this early is attributable afterwards instead of only in
+		// whatever consumed the CLI's stderr.
+		if runErr != nil {
+			if e := writeError(sessionDir, runErr); e != nil {
+				progress("teardown", "could not record the session error breadcrumb: "+e.Error())
+			}
 		}
 	}()
 
