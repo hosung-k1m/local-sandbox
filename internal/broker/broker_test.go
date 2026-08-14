@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"boxedai/internal/evidence"
 	"boxedai/internal/policy"
@@ -57,6 +58,40 @@ func (f *fakeEmitter) last() captured {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.events[len(f.events)-1]
+}
+
+func TestWorkloadSuppliedHookPIDDoesNotGateToolCompletion(t *testing.T) {
+	fe := &fakeEmitter{}
+	b := mustBroker(t, Config{Emitter: fe})
+	srv := testServer(t, b)
+
+	sensor := do(t, http.MethodPost, srv.URL+"/v1/events", b.SupervisorToken(),
+		`{"events":[{"name":"sensor.started","attrs":{"sensor.mechanism":"tetragon"}}]}`)
+	sensor.Body.Close()
+	if sensor.StatusCode != http.StatusOK {
+		t.Fatalf("sensor.started status = %d, want 200", sensor.StatusCode)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/events", strings.NewReader(
+		`{"events":[{"name":"tool.completed","attrs":{"tool.name":"Bash","harness.hook.pid":999999}}]}`))
+	if err != nil {
+		t.Fatalf("build tool.completed request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.WorkloadToken())
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := (&http.Client{Timeout: 250 * time.Millisecond}).Do(req)
+	if err != nil {
+		t.Fatalf("tool.completed with workload-supplied hook pid was gated: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("tool.completed status = %d, want 200", resp.StatusCode)
+	}
+
+	completed := fe.byName(evidence.EventToolCompleted)
+	if len(completed) != 1 || completed[0].ch != evidence.ChannelWorkload {
+		t.Fatalf("recorded tool.completed = %+v, want one workload event", completed)
+	}
 }
 
 // --- helpers -------------------------------------------------------------------------

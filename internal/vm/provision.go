@@ -98,7 +98,10 @@ export NODE_EXTRA_CA_CERTS=/usr/local/share/ca-certificates/boxedai-extra-ca.crt
 # npm's default registry (registry.npmjs.org) is blocked by some corporate
 # gateways as a dependency-confusion policy; point it at an internal mirror
 # instead, same rationale as the CA injection above.
-npm config set registry {{.NPMRegistry}}
+# Write to the global npmrc ($PREFIX/etc/npmrc) rather than root's user-level
+# ~/.npmrc so the unprivileged agent user (which runs the harness CLIs, and the
+# bake verification) actually sees the mirror.
+npm config set registry {{.NPMRegistry}} --location=global
 printf '%s\n' '{{.NPMRegistry}}' > /etc/boxedai/expected-npm-registry
 {{end}}
 npm install -g @anthropic-ai/claude-code @openai/codex
@@ -112,25 +115,52 @@ install -m 0755 \
 `))
 
 // stepBakeTetragonTmpl gives the golden image kernel_observed process/network
-// evidence. Best-effort: if the release tarball is unavailable for this arch,
-// the guest agent falls back to procfs polling and reports that honestly
-// (sensor.mechanism=procfs), so a failure here must not abort bake
-// provisioning. `systemctl enable --now` here means every future session
-// boots with tetragon already running — no per-session systemctl call needed.
+// evidence. Installation is best-effort so a missing release or a VM kernel
+// that cannot load Tetragon still leaves the honest procfs fallback available.
+// A successfully downloaded release must include its BPF runtime payload;
+// bake verification separately rejects a binary-only installation.
 var stepBakeTetragonTmpl = template.Must(template.New("bake-step-tetragon").Parse(`#!/bin/sh
 set -eu
 mkdir -p /var/log/tetragon
 (
   set -e
   TETRAGON_VERSION="v1.2.0"
-  TMPDIR=$(mktemp -d)
-  cd "$TMPDIR"
+  rm -rf /var/lib/boxedai/tetragon-install
+  mkdir -p /var/lib/boxedai/tetragon-install
+  trap 'rm -rf /var/lib/boxedai/tetragon-install' EXIT
+  cd /var/lib/boxedai/tetragon-install
   curl -fsSL -o tetragon.tar.gz \
     "https://github.com/cilium/tetragon/releases/download/${TETRAGON_VERSION}/tetragon-${TETRAGON_VERSION}-{{.Arch}}.tar.gz"
   tar -xzf tetragon.tar.gz
-  install -m 0755 tetragon-*/usr/local/bin/tetragon /usr/local/bin/tetragon
+  cp -a tetragon-*/usr/local/. /usr/local/
+  test -x /usr/local/bin/tetragon
+  test -x /usr/local/lib/tetragon/bpftool
+  test -s /usr/local/lib/tetragon/tetragon.conf.d/bpf-lib
+  test -s /usr/local/lib/tetragon/bpf/bpf_execve_event.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_exit.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v53.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v511.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v61.o
+  mkdir -p /etc/boxedai/tetragon
+  cat > /etc/boxedai/tetragon/boxedai-process-fork.yaml <<'POLICY_EOF'
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: boxedai-process-fork
+spec:
+  tracepoints:
+  - subsystem: sched
+    event: sched_process_fork
+    args:
+    - index: 5
+      type: uint32
+    - index: 7
+      type: uint32
+POLICY_EOF
   cd /
-  rm -rf "$TMPDIR"
+  rm -rf /var/lib/boxedai/tetragon-install
+  trap - EXIT
   cat > /etc/systemd/system/tetragon.service <<'UNIT_EOF'
 [Unit]
 Description=Tetragon eBPF sensor
@@ -138,14 +168,16 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/tetragon --export-filename=/var/log/tetragon/tetragon.log
+Environment="PATH=/usr/local/lib/tetragon/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+ExecStart=/usr/local/bin/tetragon --bpf-lib=/usr/local/lib/tetragon/bpf --tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml --export-filename=/var/log/tetragon/tetragon.log --export-rate-limit=-1 --metrics-server=127.0.0.1:2112
 Restart=on-failure
 
 [Install]
 WantedBy=multi-user.target
 UNIT_EOF
   systemctl daemon-reload
-  systemctl enable --now tetragon
+  systemctl enable tetragon
+  systemctl start tetragon || echo "boxedai: tetragon cannot start on the bake VM kernel, guest agent will fall back to procfs" >&2
 ) || echo "boxedai: tetragon install failed, guest agent will fall back to procfs" >&2
 `))
 
@@ -187,6 +219,8 @@ Type=simple
 ExecStart=/usr/local/bin/boxedai-guest-agent
 Restart=on-failure
 User=root
+RuntimeDirectory=boxedai
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target
@@ -257,12 +291,35 @@ systemctl enable nftables
 systemctl restart nftables
 `))
 
-// stepEnableAgentTmpl brings the supervisor up now that egress is locked
-// down, so its first packet is already governed by the nftables allowlist
-// above. It POSTs sensor.started to the broker over the one route that
-// survives.
+// stepEnableAgentTmpl establishes a fresh per-session Tetragon export boundary,
+// then brings the supervisor up now that egress is locked down. A Tetragon
+// restart that cannot stay active leaves no export file, so the agent selects
+// the honest procfs fallback instead of attaching to baked stale content.
 var stepEnableAgentTmpl = template.Must(template.New("session-step-enable-agent").Parse(`#!/bin/sh
 set -eu
+systemctl stop tetragon 2>/dev/null || true
+rm -f {{.TetragonLog}}
+TETRAGON_READY=false
+if command -v tetragon >/dev/null 2>&1; then
+  if systemctl start tetragon; then
+    for TETRAGON_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+      if ! systemctl is-active --quiet tetragon; then
+        break
+      fi
+      if [ -e {{.TetragonLog}} ]; then
+        if systemctl is-active --quiet tetragon; then
+          TETRAGON_READY=true
+        fi
+        break
+      fi
+      sleep 0.1
+    done
+  fi
+fi
+if [ "$TETRAGON_READY" != true ]; then
+  systemctl stop tetragon 2>/dev/null || true
+  rm -f {{.TetragonLog}}
+fi
 systemctl enable --now boxedai-guest-agent
 `))
 
@@ -278,6 +335,7 @@ type provisionData struct {
 	Arch            string // GOARCH convention: "arm64" | "amd64"
 	AgentConfigB64  string
 	WorkloadUID     int
+	TetragonLog     string
 }
 
 // bakeProvisionData is the template data for bake provisioning (see
@@ -363,6 +421,7 @@ func provisionScripts(cfg Config) ([]limaProvision, error) {
 		Arch:            cfg.Arch,
 		AgentConfigB64:  base64.StdEncoding.EncodeToString(agentCfgJSON),
 		WorkloadUID:     agentUID,
+		TetragonLog:     guestTetragonLog,
 	}
 
 	steps := []*template.Template{

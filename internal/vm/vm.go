@@ -13,6 +13,8 @@ import (
 // defaultLimactl is used when VM.Binary is unset.
 const defaultLimactl = "./bin/limactl"
 
+const guestProcessSensorReadyPath = "/run/boxedai/process-sensor-ready"
+
 // stopGrace is how long Stop waits after writing the stop sentinel, matching
 // the guest agent's 5s freeze+drain window (DESIGN.md "Kill switch").
 const stopGrace = 5 * time.Second
@@ -145,11 +147,22 @@ func (vm *VM) Start(ctx context.Context) error {
 	return nil
 }
 
-// WaitHealthy polls until the guest's boxedai-guest-agent systemd unit
-// reports active, or timeout elapses. The session layer calls this after
-// Start and before emitting session.started / launching the harness
-// (DESIGN.md session flow step 6: "abort, INCOMPLETE" on timeout).
+// WaitHealthy polls until the guest's boxedai-guest-agent systemd unit reports
+// active and the process watcher has published its readiness marker, or timeout
+// elapses. The session layer calls this after Start and before emitting
+// session.started / launching the harness (DESIGN.md session flow step 7:
+// "abort, INCOMPLETE" on timeout).
 func (vm *VM) WaitHealthy(ctx context.Context, timeout time.Duration) error {
+	return waitForGuestHealthy(ctx, vm.Cfg.SessionID, timeout, healthPollInterval, vm.run)
+}
+
+func waitForGuestHealthy(
+	ctx context.Context,
+	name string,
+	timeout time.Duration,
+	pollInterval time.Duration,
+	run limactlRunFunc,
+) error {
 	waitCtx, cancelWait := context.WithTimeout(ctx, timeout)
 	defer cancelWait()
 
@@ -158,10 +171,21 @@ func (vm *VM) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 		// Best-effort: a not-yet-booted guest simply won't answer "active"
 		// yet, so errors here are not fatal — only the deadline is.
 		probeCtx, cancelProbe := context.WithTimeout(waitCtx, limaShellProbeTimeout)
-		_ = vm.run(probeCtx, &out, io.Discard, "shell", vm.Cfg.SessionID, "--", "systemctl", "is-active", "boxedai-guest-agent")
+		_ = run(probeCtx, &out, io.Discard, "shell", name, "--", "systemctl", "is-active", "boxedai-guest-agent")
 		cancelProbe()
 		if strings.TrimSpace(out.String()) == "active" {
-			return nil
+			out.Reset()
+			probeCtx, cancelProbe = context.WithTimeout(waitCtx, limaShellProbeTimeout)
+			_ = run(probeCtx, &out, io.Discard, "shell", name, "--", "systemctl", "is-active", "tetragon")
+			cancelProbe()
+			if strings.TrimSpace(out.String()) == "active" {
+				probeCtx, cancelProbe = context.WithTimeout(waitCtx, limaShellProbeTimeout)
+				err := run(probeCtx, io.Discard, io.Discard, "shell", name, "--", "test", "-f", guestProcessSensorReadyPath)
+				cancelProbe()
+				if err == nil {
+					return nil
+				}
+			}
 		}
 		if ctx.Err() != nil {
 			return ctx.Err()
@@ -172,7 +196,7 @@ func (vm *VM) WaitHealthy(ctx context.Context, timeout time.Duration) error {
 				return ctx.Err()
 			}
 			return fmt.Errorf("vm: guest agent not healthy after %s", timeout)
-		case <-time.After(healthPollInterval):
+		case <-time.After(pollInterval):
 		}
 	}
 }
@@ -287,13 +311,28 @@ command -v claude
 command -v codex
 claude --version
 codex --version
+if command -v tetragon >/dev/null 2>&1; then
+  test -x /usr/local/lib/tetragon/bpftool
+  test -s /usr/local/lib/tetragon/tetragon.conf.d/bpf-lib
+  test -s /usr/local/lib/tetragon/bpf/bpf_execve_event.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_exit.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v53.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v511.o
+  test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v61.o
+  test -s /etc/boxedai/tetragon/boxedai-process-fork.yaml
+  grep -F -- 'PATH=/usr/local/lib/tetragon/:' /etc/systemd/system/tetragon.service
+  grep -F -- '--bpf-lib=/usr/local/lib/tetragon/bpf' /etc/systemd/system/tetragon.service
+  grep -F -- '--tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml' /etc/systemd/system/tetragon.service
+  grep -F -- '--export-rate-limit=-1' /etc/systemd/system/tetragon.service
+  grep -F -- '--metrics-server=127.0.0.1:2112' /etc/systemd/system/tetragon.service
+fi
 if test -f /usr/local/share/ca-certificates/boxedai-extra-ca.crt; then
   test -s /usr/local/share/ca-certificates/boxedai-extra-ca.crt
   test -L /etc/ssl/certs/boxedai-extra-ca.pem
 fi
 if test -f /etc/boxedai/expected-npm-registry; then
-  npm config get registry > /run/boxedai-npm-registry
-  cmp -s /etc/boxedai/expected-npm-registry /run/boxedai-npm-registry
+  npm config get registry | cmp -s /etc/boxedai/expected-npm-registry -
 fi
 `
 

@@ -80,6 +80,11 @@ func (vm *VM) harnessArgv(interactive bool) ([]string, error) {
 	argv = append(argv, streamMode...)
 	argv = append(argv,
 		"--uid=agent",
+		"--property=BindsTo=tetragon.service boxedai-guest-agent.service",
+		"--property=After=tetragon.service boxedai-guest-agent.service",
+		"--property=ConditionPathExists="+guestProcessSensorReadyPath,
+		"--property=KillMode=control-group",
+		"--property=KillSignal=SIGKILL",
 		"--property=NoNewPrivileges=yes",
 		"--property=TasksMax="+strconv.Itoa(cfg.Limits.TasksMax),
 		"--property=MemoryMax="+cfg.Limits.MemoryMax,
@@ -143,8 +148,15 @@ func harnessEnv(cfg Config) ([]string, error) {
 			"OTEL_LOG_TOOL_DETAILS=1",
 			"OTEL_LOG_TOOL_CONTENT=1",
 			"OTEL_LOG_RAW_API_BODIES=file:" + guestClaudeRawBodiesDir,
+			// Hook capture (DESIGN.md "Harness hook capture — lefthook /
+			// righthook"): the staged settings.json wires PreToolUse/PostToolUse
+			// to the guest agent's lefthook/righthook subcommands, which need
+			// these two vars to reach the broker as the workload (token W). The
+			// git bridge reads the same pair.
+			"BOXEDAI_BROKER_URL=" + base,
+			"BOXEDAI_WORKLOAD_TOKEN=" + cfg.WorkloadToken,
 		}
-		githubEnv, err := githubHarnessEnv(cfg, base)
+		githubEnv, err := githubHarnessEnv(cfg)
 		if err != nil {
 			return nil, err
 		}
@@ -154,8 +166,11 @@ func harnessEnv(cfg Config) ([]string, error) {
 			"OPENAI_BASE_URL=" + base + "/v1/model/openai",
 			"OPENAI_API_KEY=" + cfg.WorkloadToken,
 			"CODEX_HOME=" + guestCodexConfigDir,
+			// The git bridge reads this pair (codex has no capture hooks in v0.1).
+			"BOXEDAI_BROKER_URL=" + base,
+			"BOXEDAI_WORKLOAD_TOKEN=" + cfg.WorkloadToken,
 		}
-		githubEnv, err := githubHarnessEnv(cfg, base)
+		githubEnv, err := githubHarnessEnv(cfg)
 		if err != nil {
 			return nil, err
 		}

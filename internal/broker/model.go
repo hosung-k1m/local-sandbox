@@ -2,6 +2,7 @@ package broker
 
 import (
 	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
@@ -71,6 +72,13 @@ func (b *Broker) newModelProxy(provider string, up Upstream) (*httputil.ReverseP
 			pr.Out.Header.Del("Authorization")
 			pr.Out.Header.Del("X-Api-Key")
 			pr.Out.Header.Del(chatgptAccountIDHeader)
+			// Strip the workload's Accept-Encoding: the guest HTTP client asks for
+			// codings the host cannot decode (undici requests br/zstd), which would
+			// leave ModifyResponse digesting and parsing opaque compressed bytes.
+			// With it gone, Go's transport negotiates its own gzip and transparently
+			// decodes it, so the digest, usage parsing, and the bytes forwarded to
+			// the workload are always the identical plain payload.
+			pr.Out.Header.Del("Accept-Encoding")
 			if up.Key != "" {
 				switch provider {
 				case providerAnthropic:
@@ -175,6 +183,19 @@ func (b *Broker) modelModifyResponse(provider string) func(*http.Response) error
 		}
 		_ = resp.Body.Close()
 
+		// Defense in depth: the proxy strips the workload's Accept-Encoding, so a
+		// compressed body should already have been transport-negotiated gzip and
+		// transparently decoded before this callback. If a non-compliant upstream
+		// compresses anyway, usage is parsed from a decoded COPY; the digest, the
+		// client passthrough bytes, the Content-Length, and every header below all
+		// stay over the untouched raw body — this decode exists only to parse usage.
+		usageBody := body
+		if strings.EqualFold(resp.Header.Get("Content-Encoding"), "gzip") {
+			if decoded, ok := gunzipForUsageParsing(body); ok {
+				usageBody = decoded
+			}
+		}
+
 		actionID := ""
 		if mc, ok := resp.Request.Context().Value(modelCallKey{}).(*modelCall); ok {
 			actionID = mc.actionID
@@ -185,7 +206,7 @@ func (b *Broker) modelModifyResponse(provider string) func(*http.Response) error
 			evidence.AttrContentDigest:  evidence.SHA256Hex(body),
 			evidence.AttrContentCapture: string(evidence.CaptureDigestOnly),
 		}
-		for k, v := range parseUsage(provider, body) {
+		for k, v := range parseUsage(provider, usageBody) {
 			attrs[k] = v
 		}
 		outcome := evidence.OutcomeSuccess
@@ -239,19 +260,68 @@ func extractModel(body []byte) string {
 	return parsed.Model
 }
 
-// parseUsage extracts token counts from a model response body if present, mapping
-// provider-specific field names to the common llm.usage.* attributes.
+// maxGunzipDecodeBytes caps the size of the gzip-decoded COPY made for usage parsing
+// only, guarding against a decompression bomb; the client-visible response bytes are
+// completely unaffected by this cap regardless of outcome.
+const maxGunzipDecodeBytes = 32 << 20 // 32 MiB
+
+// gunzipForUsageParsing decodes a gzip-compressed response body into a separate copy
+// for usage parsing only; body itself is never consumed or mutated. It reports ok=false
+// on any error (not actually gzip, corrupt, or larger than maxGunzipDecodeBytes), and
+// the caller falls back to parsing the raw body, matching this file's existing
+// best-effort parsing style (see extractModel).
+func gunzipForUsageParsing(body []byte) (decoded []byte, ok bool) {
+	zr, err := gzip.NewReader(bytes.NewReader(body))
+	if err != nil {
+		return nil, false
+	}
+	defer zr.Close()
+	decoded, err = io.ReadAll(io.LimitReader(zr, maxGunzipDecodeBytes+1))
+	if err != nil || int64(len(decoded)) > maxGunzipDecodeBytes {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// parseUsage extracts token counts from a model response body, mapping provider-
+// specific field names to the common llm.usage.* attributes. Claude Code always
+// requests SSE streaming, so a real response is almost never a plain JSON object: a
+// plain top-level "usage" object (the non-streaming shape) is tried first, and any body
+// that isn't one, or carries no usage there, falls back to scanning it as Server-Sent
+// Events.
 func parseUsage(provider string, body []byte) map[string]any {
+	if out := parsePlainUsage(provider, body); out != nil {
+		return out
+	}
+	return parseSSEUsage(provider, body)
+}
+
+// parsePlainUsage parses body as a single non-streaming JSON object with a top-level
+// "usage" field — the shape the original parseUsage handled before SSE support existed.
+func parsePlainUsage(provider string, body []byte) map[string]any {
 	var parsed struct {
-		Usage map[string]json.Number `json:"usage"`
+		Usage map[string]any `json:"usage"`
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	if err := dec.Decode(&parsed); err != nil || parsed.Usage == nil {
 		return nil
 	}
+	return usageAttrs(provider, parsed.Usage)
+}
+
+// usageAttrs maps one raw provider usage field map to the common llm.usage.* attributes,
+// emitting only the fields the provider actually reported (an absent field stays absent;
+// an empty/unrecognized usage map yields nil, never a zero-value attr). Shared by both
+// the plain-JSON and SSE parsing paths so the field-name mapping cannot drift between
+// them. The map value type is any, not json.Number: a real Anthropic usage object also
+// carries strings, objects, and arrays (service_tier, server_tool_use, cache_creation,
+// iterations, speed), and decoding those into json.Number would fail the WHOLE usage
+// object, silently dropping the token counts next to them. Callers decode with
+// UseNumber, so numeric fields arrive here as json.Number.
+func usageAttrs(provider string, usage map[string]any) map[string]any {
 	get := func(k string) (int64, bool) {
-		n, ok := parsed.Usage[k]
+		n, ok := usage[k].(json.Number)
 		if !ok {
 			return 0, false
 		}
@@ -264,6 +334,8 @@ func parseUsage(provider string, body []byte) map[string]any {
 	out := map[string]any{}
 	switch provider {
 	case providerAnthropic:
+		// cache_creation_input_tokens / cache_read_input_tokens are deliberately
+		// ignored: only the common input/output counts are recorded.
 		if v, ok := get("input_tokens"); ok {
 			out[attrUsageInput] = v
 		}
@@ -271,10 +343,17 @@ func parseUsage(provider string, body []byte) map[string]any {
 			out[attrUsageOutput] = v
 		}
 	case providerOpenAI:
+		// Chat Completions (prompt_tokens/completion_tokens) and the Responses API
+		// (input_tokens/output_tokens) name the same counts differently; a single usage
+		// object only ever carries one of the two namings, so trying both is safe.
 		if v, ok := get("prompt_tokens"); ok {
+			out[attrUsageInput] = v
+		} else if v, ok := get("input_tokens"); ok {
 			out[attrUsageInput] = v
 		}
 		if v, ok := get("completion_tokens"); ok {
+			out[attrUsageOutput] = v
+		} else if v, ok := get("output_tokens"); ok {
 			out[attrUsageOutput] = v
 		}
 		if v, ok := get("total_tokens"); ok {
@@ -285,6 +364,91 @@ func parseUsage(provider string, body []byte) map[string]any {
 		return nil
 	}
 	return out
+}
+
+// parseSSEUsage scans body as Server-Sent Events — the shape of every real streaming
+// model response. Each "data:" line decodes independently; recognized usage fields fold
+// into a last-value-wins map so that Anthropic's cumulative message_delta usage and
+// OpenAI's single whole-usage chunk/event both converge on the correct final counts.
+func parseSSEUsage(provider string, body []byte) map[string]any {
+	out := map[string]any{}
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSuffix(line, "\r") // tolerate CRLF line endings
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		switch provider {
+		case providerAnthropic:
+			applyAnthropicSSELine(data, out)
+		case providerOpenAI:
+			applyOpenAISSELine(data, out)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// applyAnthropicSSELine decodes one Anthropic SSE data line and folds any usage it
+// carries into out. message_start's usage lives under "message"; message_delta's usage
+// is a top-level field on the event itself (cumulative — a later delta naturally
+// overwrites an earlier one as the stream is scanned in order).
+func applyAnthropicSSELine(data string, out map[string]any) {
+	var evt struct {
+		Type    string `json:"type"`
+		Message struct {
+			Usage map[string]any `json:"usage"`
+		} `json:"message"`
+		Usage map[string]any `json:"usage"`
+	}
+	dec := json.NewDecoder(strings.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&evt); err != nil {
+		return // malformed/non-JSON data line; ignore, best-effort like extractModel
+	}
+	var usage map[string]any
+	switch evt.Type {
+	case "message_start":
+		usage = evt.Message.Usage
+	case "message_delta":
+		usage = evt.Usage
+	default:
+		return
+	}
+	for k, v := range usageAttrs(providerAnthropic, usage) {
+		out[k] = v
+	}
+}
+
+// applyOpenAISSELine decodes one OpenAI SSE data line, handling both Chat Completions
+// chunks (a top-level "usage" object appears only on the final chunk, when
+// stream_options.include_usage is set) and Responses-API "response.completed" events
+// (usage nested under "response").
+func applyOpenAISSELine(data string, out map[string]any) {
+	var evt struct {
+		Type     string         `json:"type"`
+		Usage    map[string]any `json:"usage"`
+		Response struct {
+			Usage map[string]any `json:"usage"`
+		} `json:"response"`
+	}
+	dec := json.NewDecoder(strings.NewReader(data))
+	dec.UseNumber()
+	if err := dec.Decode(&evt); err != nil {
+		return
+	}
+	usage := evt.Usage
+	if evt.Type == "response.completed" {
+		usage = evt.Response.Usage
+	}
+	for k, v := range usageAttrs(providerOpenAI, usage) {
+		out[k] = v
+	}
 }
 
 // joinPath joins an upstream base path with the captured request tail using a single

@@ -12,7 +12,7 @@ const guestGitBridgeURL = "ext::/usr/local/bin/boxedai-guest-agent git-bridge %S
 // githubHarnessEnv rewrites only the current repository's exact and canonical
 // remote URLs to the guest agent's authenticated bridge. The host SSH identity
 // remains outside the VM.
-func githubHarnessEnv(cfg Config, brokerBase string) ([]string, error) {
+func githubHarnessEnv(cfg Config) ([]string, error) {
 	if cfg.GitHubRepository == "" {
 		return nil, nil
 	}
@@ -47,11 +47,12 @@ func githubHarnessEnv(cfg Config, brokerBase string) ([]string, error) {
 		)
 	}
 	protocolIndex := len(unique)
+	// BOXEDAI_BROKER_URL / BOXEDAI_WORKLOAD_TOKEN, which the git bridge reads,
+	// are set unconditionally by harnessEnv for claude and codex — the
+	// lefthook/righthook capture hooks need them even without GitHub access.
 	env = append(env,
 		"GIT_CONFIG_KEY_"+strconv.Itoa(protocolIndex)+"=protocol.ext.allow",
 		"GIT_CONFIG_VALUE_"+strconv.Itoa(protocolIndex)+"=user",
-		"BOXEDAI_BROKER_URL="+brokerBase,
-		"BOXEDAI_WORKLOAD_TOKEN="+cfg.WorkloadToken,
 		"GIT_TERMINAL_PROMPT=0",
 		"GCM_INTERACTIVE=never",
 	)

@@ -116,6 +116,81 @@ func TestWaitForBootDoneIsBounded(t *testing.T) {
 	}
 }
 
+func TestWaitForGuestHealthyRequiresProcessSensorReadiness(t *testing.T) {
+	readinessProbes := 0
+	run := func(_ context.Context, stdout, _ io.Writer, args ...string) error {
+		switch args[3] {
+		case "systemctl":
+			_, _ = io.WriteString(stdout, "active\n")
+			return nil
+		case "test":
+			readinessProbes++
+			if readinessProbes == 1 {
+				return errors.New("process sensor not ready")
+			}
+			want := []string{"shell", "test-instance", "--", "test", "-f", guestProcessSensorReadyPath}
+			if strings.Join(args, "\x00") != strings.Join(want, "\x00") {
+				t.Errorf("readiness probe args = %v, want %v", args, want)
+			}
+			return nil
+		default:
+			t.Fatalf("unexpected health probe: %v", args)
+			return nil
+		}
+	}
+
+	if err := waitForGuestHealthy(context.Background(), "test-instance", time.Second, time.Millisecond, run); err != nil {
+		t.Fatalf("waitForGuestHealthy: %v", err)
+	}
+	if readinessProbes != 2 {
+		t.Fatalf("readiness probes = %d, want 2", readinessProbes)
+	}
+}
+
+func TestWaitForGuestHealthyRequiresActiveTetragon(t *testing.T) {
+	readinessProbes := 0
+	run := func(_ context.Context, stdout, _ io.Writer, args ...string) error {
+		if args[3] == "test" {
+			readinessProbes++
+			return nil
+		}
+		if args[len(args)-1] == "boxedai-guest-agent" {
+			_, _ = io.WriteString(stdout, "active\n")
+		} else {
+			_, _ = io.WriteString(stdout, "inactive\n")
+		}
+		return nil
+	}
+
+	err := waitForGuestHealthy(context.Background(), "test-instance", 5*time.Millisecond, time.Millisecond, run)
+	if err == nil {
+		t.Fatal("waitForGuestHealthy succeeded with inactive Tetragon")
+	}
+	if readinessProbes != 0 {
+		t.Fatalf("readiness probes = %d, want 0 while Tetragon is inactive", readinessProbes)
+	}
+}
+
+func TestHarnessUnitBindsToAuthoritativeServices(t *testing.T) {
+	vm := &VM{Cfg: testConfig(t, true)}
+	argv, err := vm.harnessArgv(false)
+	if err != nil {
+		t.Fatalf("harnessArgv: %v", err)
+	}
+	joined := strings.Join(argv, "\n")
+	for _, want := range []string{
+		"--property=BindsTo=tetragon.service boxedai-guest-agent.service",
+		"--property=After=tetragon.service boxedai-guest-agent.service",
+		"--property=ConditionPathExists=" + guestProcessSensorReadyPath,
+		"--property=KillMode=control-group",
+		"--property=KillSignal=SIGKILL",
+	} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("harness argv missing %q", want)
+		}
+	}
+}
+
 func TestLimaCreateArgsDisablesTTY(t *testing.T) {
 	want := []string{"create", "--tty=false", "--name=test-instance", "/path/to/lima.yaml"}
 	got := limaCreateArgs("test-instance", "/path/to/lima.yaml")
@@ -414,17 +489,18 @@ func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 	got := combined.String()
 
 	for _, want := range []string{
-		"useradd",                    // idempotent user guard
-		"--uid 4242",                 // agent uid
-		"boxedai-guest-agent",        // guest agent binary + unit
-		"/etc/boxedai/agent.json",    // guest agent config
-		"nftables",                   // nftables ruleset
-		"systemctl restart rsyslog",  // rsyslog-restart: confirm the log sink is live this session
-		"policy drop",                // default-deny
-		"boxedai-denied",             // deny log prefix
-		"meta skuid 4242",            // log only the workload's denials
+		"useradd",                   // idempotent user guard
+		"--uid 4242",                // agent uid
+		"boxedai-guest-agent",       // guest agent binary + unit
+		"RuntimeDirectory=boxedai",  // process sensor readiness directory
+		"/etc/boxedai/agent.json",   // guest agent config
+		"nftables",                  // nftables ruleset
+		"systemctl restart rsyslog", // rsyslog-restart: confirm the log sink is live this session
+		"policy drop",               // default-deny
+		"boxedai-denied",            // deny log prefix
+		"meta skuid 4242",           // log only the workload's denials
 		"udp dport 53 ip daddr ${UPSTREAM_DNS} drop", // silently drop the workload's dead-resolver DNS (noise, not evidence)
-		"systemctl restart nftables", // ruleset applied
+		"systemctl restart nftables",                 // ruleset applied
 		"systemctl enable --now boxedai-guest-agent", // guest agent enable
 	} {
 		if !strings.Contains(got, want) {
@@ -433,7 +509,8 @@ func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 	}
 
 	// Session provisioning must never apt-get/npm/curl-install anything: all
-	// of that is baked into the golden image once, in bakeProvisionScripts.
+	// binaries and packages are baked into the golden image once. Restarting
+	// the baked Tetragon service above is session initialization, not install.
 	for _, banned := range []string{
 		"apt-get install",
 		"npm install",
@@ -441,13 +518,44 @@ func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 		"nodejs",
 		"@anthropic-ai/claude-code",
 		"@openai/codex",
-		"tetragon",
 		"BOXEDAI_CA_EOF",
 		"NODE_EXTRA_CA_CERTS",
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("session provisioning should not contain %q (belongs to bake provisioning)", banned)
 		}
+	}
+}
+
+func TestSessionProvisioningEstablishesFreshTetragonLogBeforeAgent(t *testing.T) {
+	provs, err := provisionScripts(testConfig(t, true))
+	if err != nil {
+		t.Fatalf("provisionScripts: %v", err)
+	}
+	script := provs[len(provs)-1].Script
+	for _, want := range []string{
+		"systemctl stop tetragon",
+		"rm -f /var/log/tetragon/tetragon.log",
+		"systemctl start tetragon",
+		"for TETRAGON_WAIT in 1 2 3 4 5",
+		"systemctl is-active --quiet tetragon",
+		"if [ -e /var/log/tetragon/tetragon.log ]",
+		"TETRAGON_READY=true",
+		"systemctl enable --now boxedai-guest-agent",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("agent enable script missing %q", want)
+		}
+	}
+	boundary := strings.Index(script, "rm -f /var/log/tetragon/tetragon.log")
+	restart := strings.Index(script, "systemctl start tetragon")
+	wait := strings.Index(script, "for TETRAGON_WAIT in 1 2 3 4 5")
+	validation := strings.Index(script, "systemctl is-active --quiet tetragon")
+	exportReady := strings.Index(script, "if [ -e /var/log/tetragon/tetragon.log ]")
+	decision := strings.Index(script, "if [ \"$TETRAGON_READY\" != true ]")
+	agentStart := strings.Index(script, "systemctl enable --now boxedai-guest-agent")
+	if !(boundary < restart && restart < wait && wait < validation && validation < exportReady && exportReady < decision && decision < agentStart) {
+		t.Errorf("Tetragon boundary/restart/validation must precede guest agent start:\n%s", script)
 	}
 }
 
@@ -606,8 +714,25 @@ func TestBakeProvisionScripts_ContainsBakeContent(t *testing.T) {
 		"@openai/codex",
 		"@anthropic-ai/claude-code-linux-arm64/claude",
 		"/usr/local/bin/claude",
-		"tetragon",                        // tetragon install
-		"systemctl enable --now tetragon", // baked enable state
+		"tetragon",                                             // tetragon install
+		"rm -rf /var/lib/boxedai/tetragon-install",             // exact fixed staging cleanup
+		"cp -a tetragon-*/usr/local/. /usr/local/",             // complete release payload
+		"/usr/local/lib/tetragon/bpftool",                      // packaged helper
+		"/usr/local/lib/tetragon/tetragon.conf.d/bpf-lib",      // packaged config
+		"/usr/local/lib/tetragon/bpf/bpf_execve_event.o",       // exec capture object
+		"/usr/local/lib/tetragon/bpf/bpf_exit.o",               // exit capture object
+		"/usr/local/lib/tetragon/bpf/bpf_generic_tracepoint.o", // fork tracepoint capture object
+		"/usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v53.o",
+		"/usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v511.o",
+		"/usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v61.o",
+		"name: boxedai-process-fork", // static fork policy
+		"event: sched_process_fork",
+		"--tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml",
+		"--export-rate-limit=-1",
+		"--metrics-server=127.0.0.1:2112",
+		"PATH=/usr/local/lib/tetragon/:",                              // helper lookup
+		"--bpf-lib=/usr/local/lib/tetragon/bpf",                       // explicit service path
+		"systemctl enable tetragon",                                   // baked enable state
 		"apt-get install -y --no-install-recommends nftables rsyslog", // package install
 		"systemctl enable rsyslog",                                    // baked enable state
 	} {
@@ -617,6 +742,9 @@ func TestBakeProvisionScripts_ContainsBakeContent(t *testing.T) {
 	}
 	if strings.Contains(got, "cloud-init clean") {
 		t.Errorf("bake provisioning should not clean cloud-init before CLI verification")
+	}
+	if strings.Contains(got, "mktemp -d") {
+		t.Errorf("bake provisioning should use the fixed Tetragon staging directory")
 	}
 
 	// Session-only content (broker/token/ruleset/guest-agent) must never
@@ -632,6 +760,30 @@ func TestBakeProvisionScripts_ContainsBakeContent(t *testing.T) {
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("bake provisioning should not contain %q (session-only)", banned)
+		}
+	}
+}
+
+func TestBakeVerificationChecksTetragonRuntimePayloadWhenInstalled(t *testing.T) {
+	for _, want := range []string{
+		"if command -v tetragon",
+		"test -x /usr/local/lib/tetragon/bpftool",
+		"test -s /usr/local/lib/tetragon/tetragon.conf.d/bpf-lib",
+		"test -s /usr/local/lib/tetragon/bpf/bpf_execve_event.o",
+		"test -s /usr/local/lib/tetragon/bpf/bpf_exit.o",
+		"test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint.o",
+		"test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v53.o",
+		"test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v511.o",
+		"test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v61.o",
+		"test -s /etc/boxedai/tetragon/boxedai-process-fork.yaml",
+		"PATH=/usr/local/lib/tetragon/:",
+		"--bpf-lib=/usr/local/lib/tetragon/bpf",
+		"--tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml",
+		"--export-rate-limit=-1",
+		"--metrics-server=127.0.0.1:2112",
+	} {
+		if !strings.Contains(bakeVerificationScript, want) {
+			t.Errorf("bake verification missing Tetragon runtime check %q", want)
 		}
 	}
 }
@@ -786,6 +938,8 @@ func TestHarnessEnv_Claude(t *testing.T) {
 		"OTEL_LOG_TOOL_DETAILS=1",
 		"OTEL_LOG_TOOL_CONTENT=1",
 		"OTEL_LOG_RAW_API_BODIES=file:/home/agent/.claude/raw-api-bodies",
+		"BOXEDAI_BROKER_URL=http://host.lima.internal:41830",
+		"BOXEDAI_WORKLOAD_TOKEN=workload-token",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("claude env missing %q, got %v", want, env)
@@ -845,6 +999,8 @@ func TestHarnessEnv_Codex(t *testing.T) {
 		"OPENAI_BASE_URL=http://host.lima.internal:41830/v1/model/openai",
 		"OPENAI_API_KEY=workload-token",
 		"CODEX_HOME=/home/agent/.codex",
+		"BOXEDAI_BROKER_URL=http://host.lima.internal:41830",
+		"BOXEDAI_WORKLOAD_TOKEN=workload-token",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("codex env missing %q, got %v", want, env)

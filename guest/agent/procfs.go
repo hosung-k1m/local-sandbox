@@ -21,10 +21,11 @@ const procfsPollInterval = 500 * time.Millisecond
 // because /proc offers no exec id or cgroup lineage, only a uid+pid+ppid
 // snapshot (DESIGN.md: "procfs fallback emits the same with correlation
 // weaker (note in attrs)" — see ProcInfo.Observer).
-func runProcfsWatcher(ctx context.Context, cfg Config, batch *Batcher) error {
+func runProcfsWatcher(ctx context.Context, cfg Config, batch *Batcher, ready func()) error {
 	seen := map[int64]ProcInfo{}
 	ticker := time.NewTicker(procfsPollInterval)
 	defer ticker.Stop()
+	initialized := false
 	for {
 		current := scanProcfs(cfg.WorkloadUID)
 		for pid, pi := range current {
@@ -35,10 +36,14 @@ func runProcfsWatcher(ctx context.Context, cfg Config, batch *Batcher) error {
 		for pid, pi := range seen {
 			if _, ok := current[pid]; !ok {
 				// procfs offers no exit code on its own; recorded as unknown.
-				batch.Add(newProcessExitedEvent(pi, -1))
+				batch.Add(newProcessExitedEvent(pi, ProcessExitStatus{}))
 			}
 		}
 		seen = current
+		if !initialized {
+			initialized = true
+			ready()
+		}
 		select {
 		case <-ctx.Done():
 			return nil

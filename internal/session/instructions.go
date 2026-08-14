@@ -10,7 +10,26 @@ import (
 const (
 	harnessHomeDirName     = "harness-home"
 	maxInstructionFileSize = 1 << 20
+	claudeSettingsFileName = "settings.json"
 )
+
+// claudeHooksSettingsJSON is the BoxedAi-authored Claude Code settings.json
+// staged into the session harness home, never the host's own settings (see
+// the exclusion in stageHarnessInstructions below). It wires PreToolUse/
+// PostToolUse to the guest agent's lefthook/righthook subcommands so every
+// tool invocation is recorded as tool.requested/tool.completed evidence
+// (DESIGN.md "Harness hook capture — lefthook / righthook").
+const claudeHooksSettingsJSON = `{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent lefthook", "timeout": 15}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent righthook", "timeout": 15}]}
+    ]
+  }
+}
+`
 
 var hostUserHomeDir = os.UserHomeDir
 
@@ -71,6 +90,14 @@ func stageHarnessInstructions(sessionDir, harness string) (string, error) {
 		}
 		if err := copyInstructionFile(source, target); err != nil {
 			return "", err
+		}
+	}
+	// Claude-only: stage the BoxedAi-authored hook wiring (never the host's
+	// own settings.json — codex/exec get no hook mechanism in v0.1).
+	if harness == "claude" {
+		settingsTarget := filepath.Join(destination, claudeSettingsFileName)
+		if err := os.WriteFile(settingsTarget, []byte(claudeHooksSettingsJSON), 0o600); err != nil {
+			return "", fmt.Errorf("session: write claude hooks settings: %w", err)
 		}
 	}
 	return destination, nil
