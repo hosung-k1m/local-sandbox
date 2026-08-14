@@ -304,11 +304,13 @@ func (r *recorder) writeLocked(rr resolvedRecord) error {
 	}
 	r.lastSeq = seq
 	r.recordCount++
-	switch rr.name {
-	case evidence.EventSensorLoss:
-		r.lossCount++
-	case evidence.EventSensorRestarted:
-		r.restartCount++
+	if rr.producer == evidence.ChannelGuestSupervisor && rr.class == evidence.ClassIntegrity {
+		switch rr.name {
+		case evidence.EventSensorLoss:
+			r.lossCount++
+		case evidence.EventSensorRestarted:
+			r.restartCount++
+		}
 	}
 	return nil
 }
@@ -357,15 +359,26 @@ func (r *recorder) sealLocked(reason string, openNext bool) error {
 	}
 	base := fmt.Sprintf("segment-%06d", sealedNum)
 	manPath := filepath.Join(r.segDir, base+".manifest.json")
-	if err := os.WriteFile(manPath, manBytes, 0o600); err != nil {
+	if err := writeSyncedFile(manPath, manBytes); err != nil {
 		return fmt.Errorf("recorder: write manifest: %w", err)
 	}
 	coseBytes, err := signManifest(r.key, manBytes)
 	if err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(r.segDir, base+".manifest.cose"), coseBytes, 0o600); err != nil {
+	if err := writeSyncedFile(filepath.Join(r.segDir, base+".manifest.cose"), coseBytes); err != nil {
 		return fmt.Errorf("recorder: write cose signature: %w", err)
+	}
+	dir, err := os.Open(r.segDir)
+	if err != nil {
+		return fmt.Errorf("recorder: open segment directory for fsync: %w", err)
+	}
+	if err := dir.Sync(); err != nil {
+		dir.Close()
+		return fmt.Errorf("recorder: fsync segment directory: %w", err)
+	}
+	if err := dir.Close(); err != nil {
+		return fmt.Errorf("recorder: close segment directory: %w", err)
 	}
 
 	r.manifestPaths = append(r.manifestPaths, manPath)
@@ -395,6 +408,22 @@ func (r *recorder) sealLocked(reason string, openNext bool) error {
 			attrSealReason:    reason,
 		},
 	})
+}
+
+func writeSyncedFile(path string, data []byte) error {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(data); err != nil {
+		f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // newUUIDv4 returns a random RFC 4122 version 4 UUID string sourced from crypto/rand.

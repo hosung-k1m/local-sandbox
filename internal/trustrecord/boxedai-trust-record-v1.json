@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://boxedai.dev/schema/trust-record-v1.json",
+  "type": "object",
+  "required": ["schema", "issued_at", "session", "runtime", "origin", "policy", "artifacts", "evidence", "activity", "assurance", "signing", "signature"],
+  "properties": {
+    "schema": {"const": "boxedai.trust-record/v1"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "session": {
+      "type": "object",
+      "required": ["id", "trace_id", "harness", "created_at"],
+      "properties": {
+        "id": {"type": "string", "pattern": "^bx-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$"},
+        "trace_id": {"type": "string", "pattern": "^[0-9a-f]{32}$"},
+        "harness": {"enum": ["claude", "codex", "exec"]},
+        "created_at": {"type": "string", "format": "date-time"}
+      },
+      "additionalProperties": false
+    },
+    "source": {
+      "type": "object",
+      "properties": {
+        "repository": {"type": "string", "minLength": 1},
+        "branch": {"type": "string", "minLength": 1},
+        "commit": {"type": "string", "minLength": 1}
+      },
+      "minProperties": 1,
+      "additionalProperties": false
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["platform", "isolation", "image"],
+      "properties": {
+        "platform": {"const": "software-only"},
+        "isolation": {"const": "lima-vm"},
+        "image": {
+          "type": "object",
+          "required": ["name", "digest"],
+          "properties": {
+            "name": {"type": "string", "minLength": 1},
+            "digest": {"$ref": "#/$defs/digest"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "origin": {
+      "type": "object",
+      "required": ["kind", "producer"],
+      "properties": {
+        "kind": {"const": "host-control-plane"},
+        "producer": {"const": "boxedai-recorder"}
+      },
+      "additionalProperties": false
+    },
+    "policy": {
+      "type": "object",
+      "required": ["profile", "digest"],
+      "properties": {
+        "profile": {"enum": ["develop", "review", "restricted"]},
+        "digest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "object",
+      "required": ["session_grant_digest", "policy_digest", "input_manifest_digest", "output_manifest_digest"],
+      "properties": {
+        "session_grant_digest": {"$ref": "#/$defs/digest"},
+        "policy_digest": {"$ref": "#/$defs/digest"},
+        "input_manifest_digest": {"$ref": "#/$defs/digest"},
+        "output_manifest_digest": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "evidence": {
+      "type": "object",
+      "required": ["schema", "segment_count", "record_count", "first_sequence", "last_sequence", "chain_tip", "sensor_loss_count", "sensor_restart_count", "segments"],
+      "properties": {
+        "schema": {"const": "boxedai.evidence/v1"},
+        "segment_count": {"$ref": "#/$defs/positiveInteger"},
+        "record_count": {"$ref": "#/$defs/positiveInteger"},
+        "first_sequence": {"$ref": "#/$defs/positiveInteger"},
+        "last_sequence": {"$ref": "#/$defs/positiveInteger"},
+        "chain_tip": {"$ref": "#/$defs/digest"},
+        "sensor_loss_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "sensor_restart_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "sensor_mechanisms": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "segments": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["number", "segment_digest", "manifest_digest", "first_sequence", "last_sequence", "record_count", "sealed_at"],
+            "properties": {
+              "number": {"$ref": "#/$defs/positiveInteger"},
+              "segment_digest": {"$ref": "#/$defs/digest"},
+              "manifest_digest": {"$ref": "#/$defs/digest"},
+              "first_sequence": {"$ref": "#/$defs/positiveInteger"},
+              "last_sequence": {"$ref": "#/$defs/positiveInteger"},
+              "record_count": {"$ref": "#/$defs/positiveInteger"},
+              "sealed_at": {"type": "string", "format": "date-time"}
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "activity": {
+      "type": "object",
+      "required": ["models", "model_request_count", "tools", "effect_dispatch_count", "network_denial_count", "tool_transcript"],
+      "properties": {
+        "models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["provider", "request_count"],
+            "properties": {
+              "provider": {"type": "string", "minLength": 1},
+              "model_id": {"type": "string", "minLength": 1},
+              "request_count": {"$ref": "#/$defs/nonNegativeInteger"},
+              "usage": {
+                "type": "object",
+                "minProperties": 1,
+                "properties": {
+                  "input_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+                  "output_tokens": {"$ref": "#/$defs/nonNegativeInteger"},
+                  "total_tokens": {"$ref": "#/$defs/nonNegativeInteger"}
+                },
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "model_request_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "tools": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "call_count"],
+            "properties": {
+              "name": {"type": "string", "minLength": 1},
+              "call_count": {"$ref": "#/$defs/positiveInteger"}
+            },
+            "additionalProperties": false
+          }
+        },
+        "effect_dispatch_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "network_denial_count": {"$ref": "#/$defs/nonNegativeInteger"},
+        "tool_transcript": {
+          "type": "object",
+          "required": ["schema", "canonicalization", "digest", "event_count", "call_count"],
+          "properties": {
+            "schema": {"const": "boxedai.tool-transcript/v1"},
+            "canonicalization": {"const": "RFC8785"},
+            "digest": {"$ref": "#/$defs/digest"},
+            "event_count": {"$ref": "#/$defs/nonNegativeInteger"},
+            "call_count": {"$ref": "#/$defs/nonNegativeInteger"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "assurance": {
+      "type": "object",
+      "required": ["level", "verdict_ceiling", "hardware_attested", "externally_witnessed"],
+      "properties": {
+        "level": {"const": 0},
+        "verdict_ceiling": {"const": "LOCAL_ONLY"},
+        "hardware_attested": {"const": false},
+        "externally_witnessed": {"const": false}
+      },
+      "additionalProperties": false
+    },
+    "signing": {
+      "type": "object",
+      "required": ["algorithm", "canonicalization", "recorder_key_fingerprint"],
+      "properties": {
+        "algorithm": {"const": "Ed25519"},
+        "canonicalization": {"const": "RFC8785"},
+        "recorder_key_fingerprint": {"$ref": "#/$defs/digest"}
+      },
+      "additionalProperties": false
+    },
+    "signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$"}
+  },
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^sha256:[0-9a-f]{64}$"},
+    "nonNegativeInteger": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "positiveInteger": {"type": "integer", "minimum": 1, "maximum": 9007199254740991}
+  },
+  "additionalProperties": false
+}

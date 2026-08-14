@@ -18,6 +18,7 @@ import (
 	"boxedai/internal/policy"
 	"boxedai/internal/recorder"
 	"boxedai/internal/snapshot"
+	"boxedai/internal/trustrecord"
 	"boxedai/internal/verify"
 	"boxedai/internal/vm"
 )
@@ -36,7 +37,7 @@ const (
 
 const (
 	// grantSchema is the session.json schema id (DESIGN.md session grant).
-	grantSchema = "boxedai.session/v1"
+	grantSchema = "boxedai.session/v2"
 	// assuranceMode is the v0.1 ceiling (DESIGN.md "Security claim").
 	assuranceMode = "local"
 	// brokerHost is the guest-reachable broker hostname lima provides.
@@ -290,7 +291,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		// those final events and silently truncate the evidence tail.
 		if vmc != nil {
 			stopCtx, cancelStop := context.WithTimeout(context.Background(), vmCleanupTimeout)
-			_ = vmc.Stop(stopCtx)
+			if e := vmc.Stop(stopCtx); e != nil {
+				failTeardown(fmt.Errorf("session: stop vm: %w", e))
+			}
 			cancelStop()
 		}
 		// Now revoke tokens and stop the broker: the guest has drained and the
@@ -303,7 +306,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 			if e := emit(credentialEvent(evidence.EventCredentialRevoked, "supervisor")); e != nil {
 				failTeardown(e)
 			}
-			_ = br.Stop()
+			if e := br.Stop(); e != nil {
+				failTeardown(fmt.Errorf("session: stop broker: %w", e))
+			}
 		}
 
 		// Closing artifacts + lifecycle events only if the workload started.
@@ -325,21 +330,55 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		if _, e := rec.Close(); e != nil {
 			failTeardown(e)
 		}
-		if teardownErr == nil {
-			progress("crypto", "evidence sealed: SHA-256 segment/chain digests and COSE Sign1 signatures")
+		trustRecordWritten := false
+		if runErr == nil && sessionStarted && teardownErr == nil {
+			record, e := trustrecord.Build(sessionDir, time.Now(), key.Pub)
+			if e == nil {
+				e = trustrecord.Sign(&record, key.Priv)
+			}
+			if e == nil {
+				e = trustrecord.Write(sessionDir, record)
+			}
+			if e != nil {
+				failTeardown(e)
+			} else {
+				trustRecordWritten = true
+			}
 		}
-
-		if vmc != nil && !opts.KeepVM {
-			deleteCtx, cancelDelete := context.WithTimeout(context.Background(), vmCleanupTimeout)
-			_ = vmc.Delete(deleteCtx)
-			cancelDelete()
+		if teardownErr == nil {
+			detail := "evidence sealed: SHA-256 segment/chain digests and COSE Sign1 manifests"
+			if trustRecordWritten {
+				detail += "; RFC 8785 Ed25519 trust record written"
+			}
+			progress("crypto", detail)
 		}
 
 		finalState := StateIncomplete
 		if runErr == nil && sessionStarted && teardownErr == nil {
 			finalState = StateSealed
 		}
-		_ = writeState(sessionDir, finalState)
+		if e := writeState(sessionDir, finalState); e != nil {
+			failTeardown(fmt.Errorf("session: write final state: %w", e))
+			finalState = StateIncomplete
+			if stateErr := writeState(sessionDir, finalState); stateErr != nil {
+				failTeardown(fmt.Errorf("session: write incomplete state: %w", stateErr))
+			}
+		}
+		result.State = finalState
+
+		if vmc != nil && !opts.KeepVM {
+			deleteCtx, cancelDelete := context.WithTimeout(context.Background(), vmCleanupTimeout)
+			if e := vmc.Delete(deleteCtx); e != nil {
+				failTeardown(fmt.Errorf("session: delete vm: %w", e))
+				if finalState != StateIncomplete {
+					finalState = StateIncomplete
+					if stateErr := writeState(sessionDir, finalState); stateErr != nil {
+						failTeardown(fmt.Errorf("session: write incomplete state after VM delete failure: %w", stateErr))
+					}
+				}
+			}
+			cancelDelete()
+		}
 		result.State = finalState
 
 		// Best-effort verdict hint from the offline verifier over the sealed evidence.
@@ -412,6 +451,11 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		VMImageDigest:       img.DiskDigest,
 		RecorderPub:         key.PubPEM,
 		AssuranceMode:       assuranceMode,
+		TrustRecord: trustRecordGrant{
+			Schema:   trustrecord.Profile,
+			Path:     trustrecord.FileName,
+			Required: true,
+		},
 	}
 	grantBytes, err := json.MarshalIndent(grant, "", "  ")
 	if err != nil {
@@ -540,7 +584,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		return result, err
 	}
 	sessionStarted = true
-	_ = writeState(sessionDir, StateRunning)
+	if err := writeState(sessionDir, StateRunning); err != nil {
+		return result, fmt.Errorf("session: write running state: %w", err)
+	}
 
 	exit, err := vmc.LaunchHarness(ctx)
 	if err != nil {
@@ -562,22 +608,29 @@ func claudeTelemetryDir(sessionDir, harness string) string {
 // sessionGrant is the session.json grant written before VM boot (DESIGN.md
 // session grant schema). Its digest is recorded on session.granted.
 type sessionGrant struct {
-	Schema              string `json:"schema"`
-	SessionID           string `json:"session_id"`
-	TraceID             string `json:"trace_id"`
-	Harness             string `json:"harness"`
-	Profile             string `json:"profile"`
-	RepoPath            string `json:"repo_path"`
-	Repository          string `json:"repository,omitempty"`
-	Branch              string `json:"branch,omitempty"`
-	Commit              string `json:"commit,omitempty"`
-	CreatedAt           string `json:"created_at"`
-	PolicyDigest        string `json:"policy_digest"`
-	InputManifestDigest string `json:"input_manifest_digest"`
-	VMImage             string `json:"vm_image"`
-	VMImageDigest       string `json:"vm_image_digest"`
-	RecorderPub         string `json:"recorder_pub"`
-	AssuranceMode       string `json:"assurance_mode"`
+	Schema              string           `json:"schema"`
+	SessionID           string           `json:"session_id"`
+	TraceID             string           `json:"trace_id"`
+	Harness             string           `json:"harness"`
+	Profile             string           `json:"profile"`
+	RepoPath            string           `json:"repo_path"`
+	Repository          string           `json:"repository,omitempty"`
+	Branch              string           `json:"branch,omitempty"`
+	Commit              string           `json:"commit,omitempty"`
+	CreatedAt           string           `json:"created_at"`
+	PolicyDigest        string           `json:"policy_digest"`
+	InputManifestDigest string           `json:"input_manifest_digest"`
+	VMImage             string           `json:"vm_image"`
+	VMImageDigest       string           `json:"vm_image_digest"`
+	RecorderPub         string           `json:"recorder_pub"`
+	AssuranceMode       string           `json:"assurance_mode"`
+	TrustRecord         trustRecordGrant `json:"trust_record"`
+}
+
+type trustRecordGrant struct {
+	Schema   string `json:"schema"`
+	Path     string `json:"path"`
+	Required bool   `json:"required"`
 }
 
 type repositoryProvenance struct {

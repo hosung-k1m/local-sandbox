@@ -61,10 +61,15 @@ type Facets struct {
 	SignatureAlgorithm   string   `json:"signature_algorithm"`
 	RecorderFingerprint  string   `json:"recorder_key_fingerprint"`
 	SegmentCount         int      `json:"segment_count"`
+	TrustRecordStatus    string   `json:"trust_record_status"`
+	TrustRecordProfile   string   `json:"trust_record_profile,omitempty"`
+	TrustRecordAssurance string   `json:"trust_record_assurance,omitempty"`
+	TrustRecordSignature bool     `json:"trust_record_signature_valid"`
+	TrustRecordDerived   bool     `json:"trust_record_cross_derived"`
 }
 
 // Check is one named verification step and its outcome (DESIGN "Verifier"
-// checks 1..9). Detail carries a short human-readable explanation.
+// checks 1..11). Detail carries a short human-readable explanation.
 type Check struct {
 	Name   string `json:"name"`
 	Passed bool   `json:"passed"`
@@ -193,17 +198,20 @@ func Verify(sessionDir string) (Report, error) {
 	// (5) session lifecycle events present exactly once and ordered.
 	lifecycleOK, closeStatus, lifecycleDetail := checkLifecycleEvents(records, len(segs))
 
-	// (6) policy digest consistent across grant, events, manifests.
+	// (7) policy digest consistent across grant, events, manifests.
 	policyOK, policyDetail := checkPolicyDigest(g.PolicyDigest, records, manifests)
 
-	// (7) sensor invariants.
+	// (8) sensor invariants.
 	sensorOK, lossCount, sensorDetail := checkSensor(records)
 
-	// (8) flow invariants (effect/tool gating).
+	// (9) flow invariants (effect/tool gating).
 	flowOK, ungated, flowDetail := checkFlow(records)
 
-	// (9) output manifest digest matches the recorded workspace.manifested event.
+	// (10) output manifest digest matches the recorded workspace.manifested event.
 	outputOK, outputDetail := checkOutputManifest(sessionDir, records)
+	grantOK, grantDetail := checkSessionGrantBinding(sessionDir, g, records)
+	trustResult := checkTrustRecord(sessionDir, g, publicKey, segs, manifests, records)
+	trustOK := !trustResult.tamper && !trustResult.incomplete
 
 	rep.Checks = []Check{
 		{stepSignatures, sigOK, join(sigDetail, fmt.Sprintf("%d COSE Sign1 manifest signature(s) verified with EdDSA (Ed25519); key %s", len(manifests), rep.Facets.RecorderFingerprint))},
@@ -211,10 +219,12 @@ func Verify(sessionDir string) (Report, error) {
 		{stepChain, chainOK, chainDetail},
 		{stepSequence, seqOK, seqDetail},
 		{stepLifecycle, lifecycleOK, lifecycleDetail},
+		{stepGrantRecord, grantOK, grantDetail},
 		{stepPolicy, policyOK, policyDetail},
 		{stepSensor, sensorOK, sensorDetail},
 		{stepFlow, flowOK, flowDetail},
 		{stepOutput, outputOK, outputDetail},
+		{stepTrustRecord, trustOK, trustResult.detail},
 	}
 
 	rep.Facets.SignatureValid = sigOK
@@ -223,6 +233,11 @@ func Verify(sessionDir string) (Report, error) {
 	rep.Facets.CloseStatus = closeStatus
 	rep.Facets.SensorLossCount = lossCount
 	rep.Facets.UngatedActivityCount = ungated
+	rep.Facets.TrustRecordStatus = trustResult.status
+	rep.Facets.TrustRecordProfile = trustResult.profile
+	rep.Facets.TrustRecordAssurance = trustResult.assurance
+	rep.Facets.TrustRecordSignature = trustResult.signatureValid
+	rep.Facets.TrustRecordDerived = trustResult.crossDerived
 	for _, c := range rep.Checks {
 		status := "ok"
 		if !c.Passed {
@@ -236,11 +251,11 @@ func Verify(sessionDir string) (Report, error) {
 
 	// Verdict selection (DESIGN "Verifier"), most-severe wins.
 	switch {
-	case !sigOK || !digestOK || !chainOK || !seqOK || !policyOK || !outputOK:
+	case !sigOK || !digestOK || !chainOK || !seqOK || !grantOK || !policyOK || !outputOK || trustResult.tamper:
 		rep.Verdict = VerdictTamperSuspected
 	case !flowOK:
 		rep.Verdict = VerdictBypassDetected
-	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail:
+	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete:
 		rep.Verdict = VerdictIncomplete
 	default:
 		rep.Verdict = VerdictLocalOnly
@@ -325,6 +340,13 @@ func (r Report) String() string {
 	fmt.Fprintf(&b, "  close status:        %s\n", r.Facets.CloseStatus)
 	fmt.Fprintf(&b, "  sensor loss count:   %d\n", r.Facets.SensorLossCount)
 	fmt.Fprintf(&b, "  ungated activity:    %d\n", r.Facets.UngatedActivityCount)
+	fmt.Fprintf(&b, "  trust record:        %s\n", r.Facets.TrustRecordStatus)
+	if r.Facets.TrustRecordProfile != "" {
+		fmt.Fprintf(&b, "  trust profile:       %s\n", r.Facets.TrustRecordProfile)
+		fmt.Fprintf(&b, "  trust signature:     %v\n", r.Facets.TrustRecordSignature)
+		fmt.Fprintf(&b, "  claims rederived:    %v\n", r.Facets.TrustRecordDerived)
+		fmt.Fprintf(&b, "  assurance:           %s\n", r.Facets.TrustRecordAssurance)
+	}
 	b.WriteString("\nChecks:\n")
 	for _, c := range r.Checks {
 		status := "PASS"

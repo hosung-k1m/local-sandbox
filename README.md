@@ -135,9 +135,21 @@ dist/boxedai view <session>        # evidence timeline (each event shows its cla
 dist/boxedai view <session> --web  # local web viewer
 dist/boxedai diff <session>        # workspace changes (input -> output)
 dist/boxedai verify <session>      # offline verifier: verdict + per-check facets
+dist/boxedai verify-record <trust-record.json> --public-key <recorder-public-key.pem>
+                                    # portable trust-record signature and claims
+dist/boxedai verify-record <trust-record.json> --public-key <recorder-public-key.pem> --json
 dist/boxedai apply <session>       # apply the workspace diff back to the repo (confirms first)
 dist/boxedai stop <session>        # kill switch: freeze, seal, destroy
 ```
+
+Claude sessions record every harness tool invocation — each Bash command, file read,
+edit, and subagent tool call — as `tool.requested`/`tool.completed` timeline events.
+BoxedAi stages Claude Code hooks (`lefthook` for PreToolUse, `righthook` for
+PostToolUse, both served by the guest agent) into the session harness home; the
+events are honestly labeled `harness_observed` since they are reported from inside
+the sandbox. `model.completed` events carry the provider-reported token usage
+(`llm.usage.*`), parsed from streaming and non-streaming responses alike, and the
+session trust record aggregates per-model totals.
 
 Every displayed event carries an evidence class distinguishing what was self-reported by
 the harness from what was independently observed by the guest kernel witness, mediated by
@@ -158,3 +170,12 @@ historical sessions; those rows are labeled as unverified summaries and expose t
 manifest-declared segment digest as `declared_segment_digest`. Selecting a session
 runs the full projection and verifier, including recomputed hashes, chain checks,
 verdict, and recorder fingerprint.
+
+`verify-record` verifies a portable `boxedai.trust-record/v1` envelope without a session
+directory or network access. It requires the recorder's external PKIX PEM Ed25519 public
+key (normally `~/.boxedai/keys/recorder.pub`), checks the profile, schema, key binding,
+RFC 8785 signature, and Level 0 software-only assurance, then reports evidence counts,
+chain tip, model/tool activity, and the tool-transcript digest. `--json` emits the same
+report as one machine-readable object. The command validates the envelope only; use
+`boxedai verify <session>` when the raw session evidence must also be independently
+re-derived and checked against the trust record.

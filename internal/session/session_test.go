@@ -1,8 +1,12 @@
 package session
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,8 +14,10 @@ import (
 	"time"
 
 	"boxedai/internal/broker"
+	"boxedai/internal/evidence"
 	"boxedai/internal/image"
 	"boxedai/internal/policy"
+	"boxedai/internal/trustrecord"
 	"boxedai/internal/verify"
 	"boxedai/internal/vm"
 )
@@ -25,7 +31,7 @@ var fakeManifest = image.Manifest{
 	Tag:        "boxedai-base-test",
 	Arch:       "test",
 	DiskPath:   "/fake/boxedai-image/disk.img",
-	DiskDigest: "sha256:test-digest",
+	DiskDigest: "sha256:1111111111111111111111111111111111111111111111111111111111111111",
 }
 
 // withResolveImage swaps resolveImage for fn and restores the real
@@ -49,10 +55,13 @@ type fakeVM struct {
 	cfg                  vm.Config
 	launchCancel         context.CancelFunc
 	launchErr            error
+	stopErr              error
+	deleteErr            error
 	stopContextErr       error
 	deleteContextErr     error
 	stopContextBounded   bool
 	deleteContextBounded bool
+	emitLifecycle        bool
 	started              bool
 	healthy              bool
 	launched             bool
@@ -62,10 +71,30 @@ type fakeVM struct {
 
 func (f *fakeVM) Start(context.Context) error { f.started = true; return nil }
 
-func (f *fakeVM) WaitHealthy(context.Context, time.Duration) error { f.healthy = true; return nil }
+func (f *fakeVM) WaitHealthy(ctx context.Context, _ time.Duration) error {
+	f.healthy = true
+	if f.emitLifecycle {
+		return f.emitEvents(ctx, []evidence.Event{{
+			Name:    evidence.EventSensorStarted,
+			Time:    time.Now(),
+			Class:   evidence.ClassIntegrity,
+			Outcome: evidence.OutcomeSuccess,
+			Body:    "sensor started: tetragon",
+			Attrs: map[string]any{
+				"sensor.mechanism": "tetragon",
+			},
+		}})
+	}
+	return nil
+}
 
-func (f *fakeVM) LaunchHarness(context.Context) (int, error) {
+func (f *fakeVM) LaunchHarness(ctx context.Context) (int, error) {
 	f.launched = true
+	if f.emitLifecycle {
+		if err := f.emitProcessLifecycle(ctx); err != nil {
+			return -1, err
+		}
+	}
 	// Simulate the harness writing a new file into the mounted workspace.
 	_ = os.WriteFile(filepath.Join(f.cfg.WorkspacePath, "harness-output.txt"), []byte("written by workload\n"), 0o644)
 	if f.launchCancel != nil {
@@ -74,18 +103,73 @@ func (f *fakeVM) LaunchHarness(context.Context) (int, error) {
 	return 0, f.launchErr
 }
 
+func (f *fakeVM) emitProcessLifecycle(ctx context.Context) error {
+	events := []evidence.Event{
+		{
+			Name:    evidence.EventProcessExecuted,
+			Time:    time.Now(),
+			Class:   evidence.ClassKernelObserved,
+			Outcome: evidence.OutcomeSuccess,
+			Body:    "exec /bin/true",
+			Attrs: map[string]any{
+				evidence.AttrProcessPID:    int64(100),
+				evidence.AttrProcessPPID:   int64(1),
+				evidence.AttrProcessExecID: "test-exec",
+				"observer":                 "tetragon",
+			},
+		},
+		{
+			Name:    evidence.EventProcessExited,
+			Time:    time.Now(),
+			Class:   evidence.ClassKernelObserved,
+			Outcome: evidence.OutcomeSuccess,
+			Body:    "exit pid=100 code=0",
+			Attrs: map[string]any{
+				evidence.AttrProcessPID:    int64(100),
+				evidence.AttrProcessExecID: "test-exec",
+				"observer":                 "tetragon",
+			},
+		},
+	}
+	return f.emitEvents(ctx, events)
+}
+
+func (f *fakeVM) emitEvents(ctx context.Context, events []evidence.Event) error {
+	body, err := json.Marshal(struct {
+		Events []evidence.Event `json:"events"`
+	}{Events: events})
+	if err != nil {
+		return fmt.Errorf("marshal fake lifecycle: %w", err)
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fmt.Sprintf("http://127.0.0.1:%d/v1/events", f.cfg.BrokerPort), bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("build fake lifecycle request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+f.cfg.SupervisorToken)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("submit fake lifecycle: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode/100 != 2 {
+		return fmt.Errorf("submit fake lifecycle: status %d", resp.StatusCode)
+	}
+	return nil
+}
+
 func (f *fakeVM) Stop(ctx context.Context) error {
 	f.stopped = true
 	f.stopContextErr = ctx.Err()
 	_, f.stopContextBounded = ctx.Deadline()
-	return nil
+	return f.stopErr
 }
 
 func (f *fakeVM) Delete(ctx context.Context) error {
 	f.deleted = true
 	f.deleteContextErr = ctx.Err()
 	_, f.deleteContextBounded = ctx.Deadline()
-	return nil
+	return f.deleteErr
 }
 
 // TestRunOrchestration exercises the full session wiring with an injected fake VM:
@@ -111,7 +195,7 @@ func TestRunOrchestration(t *testing.T) {
 
 	var fake *fakeVM
 	r := &Runner{newVM: func(cfg vm.Config) vmController {
-		fake = &fakeVM{cfg: cfg}
+		fake = &fakeVM{cfg: cfg, emitLifecycle: true}
 		return fake
 	}}
 
@@ -157,7 +241,7 @@ func TestRunOrchestration(t *testing.T) {
 	dir := res.SessionDir
 	for _, rel := range []string{
 		grantFileName, policyFileName, inputManifestFileName, outputManifestFileName,
-		"workspace.diff",
+		trustrecord.FileName, "workspace.diff",
 		filepath.Join(workspaceDirName, "harness-output.txt"),
 	} {
 		if _, err := os.Stat(filepath.Join(dir, rel)); err != nil {
@@ -193,6 +277,9 @@ func TestRunOrchestration(t *testing.T) {
 	if rep.Verdict != verify.VerdictLocalOnly {
 		t.Errorf("verdict = %s, want %s (clean local session)", rep.Verdict, verify.VerdictLocalOnly)
 	}
+	if rep.Facets.TrustRecordStatus != "verified" || !rep.Facets.TrustRecordSignature || !rep.Facets.TrustRecordDerived {
+		t.Errorf("trust record facets = %+v, want signed and cross-derived", rep.Facets)
+	}
 	if res.Verdict != string(verify.VerdictLocalOnly) {
 		t.Errorf("Result.Verdict hint = %q, want %q", res.Verdict, verify.VerdictLocalOnly)
 	}
@@ -207,6 +294,13 @@ func TestRunOrchestration(t *testing.T) {
 	}
 	if sessions[0].SessionID != res.SessionID || sessions[0].State != StateSealed || sessions[0].Harness != "exec" {
 		t.Errorf("SessionInfo = %+v, want id=%s state=sealed harness=exec", sessions[0], res.SessionID)
+	}
+	grant, err := readGrant(res.SessionID)
+	if err != nil {
+		t.Fatalf("readGrant: %v", err)
+	}
+	if grant.Schema != grantSchema || grant.TrustRecord.Schema != trustrecord.Profile || !grant.TrustRecord.Required {
+		t.Errorf("grant trust-record marker = %+v (schema %q), want required %s", grant.TrustRecord, grant.Schema, trustrecord.Profile)
 	}
 }
 
@@ -252,6 +346,65 @@ func TestRunCancellationStillCleansUpVM(t *testing.T) {
 	}
 	if !fake.stopContextBounded || !fake.deleteContextBounded {
 		t.Errorf("cleanup contexts bounded = Stop:%t Delete:%t, want both true", fake.stopContextBounded, fake.deleteContextBounded)
+	}
+}
+
+func TestRunVMStopFailureLeavesSessionIncomplete(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BOXEDAI_HOME", home)
+	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	withResolveImage(t, func(arch string) (image.Manifest, error) { return fakeManifest, nil })
+
+	repo := t.TempDir()
+	writeFile(t, filepath.Join(repo, "README.md"), "# fixture repo\n")
+	wantErr := errors.New("guest drain failed")
+	var fake *fakeVM
+	r := &Runner{newVM: func(cfg vm.Config) vmController {
+		fake = &fakeVM{cfg: cfg, stopErr: wantErr}
+		return fake
+	}}
+
+	res, err := r.Run(context.Background(), RunOptions{Harness: "exec", RepoPath: repo, Profile: policy.ProfileDevelop, Cmd: "true"})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run error = %v, want VM stop failure", err)
+	}
+	if res.State != StateIncomplete {
+		t.Errorf("State = %q, want %q", res.State, StateIncomplete)
+	}
+	if fake == nil || !fake.stopped || !fake.deleted {
+		t.Fatalf("fake VM lifecycle = %+v, want Stop and Delete", fake)
+	}
+	if _, statErr := os.Stat(filepath.Join(res.SessionDir, trustrecord.FileName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Errorf("trust record stat error = %v, want absent after failed drain", statErr)
+	}
+}
+
+func TestRunVMDeleteFailureRevertsSealedState(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BOXEDAI_HOME", home)
+	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+	t.Setenv("OPENAI_API_KEY", "test-openai-key")
+	withResolveImage(t, func(arch string) (image.Manifest, error) { return fakeManifest, nil })
+
+	repo := t.TempDir()
+	writeFile(t, filepath.Join(repo, "README.md"), "# fixture repo\n")
+	wantErr := errors.New("VM deletion failed")
+	r := &Runner{newVM: func(cfg vm.Config) vmController {
+		return &fakeVM{cfg: cfg, deleteErr: wantErr}
+	}}
+
+	res, err := r.Run(context.Background(), RunOptions{Harness: "exec", RepoPath: repo, Profile: policy.ProfileDevelop, Cmd: "true"})
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("Run error = %v, want VM delete failure", err)
+	}
+	if res.State != StateIncomplete {
+		t.Errorf("State = %q, want %q", res.State, StateIncomplete)
+	}
+	if state, stateErr := LoadState(res.SessionID); stateErr != nil {
+		t.Fatalf("LoadState: %v", stateErr)
+	} else if state != StateIncomplete {
+		t.Errorf("persisted state = %q, want %q", state, StateIncomplete)
 	}
 }
 

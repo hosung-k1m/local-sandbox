@@ -93,6 +93,8 @@ const (
 	EventModelRequested         = "model.requested"
 	EventModelCompleted         = "model.completed"
 	EventToolRequested          = "tool.requested"
+	EventToolCompleted          = "tool.completed"
+	EventProcessCreated         = "process.created"
 	EventProcessExecuted        = "process.executed"
 	EventProcessExited          = "process.exited"
 	EventFileChanged            = "file.changed"
@@ -122,7 +124,8 @@ var Catalog = map[string]bool{
 	EventSessionGranted: true, EventSessionStarted: true, EventSessionStopped: true,
 	EventSessionSealed: true, EventPolicyLoaded: true, EventAuthorizationDecided: true,
 	EventModelRequested: true, EventModelCompleted: true, EventToolRequested: true,
-	EventProcessExecuted: true, EventProcessExited: true, EventFileChanged: true,
+	EventToolCompleted: true, EventProcessCreated: true, EventProcessExecuted: true, EventProcessExited: true,
+	EventFileChanged: true,
 	EventFileDeleted: true, EventWorkspaceManifested: true, EventNetworkConnected: true,
 	EventNetworkDenied: true, EventInternalToolDispatched: true,
 	EventInternalToolCompleted: true, EventInternalToolFailed: true,

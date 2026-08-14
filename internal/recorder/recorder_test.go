@@ -75,6 +75,11 @@ func TestRecorderRoundTrip(t *testing.T) {
 		Name: evidence.EventModelRequested, Class: evidence.ClassKernelObserved, Outcome: evidence.OutcomeSuccess,
 		Attrs: map[string]any{evidence.AttrContentDigest: "sha256:abc"},
 	})
+	// A workload may use a sensor event name, but it cannot contribute to the
+	// authoritative per-segment sensor-loss counter.
+	mustEmit(evidence.ChannelWorkload, evidence.Event{
+		Name: evidence.EventSensorLoss, Class: evidence.ClassModelSelfReported, Outcome: evidence.OutcomeFailure,
+	})
 
 	if err := rec.SealSegment("test-rotate"); err != nil {
 		t.Fatalf("SealSegment: %v", err)
@@ -113,8 +118,8 @@ func TestRecorderRoundTrip(t *testing.T) {
 	}
 
 	// Sequence continuity: exactly 1..N, no gaps, no duplicates, in file order.
-	if len(records) != 7 {
-		t.Fatalf("read %d records, want 7", len(records))
+	if len(records) != 8 {
+		t.Fatalf("read %d records, want 8", len(records))
 	}
 	for i, r := range records {
 		if want := int64(i + 1); r.sequence != want {

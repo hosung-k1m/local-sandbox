@@ -40,13 +40,14 @@ supervisor (root in VM), host broker, host recorder.
 
 ```
 cmd/boxedai            CLI entrypoint (thin main)
-internal/cli           cobra commands: setup, doctor, build-image, run, sessions, view, diff, verify, apply, stop
+internal/cli           cobra commands: setup, doctor, build-image, run, sessions, view, diff, verify, verify-record, apply, stop
 internal/setup         host preflight, corporate config, idempotent image setup
 internal/session       session lifecycle orchestration, IDs, session dir, state file
 internal/image         golden VM image build/resolve, manifest, digest verification
 internal/policy        profiles (review/develop/restricted), capability model   [SCAFFOLDED]
 internal/evidence      event model, schema constants, Emitter interface          [SCAFFOLDED]
 internal/recorder      sequencing, OTLP WAL segments, manifests, COSE signing, keys
+internal/trustrecord   strict schema, RFC 8785 envelope signing, sealed-evidence derivation
 internal/verify        offline verifier, verdicts
 internal/broker        host HTTP: model proxy, internal tools, external effects,
                        approvals, guest event ingest
@@ -58,10 +59,12 @@ guest/provision        provisioning shell scripts embedded into lima.yaml
 ```
 
 Dependency direction (no cycles):
-`cli → setup → {session, image}`; `cli → session → {vm, image, snapshot, broker, recorder, view, verify}`; `cli → image`
+`cli → setup → {session, image}`; `cli → {session, trustrecord}`;
+`session → {vm, image, snapshot, broker, recorder, trustrecord, view, verify}`; `cli → image`
 (`build-image` calls it directly); `image → vm` (drives `vm.BakeConfig`/`vm.BakeVM` to
 provision the bake boot); `broker → {evidence, policy}`; `vm → {evidence, policy}`;
-`recorder → evidence`; `verify → evidence` (verify reads raw files; it must NOT import
+`recorder → evidence`; `trustrecord → evidence`; `verify → {evidence, trustrecord}`
+(verify reads raw files; it must NOT import
 recorder internals — independent implementation of digest/signature checking is the
 point); `view → evidence`. `evidence` and `policy` import nothing else in the repo.
 
@@ -78,9 +81,11 @@ State root `~/.boxedai/` (override: env `BOXEDAI_HOME`):
   images/<arch>/manifest.json  tag, build timestamp, disk sha256 digest (see below)
   sessions/<session-id>/
     session.json               session grant (see below)
+    trust-record.json          signed session trust record (new v2 grants; see below)
     policy.json                resolved policy manifest (canonical JSON)
     workspace/                 APFS clone of the repo, mounted rw into the VM
     harness-home/              guest-mounted fresh Claude/Codex home and selected global instructions
+      settings.json            BoxedAi-authored Claude hook wiring (lefthook/righthook; never host-copied)
       debug/claude-code.log    native verbose debug log
       raw-api-bodies/          untruncated Messages API request/response bodies
     claude-telemetry/          host-only OTLP HTTP/JSON exports (Claude sessions only)
@@ -125,7 +130,7 @@ reproducible-build guarantee that rebuilding produces identical bytes.
 
 ```json
 {
-  "schema": "boxedai.session/v1",
+  "schema": "boxedai.session/v2",
   "session_id": "bx-...",
   "trace_id": "hex32",
   "harness": "claude|codex|exec",
@@ -137,7 +142,12 @@ reproducible-build guarantee that rebuilding produces identical bytes.
   "vm_image": "boxedai-base-arm64",
   "vm_image_digest": "sha256:...",
   "recorder_pub": "PEM",
-  "assurance_mode": "local"
+  "assurance_mode": "local",
+  "trust_record": {
+    "schema": "boxedai.trust-record/v1",
+    "path": "trust-record.json",
+    "required": true
+  }
 }
 ```
 
@@ -187,14 +197,23 @@ the attempt.
 
 Event catalog (v0.1 set): `session.granted session.started session.stopped
 session.sealed policy.loaded authorization.decided model.requested model.completed
-tool.requested process.executed process.exited file.changed file.deleted
+tool.requested tool.completed process.created process.executed process.exited file.changed file.deleted
 workspace.manifested network.connected network.denied internal_tool.dispatched
 internal_tool.completed internal_tool.failed effect.requested effect.approved
 effect.denied effect.dispatched effect.completed effect.failed credential.issued
 credential.revoked sensor.started sensor.loss sensor.restarted segment.sealed`.
 
 Signed evidence content capture defaults to `redacted` metadata + sha256 digests; the
-broker's model evidence stores digest + token counts + model id only. Claude sessions
+broker's model evidence stores digest + token counts + model id only. Token usage is
+parsed from both plain-JSON and SSE-streaming response bodies (Anthropic
+`message_start`/`message_delta` usage, OpenAI chat-completions and Responses API
+usage) and recorded on `model.completed` as `llm.usage.input_tokens` /
+`llm.usage.output_tokens` / `llm.usage.total_tokens` — only the fields the provider
+actually reported, never derived. The model proxy strips the workload's
+Accept-Encoding so upstream compression is transport-negotiated gzip, transparently
+decoded before evidence capture: the digest, the parsed usage, and the bytes
+forwarded to the workload all cover the identical plain payload (a non-compliant
+upstream that compresses anyway is gunzipped for parsing only). Claude sessions
 separately retain explicitly enabled, unsigned native and OTLP diagnostics, including
 full prompt/response bodies. Command argv is stored in evidence (workspace commands
 are not secrets by policy), URLs stored, headers never.
@@ -223,28 +242,148 @@ Behavior:
    "" for first), segment_digest, policy_digest, sensor_loss_count,
    sensor_restart_count, created_at, sealed_at}` — canonical JSON (sorted keys, no
    extra whitespace); digest = sha256 over exact segment file bytes.
-6. Sign manifest bytes with COSE Sign1 (Ed25519, `veraison/go-cose`), write `.cose`.
+6. Sign manifest bytes with COSE Sign1 (Ed25519, `veraison/go-cose`), write `.cose`,
+   then fsync both sidecars and the segment directory before reporting the seal.
 7. Key management: `LoadOrGenerateKey(dir)` — Ed25519 keypair under `~/.boxedai/keys/`.
 
 ## Verifier (internal/verify)
 
 Input: session dir (offline; no network). Checks, in order: (1) COSE signature of every
 manifest against the trust root (recorder.pub supplied or from session.json);
-(2) segment digest matches file bytes; (3) prev-digest chain; (4) sequence continuity
-1..N with no gaps or duplicates across segments; (5) session.granted, session.started,
-session.stopped, session.sealed all present exactly once and correctly ordered;
-(6) policy digest consistent across grant, events, manifests; (7) sensor invariants:
-sensor.started before workload launch, any sensor.loss/restart flagged; (8) flow
-invariants: every `effect.dispatched` preceded by `effect.approved` with matching
-action digest; every `internal_tool.dispatched` preceded by `authorization.decided`
-allow; (9) output-manifest digest matches `workspace.manifested` event.
+(2) segment digest matches file bytes; (3) prev-digest chain; (4) physical sequence
+continuity 1..N with no gaps, duplicates, or reordering across segments;
+(5) session.granted, session.started, session.stopped, session.sealed all present
+exactly once and correctly ordered; (6) exact-byte session.json digest matches the
+controller's session.granted event and the grant schema is exactly v1 or v2;
+(7) policy digest consistent across grant, events, manifests; (8) sensor invariants:
+sensor.started before workload launch; a started session has trusted Tetragon
+process.executed and process.exited coverage; any sensor.loss/restart is flagged; (9) flow
+invariants: every `effect.dispatched` is preceded by a successful `effect.approved`
+with matching action digest, and every `internal_tool.dispatched` is preceded by a
+successful `authorization.decided` for the same action; (10) output-manifest digest
+matches `workspace.manifested`; (11) the session trust record passes its profile,
+schema, key, signature, semantic, and independent cross-derivation gates.
 
 Verdicts: `LOCAL_ONLY` (all checks pass; ceiling in v0.1), `INCOMPLETE` (missing
 close/seal, sensor loss, or unresolved tail), `BYPASS_DETECTED` (flow invariant
 violated), `TAMPER_SUSPECTED` (signature/digest/sequence inconsistency).
 `VERIFIED` is unreachable in v0.1 and the verifier must say why when asked.
 Also report facets: signature validity, chain validity, sequence continuity, close
-status, sensor-loss count, ungated-activity count.
+status, sensor-loss count, ungated-activity count, trust-record status/profile,
+trust-record signature validity, cross-derivation status, and assurance level.
+
+## Session trust record (boxedai.trust-record/v1)
+
+New sessions write `trust-record.json` after the final OTLP segment is sealed. The
+record is a portable, host-produced summary and binding over the existing session
+files and signed segment set. It does not replace the raw OTLP segments, their
+manifests, or their COSE Sign1 signatures; those remain authoritative.
+
+The envelope is one strict JSON object with `schema: "boxedai.trust-record/v1"` and
+the following top-level objects: `session`, optional `source`, `runtime`, `origin`,
+`policy`, `artifacts`, `evidence`, `activity`, `assurance`, and `signing`, plus
+`issued_at` and `signature`. The Draft 2020-12 schema rejects unknown properties at
+every level. Digests are lowercase `sha256:<64 hex>` strings. Counts and sequence
+numbers are non-negative JSON integers no larger than 9,007,199,254,740,991, the
+largest integer represented exactly by JCS's IEEE-754 number model. Optional facts are
+omitted, never guessed.
+
+The signed claims are:
+
+- `session`: id, trace id, harness, and creation time from `session.json`.
+- `source`: repository, branch, and commit when present in `session.json`.
+- `runtime`: `platform: "software-only"`, `isolation: "lima-vm"`, and the image
+  name/digest from `session.json`.
+- `origin`: `kind: "host-control-plane"`, `producer: "boxedai-recorder"`.
+- `policy`: resolved profile and policy digest.
+- `artifacts`: exact-byte digests of `session.json`, `policy.json`,
+  `input-manifest.json`, and `output-manifest.json`.
+- `evidence`: `boxedai.evidence/v1`, total segment/record/sensor counts, sequence
+  range, final segment digest as `chain_tip`, sorted observed sensor mechanisms
+  (including `procfs` when that is what the guest reported), and one ordered
+  descriptor per sealed segment containing its number, exact manifest-file digest,
+  declared segment digest, sequence range, record count, and seal time.
+- `activity`: sorted observed model provider/id pairs with request counts and only
+  the input/output/total token usage fields actually reported by the provider,
+  model request count, sorted internal-tool call counts, effect dispatch count,
+  network denial count, and a tool transcript binding derived only from
+  authoritative OTLP records.
+
+The tool transcript binding is the SHA-256 digest of RFC 8785 JCS over an array of
+broker-mediated events in `audit.sequence` order. It includes
+`authorization.decided`, every `internal_tool.*` event, and every `effect.*` event.
+Each normalized object always carries `sequence` and `event`, then carries only the
+observed values among `action_id`, `parent_action_id`, `outcome`, `content_digest`,
+`tool_name`, `tool_operation`, `effect_adapter`, and `effect_operation`. The binding
+also carries the normalized event count and a call count that counts only
+`internal_tool.dispatched` and `effect.dispatched`. No event body, command line,
+error text, or other unbounded attribute enters this portable summary.
+
+Derivation keys off recorder-assigned identity as well as event name: model/tool/effect
+claims and transcript entries require `audit.producer=broker` with
+`audit.evidence.class=broker_mediated`; sensor lifecycle mechanisms/loss/restart
+require `audit.producer=guest_supervisor` with `integrity`; process and network
+observations require `audit.producer=guest_supervisor` with `kernel_observed`;
+lifecycle and artifact bindings require `audit.producer=controller`. A
+workload-submitted event using one of those names cannot enter an authoritative
+trust-record claim.
+
+- `assurance`: fixed Level 0 claims: `level: 0`,
+  `verdict_ceiling: "LOCAL_ONLY"`, `hardware_attested: false`, and
+  `externally_witnessed: false`.
+- `signing`: fixed `algorithm: "Ed25519"` and `canonicalization: "RFC8785"`, plus
+  the existing recorder public-key fingerprint. The trust record never embeds a
+  public key; verification requires a caller-supplied recorder public key.
+
+The top-level `signature` is the recorder key's raw Ed25519 signature encoded as
+unpadded base64url. Its preimage is RFC 8785 JSON Canonicalization Scheme (JCS) over
+the complete record with only the `signature` field absent. The same persistent
+recorder key signs both trust records and segment-manifest COSE Sign1 envelopes.
+RFC 8785 applies only to trust-record signatures; `evidence.CanonicalJSON` remains
+the encoding for existing policy, snapshot, and segment-manifest digests.
+The implementation uses `gowebpki/jcs` for RFC 8785, `santhosh-tekuri/jsonschema/v6`
+for Draft 2020-12 validation, and `go-json-experiment/json` strict decoding to reject
+duplicate members and invalid UTF-8 before signature verification.
+
+Trust-record production order is binding:
+
+1. Stop/freeze the guest and drain its authenticated evidence.
+2. Revoke credentials and stop the broker.
+3. Write the output manifest and diff; emit `workspace.manifested(output)`.
+4. Emit `session.stopped`, then `session.sealed`, into the open final segment.
+5. Call `Recorder.Close()` to fsync and close the final WAL, compute its digest,
+   write its manifest, and COSE-sign the exact manifest bytes.
+6. Independently reread session files, manifests, and OTLP records from disk and
+   construct the unsigned trust record.
+7. Validate the unsigned record shape, RFC 8785-canonicalize it, sign it with the
+   recorder Ed25519 key, validate the final envelope, and atomically write/fsync
+   `trust-record.json` at mode 0600.
+8. Set `session.state=sealed` only after the trust record is durable. Any failure
+   after recorder creation leaves the session `incomplete`.
+
+The trust record is deliberately not emitted into an OTLP event: doing so would
+create a circular dependency between the record's final-chain binding and the
+digest of the segment containing that binding.
+
+New grants use `schema: "boxedai.session/v2"` and declare
+`trust_record: {schema:"boxedai.trust-record/v1", path:"trust-record.json",
+required:true}` before VM boot. A v1 grant without a trust record is a compatible
+legacy session (`absent_legacy`) and retains its existing verifier verdict. A v2
+grant missing its required record is `INCOMPLETE`, preventing deletion downgrade.
+A present trust record is always verified regardless of grant version.
+
+Trust-record verification is independent of its producer and uses this exact gate
+order: (1) pin the `boxedai.trust-record/v1` profile; (2) validate the complete
+envelope against its JSON Schema; (3) require and parse the caller-supplied Ed25519
+recorder public key, checking the signed fingerprint; (4) verify the Ed25519
+signature over the RFC 8785 preimage; (5) enforce the Level-0 honesty invariants and
+independently rederive every session-file, segment, and OTLP claim, including exact
+physical record order and every OTLP `TraceId` binding to the granted trace id. Only
+after these gates do the existing segment/lifecycle/flow checks determine the final verdict.
+Schema, signature, key-binding, or derivation mismatches are
+`TAMPER_SUSPECTED`; an unsupported profile or required missing record is
+`INCOMPLETE`; a clean record remains `LOCAL_ONLY`. `VERIFIED` remains unreachable
+without an external witness.
 
 ## Broker (internal/broker)
 
@@ -373,6 +512,61 @@ external effect.
 The JSON external-effect adapter retains `github/pr-comment`, but the session-scoped
 approver does not preapprove it, so it remains fail-closed.
 
+## Harness hook capture — lefthook / righthook
+
+Claude sessions record every harness tool invocation — each Bash command, file read,
+edit, search, and subagent tool call — as workload-channel evidence, independent of
+the kernel sensor (whose diagnostic procfs path cannot see short-lived processes like `ls`,
+and can never see shell builtins like `cd`). The controller stages a BoxedAi-authored
+`settings.json` into the session harness home (never copied from the host — the
+existing host-settings exclusion stands) wiring two Claude Code hooks, named for the
+box the agent runs in:
+
+- `PreToolUse` → `boxedai-guest-agent lefthook` → emits `tool.requested`
+- `PostToolUse` → `boxedai-guest-agent righthook` → emits `tool.completed`
+
+Both hooks match every tool (`matcher: "*"`). Each reads the harness's hook JSON on
+stdin and POSTs one event to `POST /v1/events` using `BOXEDAI_BROKER_URL` and the
+workload token from `BOXEDAI_WORKLOAD_TOKEN` (token W, already present in the
+workload environment as the harness auth token — no new exposure), so the recorder
+assigns `audit.producer=workload` and `audit.evidence.class=harness_observed` from
+the authenticated channel, never from the payload. Attributes: `tool.name`, the
+harness-reported tool-use id as `harness.tool_use_id` (also set as a best-effort
+`audit.action.id` to pair requested/completed — self-reported correlation, never
+authenticated identity), `harness.permission_mode`, a size-capped
+`harness.tool.input` excerpt with `audit.content.capture=redacted` and
+`audit.content.digest` over the full input JSON, and `audit.correlation=none`. For
+Bash the event body carries the command string (workspace command lines are not
+secrets by policy). `tool.completed` adds the tool-response digest and byte size,
+never response content. A `tool.requested` with no matching `tool.completed` means
+the tool was denied, failed, or interrupted before completing.
+
+Hook and kernel events arrive over independent authenticated channels. The recorder
+sequences them in arrival order; a harness tool-use id does not authenticate a
+specific kernel process, and Tetragon's JSON export supplies no broker-visible
+watermark proving that every causally earlier process event has arrived. BoxedAi
+therefore does not reorder or delay `tool.completed` based on workload-supplied
+process metadata. The guest does synchronously flush each Tetragon fork/exec/exit line
+before advancing to the next line, removing the ordinary 500ms batch delay and
+preserving that sensor's source order, but this is not a cross-channel causal
+watermark: the JSON tailer installs an fsnotify directory watch before seeking the
+export to EOF and retains polling only as a fallback, but kernel notification and
+broker scheduling remain independent of the harness hook channel. `tool.completed`
+can still reach the broker first. Hook events remain `harness_observed` with
+`audit.correlation=none`, and Tetragon process correlation remains `lineage`.
+Procfs `sensor.started` and `sensor.restarted` evidence additionally reports
+`sensor.coverage="incomplete: polling can miss short-lived processes"`; offline
+verification returns `INCOMPLETE` whenever authoritative process coverage used
+procfs.
+
+Hook capture is honest-but-self-reported: it originates inside the distrusted
+workload, so a compromised harness can suppress or forge it. It exists to make the
+timeline complete, not to strengthen the security claim — hook events never enter
+the trust record's broker-derived activity claims or tool-transcript binding. Hooks
+fail open (always exit 0, errors to stderr → native debug log) so evidence-capture
+problems never break the workload. Codex and exec harnesses have no hook mechanism
+in v0.1 (gap-noted).
+
 ## Snapshot / workspace (internal/snapshot)
 
 - `Snapshot(repo, dest) error` — APFS clone via `cp -Rc` (fallback plain copy),
@@ -422,9 +616,8 @@ lockdown; the bake boot never runs a workload):
 3. Install tetragon (release tarball, systemd unit, JSON export to
    /var/log/tetragon/tetragon.log) and enable+start it, so every session's guest already
    has it running. Best-effort: if the release tarball is unavailable for the arch, bake
-   provisioning logs and continues; the guest agent then falls back to procfs polling
-   and reports `sensor.started` with `sensor.mechanism=procfs` (weaker, recorded
-   honestly).
+   provisioning logs and continues, but session launch remains fail-closed until a
+   functioning Tetragon lifecycle sensor proves readiness. Procfs is diagnostic-only.
 4. Install (but do not configure) the nftables and rsyslog packages, and enable
    rsyslog's systemd unit. No ruleset is written and rsyslog is not started yet — the
    ruleset needs a real session's broker IP, which does not exist at bake time.
@@ -462,13 +655,29 @@ or downloads beyond the guest agent binary itself):
    regular growing file the guest agent tails (unlike `/dev/kmsg`, a char device that
    defeats size-based rotation detection).
 4. Enable+start guest agent systemd unit now that egress is locked down, so its first
-   packet is already governed by the ruleset above; agent POSTs sensor.started.
+   packet is already governed by the ruleset above. Immediately before that start,
+   stop Tetragon, remove the baked export log, restart the service, and wait boundedly
+   for it to remain active and create the fresh export path. Leave the log absent on
+   failure so launch readiness cannot be published. The agent
+   POSTs sensor.started. The
+   process watcher writes `/run/boxedai/process-sensor-ready` only after fresh valid
+   `sched_process_fork`, built-in exec, and built-in exit observations plus a clean
+   Tetragon loss-metrics scrape. Procfs never publishes readiness. Merely attaching
+   at Tetragon EOF is not ready.
 
 Guest agent duties (root daemon):
-- Health: verify tetragon running (or start procfs fallback), report sensor events.
-- Tail tetragon JSON export; filter to the session unit's cgroup subtree; forward
-  process.executed/process.exited (+ network events if tetragon policy loaded) in
-  batches to `POST /v1/events` with token S.
+- Health: require Tetragon for launch readiness. After loss, synchronously stop the
+  workload and report sensor loss; procfs may continue for diagnostics only.
+- Periodically launch a root-owned no-op process and treat Tetragon freshness from
+  export growth observed after those probes, not from service activity or the last
+  health check. Root events are filtered from workload evidence. While using procfs,
+  an existing export establishes only a size baseline; recovery to Tetragon requires
+  subsequent post-baseline growth.
+- Tail the Tetragon JSON export using fsnotify with a polling fallback. Any export
+  rotation, truncation, or generation change is sensor loss. In the dedicated VM,
+  scope lifecycle evidence to the exact workload uid; no unavailable cgroup filter
+  is claimed. Forward process.created/process.executed/process.exited in source-log
+  order to `POST /v1/events` with token S.
 - Periodic content scan of /workspace (every 2s) → file.changed (capped sha256
   digest) / file.deleted, forwarded as kernel_observed with `observer=scan`. A
   scan is used, not fsnotify: inotify does not deliver events on the virtiofs
@@ -481,6 +690,11 @@ Guest agent duties (root daemon):
   step 3, above).
 - On `/etc/boxedai/stop` sentinel or broker signal: freeze the session cgroup, drain,
   final flush.
+- Hook mode (not a daemon duty; runs as the workload uid): `lefthook`/`righthook`
+  subcommands invoked by the harness's PreToolUse/PostToolUse hooks read the hook
+  JSON from stdin and emit one `tool.requested`/`tool.completed` event via
+  `POST /v1/events` with token W from the workload environment; always exit 0
+  (see "Harness hook capture").
 
 Harness launch: controller executes
 `limactl shell <id> -- sudo systemd-run --unit boxedai-session <stream-mode> --collect
@@ -501,14 +715,17 @@ character device but not a terminal. `WorkingDirectory=/workspace` so the agent'
 relative file operations land in the writable overlay, not read-only `/`. Harness adapters set
 env: claude → `ANTHROPIC_BASE_URL=http://host.lima.internal:<port>/v1/model/anthropic`,
 `ANTHROPIC_AUTH_TOKEN=<W>`, `CLAUDE_CONFIG_DIR=/home/agent/.claude`,
+`BOXEDAI_BROKER_URL=http://host.lima.internal:<port>` and
+`BOXEDAI_WORKLOAD_TOKEN=<W>` for the staged lefthook/righthook tool-capture hooks,
 `DISABLE_AUTOUPDATER=1`, narrow error-reporting/feedback/marketplace controls, verbose native
 debug, and authenticated OTLP HTTP/JSON logs, metrics, and beta traces. Prompt text,
 assistant text, tool details/content, and untruncated raw Messages API bodies are all
 enabled; the raw bodies remain in the guest-mounted config directory while OTLP
 exports go to the host-only `claude-telemetry` sibling. Claude starts with
 `--debug-file /home/agent/.claude/debug/claude-code.log`; codex → `OPENAI_BASE_URL=...openai`,
-`OPENAI_API_KEY=<W>`; exec → runs `sh -lc <cmd>` (scripted/e2e testing harness,
-recorded like any other).
+`OPENAI_API_KEY=<W>`, plus the same `BOXEDAI_BROKER_URL`/`BOXEDAI_WORKLOAD_TOKEN`
+pair (read by the git bridge; codex has no capture hooks); exec → runs `sh -lc <cmd>`
+(scripted/e2e testing harness, recorded like any other).
 
 Kill switch: `boxedai stop <id>` → revoke tokens, broker returns 401s, guest agent
 freeze+drain (5s grace), `limactl stop -f` then `limactl delete` after evidence seal.
@@ -532,11 +749,13 @@ Startup order (fail-closed at every step):
    credential.issued ×2).
 6. Generate lima.yaml (`images:` pointed at the resolved golden disk, no download) →
    limactl create+start (progress to user).
-7. Wait for guest agent sensor.started (timeout 120s → abort, INCOMPLETE).
+7. Wait for the guest agent unit to be active and its process-sensor readiness marker
+   to exist (timeout 120s → abort, INCOMPLETE).
 8. Emit session.started → launch harness interactively (user drives).
-9. On harness exit: revoke tokens (credential.revoked), guest drain, final output
-   manifest + diff, workspace.manifested(output), session.stopped, Close recorder →
-   session.sealed inside final segment, limactl delete, print summary
+9. On harness exit: guest drain, revoke tokens (credential.revoked), final output
+   manifest + diff, workspace.manifested(output), session.stopped, session.sealed,
+   Close recorder, write the signed session trust record, mark state sealed, then
+   limactl delete and print the summary
    (files changed, network denials, tools used, evidence path, verify hint).
 
 Crash safety: a deferred cleanup handler must revoke tokens, seal what exists, and
@@ -560,6 +779,8 @@ boxedai sessions            list sessions + state + verdict cache
 boxedai view <session> [--web [--addr]]   timeline (evidence-class badges) / web UI
 boxedai diff <session>      show workspace.diff
 boxedai verify <session> [--json]         run verifier, print verdict + facets
+boxedai verify-record <trust-record.json> --public-key <pkix.pem> [--json]
+                            verify a portable envelope only; do not rederive a session
 boxedai apply <session>     apply diff to original repo (asks confirmation)
 boxedai stop <session>      kill switch
 ```
@@ -628,10 +849,13 @@ exist.
 - No Landlock; filesystem policy is systemd hardening (ProtectSystem=strict etc.).
 - Tetragon network/file TracingPolicies not shipped; network evidence = nftables logs,
   file evidence = periodic /workspace scan + final manifest (authoritative).
-- Tetragon frequently fails to load in the Lima vz guest (BPF/BTF/kernel), so process
-  evidence in practice is the procfs fallback: `sensor.mechanism=procfs`,
-  `correlation=none`, exit codes reported as `-1` (procfs sees the PID vanish, not the
-  real status). Honestly recorded; hardening tetragon-in-vz is deferred.
+- Tetragon may fail to load in the Lima vz guest (BPF/BTF/kernel); strict sessions
+  then abort before workload launch. Procfs may record diagnostic observations with
+  `correlation=none`, unknown exit status, and explicit incomplete coverage, but
+  cannot satisfy readiness. Neither sensor currently supplies trusted tool/process
+  correlation or a completion watermark, so process/tool lifecycle ordering is not
+  guaranteed even though Tetragon source events bypass the guest's timed batch.
+  Honestly recorded; hardening tetragon-in-vz is deferred.
 - Live file.changed granularity is the 2s scan interval; changes fully created and
   deleted within one interval are only caught by the authoritative final diff.
 - Evidence at rest is not encrypted (FileVault assumed).
@@ -641,6 +865,10 @@ exist.
   verification on top of that — no signature over who ran `build-image`, and no
   reproducible-build guarantee that a rebuild yields identical bytes.
 - Model request/response bodies stored as digest+usage only (no forensic body capture).
+- Harness hook capture (`tool.requested`/`tool.completed`) is workload self-reported
+  and fail-open: a compromised harness can suppress it, and a hook that cannot reach
+  the broker loses that event silently (stderr only). Claude only — codex and exec
+  have no hook mechanism.
 - Codex adapter untested against a real OpenAI credential.
 - ChatGPT-mode Codex device credentials (`access_token`+`account_id` from `codex login`)
   are proxied best-effort: host-side token expiry is never checked, so a stale token

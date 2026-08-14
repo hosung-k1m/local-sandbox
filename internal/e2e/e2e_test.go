@@ -19,7 +19,9 @@ import (
 	"boxedai/internal/evidence"
 	"boxedai/internal/image"
 	"boxedai/internal/policy"
+	"boxedai/internal/recorder"
 	"boxedai/internal/session"
+	"boxedai/internal/trustrecord"
 	"boxedai/internal/verify"
 	"boxedai/internal/view"
 	"boxedai/internal/vm"
@@ -48,6 +50,7 @@ func (f *fakeGuestVM) Start(context.Context) error { return nil }
 func (f *fakeGuestVM) WaitHealthy(context.Context, time.Duration) error {
 	return f.postEvents([]evidence.Event{{
 		Name:    evidence.EventSensorStarted,
+		Class:   evidence.ClassIntegrity,
 		Outcome: evidence.OutcomeSuccess,
 		Body:    "guest sensor started",
 		Attrs:   map[string]any{"sensor.mechanism": "procfs"},
@@ -241,6 +244,9 @@ func TestEndToEndHostPipeline(t *testing.T) {
 			t.Errorf("expected evidence artifact %s: %v", rel, err)
 		}
 	}
+	if _, err := os.Stat(filepath.Join(dir, trustrecord.FileName)); err != nil {
+		t.Errorf("expected session trust record: %v", err)
+	}
 
 	// --- The offline verifier accepts the clean session as LOCAL_ONLY. ---
 	rep, err := verify.Verify(dir)
@@ -261,6 +267,20 @@ func TestEndToEndHostPipeline(t *testing.T) {
 	}
 	if rep.Facets.UngatedActivityCount != 0 {
 		t.Errorf("ungated activity = %d, want 0 (no bypass)", rep.Facets.UngatedActivityCount)
+	}
+	if rep.Facets.TrustRecordStatus != "verified" || !rep.Facets.TrustRecordSignature || !rep.Facets.TrustRecordDerived {
+		t.Errorf("trust record facets = %+v, want signed and cross-derived", rep.Facets)
+	}
+	recordBytes, err := os.ReadFile(filepath.Join(dir, trustrecord.FileName))
+	if err != nil {
+		t.Fatalf("read trust record: %v", err)
+	}
+	record, err := trustrecord.Decode(recordBytes)
+	if err != nil {
+		t.Fatalf("decode trust record: %v", err)
+	}
+	if len(record.Evidence.SensorMechanisms) != 1 || record.Evidence.SensorMechanisms[0] != "procfs" {
+		t.Errorf("sensor mechanisms = %v, want [procfs]", record.Evidence.SensorMechanisms)
 	}
 	if res.Verdict != string(verify.VerdictLocalOnly) {
 		t.Errorf("Result.Verdict hint = %q, want %q", res.Verdict, verify.VerdictLocalOnly)
@@ -344,8 +364,49 @@ func TestEndToEndHostPipeline(t *testing.T) {
 		}
 	})
 
-	// --- NEGATIVE: removing the final segment manifest yields INCOMPLETE. ---
-	t.Run("missing final manifest yields incomplete", func(t *testing.T) {
+	t.Run("valid signature cannot hide a drifted trust-record claim", func(t *testing.T) {
+		td := runPipeline(t)
+		path := filepath.Join(td.SessionDir, trustrecord.FileName)
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read trust record: %v", err)
+		}
+		envelope, err := trustrecord.Decode(data)
+		if err != nil {
+			t.Fatalf("decode trust record: %v", err)
+		}
+		envelope.Activity.NetworkDenialCount++
+		key, err := recorder.LoadOrGenerateKey(filepath.Join(os.Getenv("BOXEDAI_HOME"), "keys"))
+		if err != nil {
+			t.Fatalf("load recorder key: %v", err)
+		}
+		if err := trustrecord.Sign(&envelope, key.Priv); err != nil {
+			t.Fatalf("re-sign changed trust record: %v", err)
+		}
+		data, err = json.MarshalIndent(envelope, "", "  ")
+		if err != nil {
+			t.Fatalf("marshal changed trust record: %v", err)
+		}
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatalf("rewrite trust record: %v", err)
+		}
+		rep, err := verify.Verify(td.SessionDir)
+		if err != nil {
+			t.Fatalf("verify.Verify: %v", err)
+		}
+		if rep.Verdict != verify.VerdictTamperSuspected {
+			t.Fatalf("verdict = %s, want TAMPER_SUSPECTED\n%s", rep.Verdict, rep.String())
+		}
+		if checkPassed(rep, "session-trust-record") {
+			t.Error("session-trust-record check should have failed under a changed claim")
+		}
+		if !rep.Facets.TrustRecordSignature || rep.Facets.TrustRecordDerived || rep.Facets.TrustRecordStatus != "claim_mismatch" {
+			t.Errorf("trust record facets = %+v, want valid signature with failed cross-derivation", rep.Facets)
+		}
+	})
+
+	// --- NEGATIVE: the signed record turns post-seal segment removal into tamper. ---
+	t.Run("missing bound final manifest yields tamper", func(t *testing.T) {
 		id := runPipeline(t)
 		segs := filepath.Join(id.SessionDir, "evidence", "segments")
 		// Delete the last sealed segment's manifest + signature, leaving an
@@ -360,12 +421,11 @@ func TestEndToEndHostPipeline(t *testing.T) {
 		if err != nil {
 			t.Fatalf("verify.Verify: %v", err)
 		}
-		if rep.Verdict != verify.VerdictIncomplete {
-			t.Fatalf("verdict = %s, want INCOMPLETE\n%s", rep.Verdict, rep.String())
+		if rep.Verdict != verify.VerdictTamperSuspected {
+			t.Fatalf("verdict = %s, want TAMPER_SUSPECTED\n%s", rep.Verdict, rep.String())
 		}
-		// It is incomplete because of the missing seal, NOT tamper: the surviving
-		// evidence still verifies (signatures/sequence intact), leaving only an
-		// unresolved unsealed tail.
+		// The surviving evidence still verifies, but the independently signed trust
+		// record proves a sealed manifest was present when the session was sealed.
 		if !rep.Facets.SignatureValid || !rep.Facets.SequenceContinuous {
 			t.Errorf("integrity facets should still hold (truncation, not tamper): %+v", rep.Facets)
 		}

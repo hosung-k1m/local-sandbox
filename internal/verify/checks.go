@@ -3,7 +3,9 @@ package verify
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"path/filepath"
 	"sort"
 
@@ -16,7 +18,17 @@ import (
 func jsonUnmarshalStrict(b []byte, v any) error {
 	dec := json.NewDecoder(bytes.NewReader(b))
 	dec.DisallowUnknownFields()
-	return dec.Decode(v)
+	if err := dec.Decode(v); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("unexpected trailing JSON value")
+		}
+		return err
+	}
+	return nil
 }
 
 // checkChainLinks verifies the prev_segment_digest chain (DESIGN check 3): the
@@ -41,28 +53,23 @@ func checkChainLinks(manifests []segmentManifest) (bool, string) {
 	return true, fmt.Sprintf("%d segment(s) linked by SHA-256 digest", len(ms))
 }
 
-// checkSequenceContinuity verifies audit.sequence forms 1..N with no gaps or
-// duplicates across all segments (DESIGN check 4).
+// checkSequenceContinuity verifies audit.sequence forms 1..N in physical record
+// order with no gaps, duplicates, or reordering across segments (DESIGN check 4).
 func checkSequenceContinuity(records []record) (bool, string) {
 	if len(records) == 0 {
 		return false, "no records found"
 	}
-	seqs := make([]int64, 0, len(records))
-	for _, r := range records {
-		seqs = append(seqs, r.seq)
-	}
-	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
-	for i, s := range seqs {
+	for i, r := range records {
 		want := int64(i + 1)
-		if s == want {
+		if r.seq == want {
 			continue
 		}
-		if s < want {
-			return false, fmt.Sprintf("duplicate sequence near %d", s)
+		if r.seq < want {
+			return false, fmt.Sprintf("duplicate or reordered sequence: expected %d, found %d", want, r.seq)
 		}
-		return false, fmt.Sprintf("sequence gap: expected %d, found %d", want, s)
+		return false, fmt.Sprintf("sequence gap or reordering: expected %d, found %d", want, r.seq)
 	}
-	return true, fmt.Sprintf("sequences 1..%d continuous", len(seqs))
+	return true, fmt.Sprintf("sequences 1..%d continuous and physically ordered", len(records))
 }
 
 // lifecycleEvents are the four session-scope events checked in order.
@@ -80,6 +87,9 @@ var lifecycleEvents = []string{
 func checkLifecycleEvents(records []record, segCount int) (ok bool, closeStatus, detail string) {
 	seqByName := map[string][]int64{}
 	for _, r := range records {
+		if r.str(evidence.AttrProducer) != string(evidence.ChannelController) {
+			continue
+		}
 		if _, tracked := indexOf(lifecycleEvents, r.name); tracked {
 			seqByName[r.name] = append(seqByName[r.name], r.seq)
 		}
@@ -124,16 +134,13 @@ func checkLifecycleEvents(records []record, segCount int) (ok bool, closeStatus,
 }
 
 // checkPolicyDigest verifies the policy digest is identical across the grant,
-// every event's audit.policy.digest, and every manifest (DESIGN check 6).
+// every event's audit.policy.digest, and every manifest (DESIGN check 7).
 func checkPolicyDigest(grantDigest string, records []record, manifests []segmentManifest) (bool, string) {
 	if grantDigest == "" {
 		return false, "grant has empty policy_digest"
 	}
 	for _, r := range records {
 		d := r.str(evidence.AttrPolicyDigest)
-		if d == "" {
-			continue // not every producer stamps it on every record; skip blanks
-		}
 		if d != grantDigest {
 			return false, fmt.Sprintf("event %s (seq %d) policy digest %s != grant %s", r.name, r.seq, d, grantDigest)
 		}
@@ -146,41 +153,90 @@ func checkPolicyDigest(grantDigest string, records []record, manifests []segment
 	return true, "policy digest consistent across grant, events, manifests"
 }
 
-// checkSensor verifies sensor.started precedes the first process.executed and
-// counts sensor loss (DESIGN check 7). Any sensor loss, or a process observed
+// checkSensor verifies sensor.started precedes the first process lifecycle event and
+// counts sensor loss (DESIGN check 8). Any sensor loss, or a process observed
 // before the sensor came up, fails the check (driving an INCOMPLETE verdict);
 // the loss count is returned regardless for the facet.
 func checkSensor(records []record) (ok bool, lossCount int, detail string) {
 	var firstSensorStart int64 = -1
-	var firstProcExec int64 = -1
+	var firstProcessEvent int64 = -1
+	sessionStarted := false
+	processExecuted := false
+	processExited := false
 	restartCount := 0
+	procfsCoverage := false
 	for _, r := range records {
 		switch r.name {
+		case evidence.EventSessionStarted:
+			if r.str(evidence.AttrProducer) == string(evidence.ChannelController) {
+				sessionStarted = true
+			}
 		case evidence.EventSensorStarted:
+			if !isGuestIntegrityRecord(r) {
+				continue
+			}
+			if r.str("sensor.mechanism") == "procfs" {
+				procfsCoverage = true
+			}
 			if firstSensorStart < 0 || r.seq < firstSensorStart {
 				firstSensorStart = r.seq
 			}
 		case evidence.EventSensorLoss:
-			lossCount++
+			if isGuestIntegrityRecord(r) {
+				lossCount++
+			}
 		case evidence.EventSensorRestarted:
-			restartCount++
-		case evidence.EventProcessExecuted:
-			if firstProcExec < 0 || r.seq < firstProcExec {
-				firstProcExec = r.seq
+			if isGuestIntegrityRecord(r) {
+				restartCount++
+				if r.str("sensor.mechanism") == "procfs" {
+					procfsCoverage = true
+				}
+			}
+		case evidence.EventProcessCreated, evidence.EventProcessExecuted:
+			if !isGuestKernelRecord(r) {
+				continue
+			}
+			if r.str("observer") == "procfs" {
+				procfsCoverage = true
+			}
+			if firstProcessEvent < 0 || r.seq < firstProcessEvent {
+				firstProcessEvent = r.seq
+			}
+			if r.name == evidence.EventProcessExecuted && r.str("observer") == "tetragon" {
+				processExecuted = true
+			}
+		case evidence.EventProcessExited:
+			if !isGuestKernelRecord(r) {
+				continue
+			}
+			if r.str("observer") == "procfs" {
+				procfsCoverage = true
+			}
+			if firstProcessEvent < 0 || r.seq < firstProcessEvent {
+				firstProcessEvent = r.seq
+			}
+			if r.str("observer") == "tetragon" {
+				processExited = true
 			}
 		}
 	}
 
 	var problems []string
-	if firstProcExec >= 0 {
+	if sessionStarted && (!processExecuted || !processExited) {
+		problems = append(problems, "started session lacks trusted Tetragon process.executed and process.exited coverage")
+	}
+	if firstProcessEvent >= 0 {
 		if firstSensorStart < 0 {
-			problems = append(problems, "process.executed observed but sensor.started never recorded")
-		} else if firstSensorStart >= firstProcExec {
-			problems = append(problems, fmt.Sprintf("sensor.started (seq %d) not before first process.executed (seq %d)", firstSensorStart, firstProcExec))
+			problems = append(problems, "process lifecycle observed but sensor.started never recorded")
+		} else if firstSensorStart >= firstProcessEvent {
+			problems = append(problems, fmt.Sprintf("sensor.started (seq %d) not before first process lifecycle event (seq %d)", firstSensorStart, firstProcessEvent))
 		}
 	}
 	if lossCount > 0 {
 		problems = append(problems, fmt.Sprintf("sensor.loss recorded %d time(s), %d restart(s)", lossCount, restartCount))
+	}
+	if procfsCoverage {
+		problems = append(problems, "authoritative process coverage used procfs polling")
 	}
 	if len(problems) == 0 {
 		return true, lossCount, "sensor.started before workload; no sensor loss"
@@ -188,7 +244,7 @@ func checkSensor(records []record) (ok bool, lossCount int, detail string) {
 	return false, lossCount, joinStrings(problems)
 }
 
-// checkFlow verifies the flow invariants (DESIGN check 8): every effect.dispatched
+// checkFlow verifies the flow invariants (DESIGN check 9): every effect.dispatched
 // is preceded by an effect.approved for the same action (matched by
 // audit.content.digest, falling back to audit.action.id), and every
 // internal_tool.dispatched is preceded by an authorization.decided=allow for the
@@ -203,8 +259,14 @@ func checkFlow(records []record) (ok bool, ungated int, detail string) {
 	var problems []string
 
 	for _, r := range sorted {
+		if !isBrokerMediatedRecord(r) {
+			continue
+		}
 		switch r.name {
 		case evidence.EventEffectApproved:
+			if r.str(evidence.AttrOutcome) != string(evidence.OutcomeSuccess) {
+				continue
+			}
 			if d := r.str(evidence.AttrContentDigest); d != "" {
 				approvedEffects["digest:"+d] = true
 			}
@@ -212,7 +274,7 @@ func checkFlow(records []record) (ok bool, ungated int, detail string) {
 				approvedEffects["action:"+a] = true
 			}
 		case evidence.EventAuthorizationDecided:
-			if r.str(evidence.AttrOutcome) != string(evidence.OutcomeDenied) {
+			if r.str(evidence.AttrOutcome) == string(evidence.OutcomeSuccess) {
 				if a := r.str(evidence.AttrActionID); a != "" {
 					authorizedTools["action:"+a] = true
 				}
@@ -250,7 +312,7 @@ func effectApproved(r record, approved map[string]bool) bool {
 
 // checkOutputManifest verifies that, when a workspace.manifested(output) event
 // exists, its recorded content digest matches the on-disk output-manifest.json
-// (DESIGN check 9). The output event is the last workspace.manifested by sequence
+// (DESIGN check 10). The output event is the last workspace.manifested by sequence
 // (the input manifest is emitted at snapshot time, the output at session end).
 // The check is skipped (and passes) when there is no output event or no file, to
 // avoid over-claiming; a genuine mismatch fails, indicating the artifact was
@@ -258,7 +320,7 @@ func effectApproved(r record, approved map[string]bool) bool {
 func checkOutputManifest(sessionDir string, records []record) (bool, string) {
 	var out *record
 	for i := range records {
-		if records[i].name == evidence.EventWorkspaceManifested {
+		if records[i].name == evidence.EventWorkspaceManifested && records[i].str(evidence.AttrProducer) == string(evidence.ChannelController) {
 			if out == nil || records[i].seq > out.seq {
 				out = &records[i]
 			}

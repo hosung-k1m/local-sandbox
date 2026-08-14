@@ -2,9 +2,11 @@ package verify
 
 import (
 	"bufio"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"time"
 
@@ -21,11 +23,12 @@ import (
 // attributes are merged (record wins) so it does not matter which layer the
 // recorder placed a given constant attribute on.
 type record struct {
-	seq   int64
-	name  string
-	ts    time.Time
-	seg   int // index of the segment file this record came from
-	attrs map[string]any
+	seq     int64
+	name    string
+	ts      time.Time
+	traceID string
+	seg     int // index of the segment file this record came from
+	attrs   map[string]any
 }
 
 func (r record) str(key string) string {
@@ -35,14 +38,17 @@ func (r record) str(key string) string {
 	return ""
 }
 
-func (r record) i64(key string) int64 {
+func (r record) i64(key string) (int64, bool) {
 	switch v := r.attrs[key].(type) {
 	case int64:
-		return v
+		return v, true
 	case float64:
-		return int64(v)
+		if math.IsNaN(v) || math.IsInf(v, 0) || math.Trunc(v) != v {
+			return 0, false
+		}
+		return int64(v), true
 	}
-	return 0
+	return 0, false
 }
 
 // anyValue extracts the concrete Go value from an OTLP AnyValue. Only the scalar
@@ -109,12 +115,17 @@ func readSegment(path string, segIndex int) ([]record, error) {
 					}
 					collectAttrs(attrs, lr.GetAttributes())
 					r := record{
-						name:  lr.GetEventName(),
-						ts:    time.Unix(0, int64(lr.GetTimeUnixNano())).UTC(),
-						seg:   segIndex,
-						attrs: attrs,
+						name:    lr.GetEventName(),
+						ts:      time.Unix(0, int64(lr.GetTimeUnixNano())).UTC(),
+						traceID: hex.EncodeToString(lr.GetTraceId()),
+						seg:     segIndex,
+						attrs:   attrs,
 					}
-					r.seq = r.i64(evidence.AttrSequence)
+					sequence, ok := r.i64(evidence.AttrSequence)
+					if !ok {
+						return nil, fmt.Errorf("decode otlp frame in %s: audit.sequence is not an integer", path)
+					}
+					r.seq = sequence
 					out = append(out, r)
 				}
 			}

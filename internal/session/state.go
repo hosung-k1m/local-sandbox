@@ -27,7 +27,7 @@ const (
 // stateFileName is the per-session state marker file.
 const stateFileName = "session.state"
 
-// writeState writes the state marker for a session dir, best-effort at 0600.
+// writeState writes the state marker for a session dir at 0600.
 func writeState(sessionDir string, s State) error {
 	path := filepath.Join(sessionDir, stateFileName)
 	if err := os.WriteFile(path, []byte(s), 0o600); err != nil {

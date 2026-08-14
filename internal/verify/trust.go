@@ -19,10 +19,25 @@ import (
 // grant fields are ignored here; the verifier does not trust anything it cannot
 // independently re-derive.
 type grant struct {
-	Schema       string `json:"schema"`
-	SessionID    string `json:"session_id"`
-	PolicyDigest string `json:"policy_digest"`
-	RecorderPub  string `json:"recorder_pub"` // PEM PKIX Ed25519 public key
+	Schema              string `json:"schema"`
+	SessionID           string `json:"session_id"`
+	TraceID             string `json:"trace_id"`
+	Harness             string `json:"harness"`
+	Profile             string `json:"profile"`
+	Repository          string `json:"repository"`
+	Branch              string `json:"branch"`
+	Commit              string `json:"commit"`
+	CreatedAt           string `json:"created_at"`
+	PolicyDigest        string `json:"policy_digest"`
+	InputManifestDigest string `json:"input_manifest_digest"`
+	VMImage             string `json:"vm_image"`
+	VMImageDigest       string `json:"vm_image_digest"`
+	RecorderPub         string `json:"recorder_pub"` // PEM PKIX Ed25519 public key
+	TrustRecord         struct {
+		Schema   string `json:"schema"`
+		Path     string `json:"path"`
+		Required bool   `json:"required"`
+	} `json:"trust_record"`
 }
 
 // loadGrant reads and parses session.json from the session directory.

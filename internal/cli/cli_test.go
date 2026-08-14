@@ -13,8 +13,8 @@ import (
 	"boxedai/internal/session"
 )
 
-// allSubcommands is every subcommand DESIGN.md's CLI section mandates.
-var allSubcommands = []string{"setup", "doctor", "run", "build-image", "sessions", "view", "diff", "verify", "apply", "stop"}
+// allSubcommands is every subcommand exposed by the root command.
+var allSubcommands = []string{"setup", "doctor", "run", "build-image", "sessions", "view", "diff", "verify", "verify-record", "apply", "stop"}
 
 // `boxedai --help` must list every mandated subcommand.
 func TestHelpListsAllSubcommands(t *testing.T) {
