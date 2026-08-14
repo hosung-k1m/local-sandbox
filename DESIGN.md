@@ -598,7 +598,13 @@ no download, no package installs. Both are vmType `vz` on the host's own arch,
 `mountTypesUnsupported: [reverse-sshfs]`, containerd disabled, no port forwards. The
 bake boot mounts nothing from the host (it only installs software) and uses a smaller
 logical disk size (20GiB) than Lima's vz default; a real session mounts
-`sessions/<id>/workspace` → `/workspace` writable (read-only for `review`). Claude
+`sessions/<id>/workspace` → `/workspace` writable (read-only for `review`). A session
+VM also requests `memory: 10GiB` and `cpus: 4` rather than taking Lima's vz defaults
+(4GiB/4cpu), which must stay coherent with the workload unit's own limits: the
+harness's `MemoryMax` (8G, from the policy limits) has to sit at least ~1GiB below the
+VM's RAM, or systemd's cgroup limit exceeds what the guest actually has and a heavy
+session is killed by the guest kernel's OOM reaper instead of the policy. The bake
+boot keeps Lima's defaults — it only installs software. Claude
 sessions additionally mount a fresh `sessions/<id>/claude-code` directory at
 `/home/agent/.claude` for native diagnostics; the host's real `~/.claude` is never
 mounted. Other harnesses mount nothing else. Sessions get `host.lima.internal` for the
@@ -622,9 +628,15 @@ lockdown; the bake boot never runs a workload):
    just updated.
 3. Install tetragon (release tarball, systemd unit, JSON export to
    /var/log/tetragon/tetragon.log) and enable+start it, so every session's guest already
-   has it running. Best-effort: if the release tarball is unavailable for the arch, bake
+   has it running. The unit pins the export's rotation flags
+   (`--export-file-max-size-mb`, `--export-file-max-backups`,
+   `--export-file-rotation-interval`) far beyond any realistic session so the export
+   is a single append-only file for the whole session: Tetragon's own 10 MB default
+   rotates a busy session's export within minutes, and every rotation is a guest-side
+   sensor coverage gap. Best-effort: if the release tarball is unavailable for the arch, bake
    provisioning logs and continues, but session launch remains fail-closed until a
-   functioning Tetragon lifecycle sensor proves readiness. Procfs is diagnostic-only.
+   process lifecycle sensor proves readiness (Tetragon, else the bounded procfs
+   fallback in session-time step 4).
 4. Install (but do not configure) the nftables and rsyslog packages, and enable
    rsyslog's systemd unit. No ruleset is written and rsyslog is not started yet — the
    ruleset needs a real session's broker IP, which does not exist at bake time.
@@ -649,6 +661,10 @@ or downloads beyond the guest agent binary itself):
    step 4 is live for this session), resolve `host.lima.internal` and pin
    `/etc/resolv.conf` at the upstream nameserver (disabling systemd-resolved) so a
    workload DNS query is an attributable uid-4242 packet aimed at a single known IP,
+   append the guest's own hostname to `/etc/hosts` (the golden image carries the bake
+   boot's hostname, and with resolved stopped and DNS dropped `sudo` otherwise stalls
+   on a doomed lookup of its own host name on every single invocation — including every
+   `limactl shell` teardown step),
    then write and enable the default-deny ruleset: allow lo; allow established; allow
    tcp to <broker ip>:<port> only. Denied egress *from the workload uid (4242)* is `log
    prefix "boxedai-denied: "` + drop, rate-limited (20/s, burst 40) — except the
@@ -773,7 +789,8 @@ Harness launch: controller executes
  --property=SystemCallFilter=@system-service --property=CapabilityBoundingSet=
  --setenv=ANTHROPIC_BASE_URL=... --setenv=ANTHROPIC_AUTH_TOKEN=<W> ...
  <harness argv>`.
-`<stream-mode>` is `--pty --wait` when the controller's stdin is a real terminal
+`MemoryMax` comes from the resolved policy limits and must stay below the session VM's
+own RAM (see above). `<stream-mode>` is `--pty --wait` when the controller's stdin is a real terminal
 (interactive claude/codex — genuine pty passthrough) and `--pipe` otherwise
 (scripted `exec`/CI: `--pty` never returns without a controlling terminal, so it
 would hang teardown; `--pipe` streams stdio and exits when the unit exits).

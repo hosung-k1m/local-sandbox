@@ -35,6 +35,29 @@ const guestTetragonLog = "/var/log/tetragon/tetragon.log"
 // that defeats size-based rotation detection).
 const guestNFTLogSource = "/var/log/kern.log"
 
+// tetragonExecStart is the exact ExecStart line for tetragon.service, shared by
+// the bake-time unit (stepBakeTetragonTmpl) and the session-time drop-in that
+// re-pins it (stepEnableAgentTmpl) so an already-built golden image picks up
+// changes here without a rebuild. The two must stay byte-identical, hence one
+// constant.
+//
+// The export rotation flags are the load-bearing part. Tetragon's defaults rotate
+// the JSON export at 10 MB, which a busy session reaches in minutes; every
+// rotation is a guest-side coverage gap the agent has to record as sensor loss.
+// Rotation cannot be switched off outright — Tetragon's rotation is
+// lumberjack-backed, where a max size of 0 means 100 MB rather than "never" — so
+// it is pushed far past any realistic session instead, with a single retained
+// backup bounding the worst case well inside the guest's 20GiB disk.
+const tetragonExecStart = "/usr/local/bin/tetragon" +
+	" --bpf-lib=/usr/local/lib/tetragon/bpf" +
+	" --tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml" +
+	" --export-filename=" + guestTetragonLog +
+	" --export-rate-limit=-1" +
+	" --export-file-max-size-mb=4096" +
+	" --export-file-max-backups=1" +
+	" --export-file-rotation-interval=0" +
+	" --metrics-server=127.0.0.1:2112"
+
 // Bake provisioning (see bakeProvisionScripts) builds the golden image ONCE
 // (internal/image), never for a real session: create the agent user, install
 // runtime deps + BOTH harness CLIs (the image is harness-agnostic — a real
@@ -169,7 +192,7 @@ After=network.target
 [Service]
 Type=simple
 Environment="PATH=/usr/local/lib/tetragon/:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
-ExecStart=/usr/local/bin/tetragon --bpf-lib=/usr/local/lib/tetragon/bpf --tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml --export-filename=/var/log/tetragon/tetragon.log --export-rate-limit=-1 --metrics-server=127.0.0.1:2112
+ExecStart={{.TetragonExecStart}}
 Restart=on-failure
 
 [Install]
@@ -213,11 +236,17 @@ cat > /etc/systemd/system/boxedai-guest-agent.service <<'UNIT_EOF'
 [Unit]
 Description=BoxedAi guest supervisor
 After=network.target
+# Never let systemd retire the supervisor permanently. Under the default start
+# limit (5 starts in 10s) a fast-failing supervisor lands in start-limit-failed,
+# after which it publishes no readiness marker at all and the host's health gate
+# times the whole session out having recorded nothing.
+StartLimitIntervalSec=0
 
 [Service]
 Type=simple
 ExecStart=/usr/local/bin/boxedai-guest-agent
 Restart=on-failure
+RestartSec=2
 User=root
 RuntimeDirectory=boxedai
 RuntimeDirectoryMode=0755
@@ -232,7 +261,8 @@ systemctl daemon-reload
 // provisioning step before the workload can run. host.lima.internal is
 // resolved to an IP now, while the network is still open, because the
 // ruleset that follows drops everything, DNS included, and nftables can only
-// match on IP addresses. The nftables and rsyslog packages themselves are
+// match on IP addresses. The guest's own hostname is pinned in /etc/hosts for
+// the same reason: after this step there is no resolver left to answer for it. The nftables and rsyslog packages themselves are
 // already installed, and rsyslog's systemd enable-state already baked in
 // (stepBakePackagesTmpl) — this step only restarts rsyslog (cheap,
 // idempotent) to make sure the log sink is confirmed live for THIS session
@@ -246,6 +276,12 @@ if [ -z "$BROKER_IP" ]; then
   echo "boxedai: could not resolve broker host {{.BrokerHost}}" >&2
   exit 1
 fi
+# The golden image carries the bake boot's hostname in /etc/hosts, so this VM's own
+# name resolves nowhere. sudo looks its host name up on every single invocation, and
+# once resolved is stopped and the ruleset below drops DNS that lookup can only time
+# out: "sudo: unable to resolve host lima-bx-..." on every sudo and systemd-run,
+# including the teardown ones racing the kill-switch grace. Pin it locally.
+printf '127.0.1.1 %s\n' "$(hostname)" >> /etc/hosts
 # Pin resolv.conf directly at the upstream nameserver and disable the
 # systemd-resolved stub. Otherwise the workload's DNS goes to 127.0.0.53
 # (loopback, allowed) and systemd-resolved makes the real upstream query under
@@ -292,17 +328,27 @@ systemctl restart nftables
 `))
 
 // stepEnableAgentTmpl establishes a fresh per-session Tetragon export boundary,
-// then brings the supervisor up now that egress is locked down. A Tetragon
-// restart that cannot stay active leaves no export file, so the agent selects
-// the honest procfs fallback instead of attaching to baked stale content.
+// re-pins the export unit's rotation flags via a drop-in (so a golden image baked
+// before those flags existed is fixed for this session without a rebuild), then
+// brings the supervisor up now that egress is locked down. A Tetragon restart
+// that cannot stay active leaves no export file, so the agent selects the honest
+// procfs fallback instead of attaching to baked stale content.
 var stepEnableAgentTmpl = template.Must(template.New("session-step-enable-agent").Parse(`#!/bin/sh
 set -eu
 systemctl stop tetragon 2>/dev/null || true
 rm -f {{.TetragonLog}}
+mkdir -p /etc/systemd/system/tetragon.service.d
+cat > /etc/systemd/system/tetragon.service.d/10-boxedai-export.conf <<'DROPIN_EOF'
+[Service]
+ExecStart=
+ExecStart={{.TetragonExecStart}}
+DROPIN_EOF
+systemctl daemon-reload
 TETRAGON_READY=false
 if command -v tetragon >/dev/null 2>&1; then
   if systemctl start tetragon; then
-    for TETRAGON_WAIT in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50; do
+    TETRAGON_WAIT=0
+    while [ "$TETRAGON_WAIT" -lt 300 ]; do
       if ! systemctl is-active --quiet tetragon; then
         break
       fi
@@ -312,6 +358,7 @@ if command -v tetragon >/dev/null 2>&1; then
         fi
         break
       fi
+      TETRAGON_WAIT=$((TETRAGON_WAIT + 1))
       sleep 0.1
     done
   fi
@@ -336,6 +383,9 @@ type provisionData struct {
 	AgentConfigB64  string
 	WorkloadUID     int
 	TetragonLog     string
+	// TetragonExecStart re-pins the baked unit's command line for this session
+	// (see tetragonExecStart).
+	TetragonExecStart string
 }
 
 // bakeProvisionData is the template data for bake provisioning (see
@@ -350,6 +400,8 @@ type bakeProvisionData struct {
 	NPMRegistry      string
 	HasNPMRegistry   bool
 	WorkloadUID      int
+	// TetragonExecStart is the baked unit's command line (see tetragonExecStart).
+	TetragonExecStart string
 }
 
 // bakeProvisionScripts renders the bake-only provisioning steps (create the
@@ -365,13 +417,14 @@ func bakeProvisionScripts(cfg BakeConfig) ([]limaProvision, error) {
 		return nil, err
 	}
 	data := bakeProvisionData{
-		Arch:             cfg.Arch,
-		ClaudeNativeArch: claudeArch,
-		ExtraCAPEM:       cfg.ExtraCAPEM,
-		HasExtraCA:       cfg.ExtraCAPEM != "",
-		NPMRegistry:      cfg.NPMRegistry,
-		HasNPMRegistry:   cfg.NPMRegistry != "",
-		WorkloadUID:      agentUID,
+		Arch:              cfg.Arch,
+		ClaudeNativeArch:  claudeArch,
+		ExtraCAPEM:        cfg.ExtraCAPEM,
+		HasExtraCA:        cfg.ExtraCAPEM != "",
+		NPMRegistry:       cfg.NPMRegistry,
+		HasNPMRegistry:    cfg.NPMRegistry != "",
+		WorkloadUID:       agentUID,
+		TetragonExecStart: tetragonExecStart,
 	}
 	steps := []*template.Template{
 		stepCreateUserTmpl,
@@ -414,14 +467,15 @@ func provisionScripts(cfg Config) ([]limaProvision, error) {
 	}
 
 	data := provisionData{
-		BrokerHost:      cfg.BrokerHost,
-		BrokerPort:      cfg.BrokerPort,
-		SupervisorToken: cfg.SupervisorToken,
-		SessionID:       cfg.SessionID,
-		Arch:            cfg.Arch,
-		AgentConfigB64:  base64.StdEncoding.EncodeToString(agentCfgJSON),
-		WorkloadUID:     agentUID,
-		TetragonLog:     guestTetragonLog,
+		BrokerHost:        cfg.BrokerHost,
+		BrokerPort:        cfg.BrokerPort,
+		SupervisorToken:   cfg.SupervisorToken,
+		SessionID:         cfg.SessionID,
+		Arch:              cfg.Arch,
+		AgentConfigB64:    base64.StdEncoding.EncodeToString(agentCfgJSON),
+		WorkloadUID:       agentUID,
+		TetragonLog:       guestTetragonLog,
+		TetragonExecStart: tetragonExecStart,
 	}
 
 	steps := []*template.Template{

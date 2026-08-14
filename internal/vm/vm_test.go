@@ -407,6 +407,15 @@ func TestGenerateLimaYAML_ParsesAndShapesMount(t *testing.T) {
 	if tmpl.Containerd.System || tmpl.Containerd.User {
 		t.Errorf("containerd = %+v, want both system and user disabled", tmpl.Containerd)
 	}
+	// The session VM sizes itself instead of taking Lima's 4GiB default, which
+	// sits below the workload unit's own MemoryMax and hands a heavy session to
+	// the guest OOM reaper instead of the policy.
+	if tmpl.Memory != sessionMemory {
+		t.Errorf("memory = %q, want %q", tmpl.Memory, sessionMemory)
+	}
+	if tmpl.CPUs != sessionCPUs {
+		t.Errorf("cpus = %d, want %d", tmpl.CPUs, sessionCPUs)
+	}
 }
 
 func TestGenerateLimaYAML_ReviewProfileIsReadOnly(t *testing.T) {
@@ -499,9 +508,13 @@ func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 		"policy drop",               // default-deny
 		"boxedai-denied",            // deny log prefix
 		"meta skuid 4242",           // log only the workload's denials
-		"udp dport 53 ip daddr ${UPSTREAM_DNS} drop", // silently drop the workload's dead-resolver DNS (noise, not evidence)
-		"systemctl restart nftables",                 // ruleset applied
-		"systemctl enable --now boxedai-guest-agent", // guest agent enable
+		"udp dport 53 ip daddr ${UPSTREAM_DNS} drop",          // silently drop the workload's dead-resolver DNS (noise, not evidence)
+		"systemctl restart nftables",                          // ruleset applied
+		"systemctl enable --now boxedai-guest-agent",          // guest agent enable
+		`printf '127.0.1.1 %s\n' "$(hostname)" >> /etc/hosts`, // sudo's own hostname must resolve without DNS
+		"RestartSec=2",                   // the supervisor keeps coming back
+		"StartLimitIntervalSec=0",        // ... and systemd never retires it permanently
+		"--export-file-max-size-mb=4096", // session-time rotation drop-in
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("session provisioning scripts missing expected content %q", want)
@@ -536,8 +549,10 @@ func TestSessionProvisioningEstablishesFreshTetragonLogBeforeAgent(t *testing.T)
 	for _, want := range []string{
 		"systemctl stop tetragon",
 		"rm -f /var/log/tetragon/tetragon.log",
+		"/etc/systemd/system/tetragon.service.d/10-boxedai-export.conf",
+		"--export-file-max-size-mb=4096",
 		"systemctl start tetragon",
-		"for TETRAGON_WAIT in 1 2 3 4 5",
+		`while [ "$TETRAGON_WAIT" -lt 300 ]`,
 		"systemctl is-active --quiet tetragon",
 		"if [ -e /var/log/tetragon/tetragon.log ]",
 		"TETRAGON_READY=true",
@@ -548,14 +563,15 @@ func TestSessionProvisioningEstablishesFreshTetragonLogBeforeAgent(t *testing.T)
 		}
 	}
 	boundary := strings.Index(script, "rm -f /var/log/tetragon/tetragon.log")
+	dropIn := strings.Index(script, "/etc/systemd/system/tetragon.service.d/10-boxedai-export.conf")
 	restart := strings.Index(script, "systemctl start tetragon")
-	wait := strings.Index(script, "for TETRAGON_WAIT in 1 2 3 4 5")
+	wait := strings.Index(script, `while [ "$TETRAGON_WAIT" -lt 300 ]`)
 	validation := strings.Index(script, "systemctl is-active --quiet tetragon")
 	exportReady := strings.Index(script, "if [ -e /var/log/tetragon/tetragon.log ]")
 	decision := strings.Index(script, "if [ \"$TETRAGON_READY\" != true ]")
 	agentStart := strings.Index(script, "systemctl enable --now boxedai-guest-agent")
-	if !(boundary < restart && restart < wait && wait < validation && validation < exportReady && exportReady < decision && decision < agentStart) {
-		t.Errorf("Tetragon boundary/restart/validation must precede guest agent start:\n%s", script)
+	if !(boundary < dropIn && dropIn < restart && restart < wait && wait < validation && validation < exportReady && exportReady < decision && decision < agentStart) {
+		t.Errorf("Tetragon boundary/rotation drop-in/restart/validation must precede guest agent start:\n%s", script)
 	}
 }
 
@@ -660,6 +676,10 @@ func TestGenerateBakeLimaYAML_UsesUbuntuImageNoMountsAndSmallDisk(t *testing.T) 
 	if tmpl.Disk != bakeDiskSize {
 		t.Errorf("disk = %q, want %q", tmpl.Disk, bakeDiskSize)
 	}
+	// The bake boot only installs software; it keeps Lima's own sizing.
+	if tmpl.Memory != "" || tmpl.CPUs != 0 {
+		t.Errorf("bake memory/cpus = %q/%d, want Lima's defaults", tmpl.Memory, tmpl.CPUs)
+	}
 }
 
 func TestGenerateBakeLimaYAML_UnsupportedArch(t *testing.T) {
@@ -729,6 +749,9 @@ func TestBakeProvisionScripts_ContainsBakeContent(t *testing.T) {
 		"event: sched_process_fork",
 		"--tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml",
 		"--export-rate-limit=-1",
+		"--export-file-max-size-mb=4096",    // rotation pushed past any real session
+		"--export-file-max-backups=1",       // ... with a bounded disk cost
+		"--export-file-rotation-interval=0", // ... and no time-based rotation
 		"--metrics-server=127.0.0.1:2112",
 		"PATH=/usr/local/lib/tetragon/:",                              // helper lookup
 		"--bpf-lib=/usr/local/lib/tetragon/bpf",                       // explicit service path
@@ -780,6 +803,9 @@ func TestBakeVerificationChecksTetragonRuntimePayloadWhenInstalled(t *testing.T)
 		"--bpf-lib=/usr/local/lib/tetragon/bpf",
 		"--tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml",
 		"--export-rate-limit=-1",
+		"--export-file-max-size-mb=4096",
+		"--export-file-max-backups=1",
+		"--export-file-rotation-interval=0",
 		"--metrics-server=127.0.0.1:2112",
 	} {
 		if !strings.Contains(bakeVerificationScript, want) {

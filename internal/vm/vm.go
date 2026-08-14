@@ -306,7 +306,10 @@ func (b *BakeVM) Verify(ctx context.Context) error {
 	return verifyBake(ctx, b.Name, b.run)
 }
 
-const bakeVerificationScript = `
+// bakeVerificationScript checks the baked unit's ExecStart against the exact
+// shared command line (see tetragonExecStart) rather than a handful of individual
+// flags, so the export rotation pins cannot silently drift out of the golden image.
+var bakeVerificationScript = `
 command -v claude
 command -v codex
 claude --version
@@ -322,10 +325,7 @@ if command -v tetragon >/dev/null 2>&1; then
   test -s /usr/local/lib/tetragon/bpf/bpf_generic_tracepoint_v61.o
   test -s /etc/boxedai/tetragon/boxedai-process-fork.yaml
   grep -F -- 'PATH=/usr/local/lib/tetragon/:' /etc/systemd/system/tetragon.service
-  grep -F -- '--bpf-lib=/usr/local/lib/tetragon/bpf' /etc/systemd/system/tetragon.service
-  grep -F -- '--tracing-policy=/etc/boxedai/tetragon/boxedai-process-fork.yaml' /etc/systemd/system/tetragon.service
-  grep -F -- '--export-rate-limit=-1' /etc/systemd/system/tetragon.service
-  grep -F -- '--metrics-server=127.0.0.1:2112' /etc/systemd/system/tetragon.service
+  grep -F -- 'ExecStart=` + tetragonExecStart + `' /etc/systemd/system/tetragon.service
 fi
 if test -f /usr/local/share/ca-certificates/boxedai-extra-ca.crt; then
   test -s /usr/local/share/ca-certificates/boxedai-extra-ca.crt

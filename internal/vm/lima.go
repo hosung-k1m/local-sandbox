@@ -37,6 +37,19 @@ const agentUID = 4242
 // copy.
 const bakeDiskSize = "20GiB"
 
+// sessionMemory and sessionCPUs size a real session's VM; Lima's own vz defaults
+// (4GiB/4cpu) are not enough. The memory figure has to stay above the workload
+// unit's MemoryMax (8G, from the resolved policy limits — see harnessArgv) with
+// roughly a gigabyte of headroom for the guest kernel, Tetragon, and the
+// supervisor. Otherwise systemd's cgroup limit exceeds the RAM the guest actually
+// has, so a heavy session is killed by the guest's OOM reaper — which looks to the
+// user like the harness crashing — instead of being bounded by the policy. The
+// bake boot keeps Lima's defaults: it only installs software.
+const (
+	sessionMemory = "10GiB"
+	sessionCPUs   = 4
+)
+
 // limaTemplate is the subset of Lima's instance config schema BoxedAi needs.
 // Field names match Lima's own YAML keys exactly.
 type limaTemplate struct {
@@ -51,6 +64,11 @@ type limaTemplate struct {
 	// (omitted) for real sessions, which use Lima's own vz default; set only
 	// for the bake boot (see GenerateBakeLimaYAML / bakeDiskSize).
 	Disk string `yaml:"disk,omitempty"`
+	// Memory and CPUs are Lima's `memory:`/`cpus:` overrides. Set only for real
+	// sessions (see sessionMemory / sessionCPUs); omitted for the bake boot,
+	// which takes Lima's own vz defaults.
+	Memory string `yaml:"memory,omitempty"`
+	CPUs   int    `yaml:"cpus,omitempty"`
 }
 
 type limaImage struct {
@@ -78,7 +96,9 @@ type limaProvision struct {
 // vmType vz on the host's own arch, the pre-baked golden image at
 // cfg.ImagePath (see internal/image) instead of a freshly downloaded Ubuntu
 // image, a writable (or read-only, for the review profile) workspace mount,
-// and, for Claude only, a fresh session-local diagnostics mount. It exposes no
+// and, for Claude only, a fresh session-local diagnostics mount, sized to
+// sessionMemory/sessionCPUs so the guest actually has the RAM the workload unit's
+// MemoryMax assumes. It exposes no
 // other host directory, configures no port forwards, and ends its fast
 // session-only provisioning with the nftables lockdown. It does not touch
 // disk; see WriteLimaYAML.
@@ -123,6 +143,8 @@ func GenerateLimaYAML(cfg Config) (string, error) {
 		MountTypesUnsupported: []string{"reverse-sshfs"},
 		Containerd:            limaContainerd{System: false, User: false},
 		Provision:             provision,
+		Memory:                sessionMemory,
+		CPUs:                  sessionCPUs,
 	}
 	b, err := yaml.Marshal(tmpl)
 	if err != nil {
