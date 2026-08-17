@@ -145,6 +145,9 @@ reproducible-build guarantee that rebuilding produces identical bytes.
   "harness": "claude|codex|exec",
   "profile": "develop",
   "repo_path": "/abs/path",
+  "repository": "git@github.com:owner/name.git",
+  "branch": "main",
+  "commit": "hex40",
   "created_at": "RFC3339",
   "policy_digest": "sha256:...",
   "input_manifest_digest": "sha256:...",
@@ -159,6 +162,10 @@ reproducible-build guarantee that rebuilding produces identical bytes.
   }
 }
 ```
+
+`repository`/`branch`/`commit` are the workspace's git provenance and are omitted
+when the checkout has none to report (no remote, detached HEAD, not a repository);
+`boxedai sessions` and the dashboard's repo › branch grouping read them from here.
 
 ## Policy profiles (internal/policy — scaffolded, do not redesign)
 
@@ -674,9 +681,25 @@ and `Agent` in others — both are in the wild, so both are matched:
 - `harness.task.description` — the harness's one-line description of the spawn.
 - `harness.task.subagent_type` — the subagent type it asked for.
 
-Both are `self_reported` narration used for display-only spawn pairing: the viewer
-pairs a spawn with the child that likely followed it, and the record claims no such
-linkage (nothing correlates a spawn call to a `SubagentStart`).
+Both are `self_reported` narration used for display-only spawn pairing on the
+request side: a `tool.requested` for a spawn call names who asked and what for, but
+not which child it became.
+
+The matching `tool.completed` closes that gap, because Claude Code's spawn tool
+returns the id of the agent it created in its `tool_response`:
+
+- `agent.spawned.native_id` — the harness-native id of the agent the call produced.
+- `agent.spawned.id` — the same id under BoxedAi's deterministic child derivation,
+  so it equals the `agent.id` that child's own `SubagentStart` registered.
+
+Beside the acting agent already stamped in `agent.id`, that single event names both
+ends of a parent→child spawn edge, and it is the only nested-parent signal Claude
+Code supplies (see ownership invariant 4). It is `self_reported` like every hook
+narration, and it is deferred: the spawn call completes after its child registers
+when the spawn is synchronous, but a backgrounded spawn returns
+(`tool_response.status` `async_launched`) before its child's `SubagentStart` has
+been observed. Any consumer must therefore join the edge set-wise, never by
+sequence order — the same rule ownership invariant 8 states for lifecycle events.
 
 The hook also records its own `process.pid`/`process.parent_pid`. When
 authenticated guest-supervisor evidence contains exactly one trusted incarnation
@@ -758,8 +781,23 @@ Ownership invariants (checked offline; a violation is INCOMPLETE, never TAMPER):
    never create a new agent.
 3. Model, tool, and network calls never create an agent.
 4. A Child Agent exists only from `SubagentStart` lifecycle evidence and is closed
-   by the corresponding `SubagentStop`; v0.1 registers every child directly under
-   the Primary because these hooks provide no trusted nested-parent relationship.
+   by the corresponding `SubagentStop`. Every child registers directly under the
+   Primary, so a child spawned by another child is recorded flat rather than
+   nested. That is a property of the hook contract, confirmed against a live
+   nested run: `SubagentStart` stdin carries only `session_id`, `transcript_path`,
+   `cwd`, `prompt_id`, `agent_id`, `agent_type`, and `hook_event_name` — no parent
+   field, a `transcript_path` that is the main session's for every depth, and no
+   spawning `tool_use_id` to join on. The hook process's environment is identical
+   for every agent, and `SubagentStop` adds only the child's own
+   `agent_transcript_path`, itself a flat `subagents/agent-<id>.jsonl`. So at
+   registration time the parent is genuinely unknown, and `agent.parent.id` names
+   the Primary as the honest default rather than a guess. The true edge exists in
+   the record, but only later and elsewhere: the spawning `tool.completed` carries
+   `agent.spawned.id` (see "Harness hook capture"). Reconstructing a nested
+   hierarchy from those edges is a reconciliation derived in verify/view, never a
+   parent claim rewritten on the wire; pairing a spawn to a child by arrival order
+   or timing is rejected outright, since concurrent same-type spawns were observed
+   registering out of call order.
 5. Every child id equals the deterministic derivation of its `native_id`.
 6. Every child has a nonempty `agent.parent.id` referring to an agent in the same
    session; accepted parent links are acyclic and rooted at the Primary. Sequence
@@ -1316,7 +1354,13 @@ projection so live event counts advance. Sealed historical summary rows are
 metadata, manifest-declared OTLP digests are named `declared_segment_digest`, and
 no verifier verdict, chain-valid result, recorder fingerprint, or checks are
 populated. Full event projection and cryptographic verification run on the
-selected `/api/session` payload. `boxedai view <session> --web` remains the single-session viewer. Both viewers show overview header (session, policy,
+selected `/api/session` payload. That per-session payload (and `/api/events` on the
+single-session viewer) carries the session's `state` marker
+(created|running|sealed|incomplete) beside its events, so the client can tell a live
+session from a finished one without inferring it from the stream: a session killed
+before it could emit `session.stopped` leaves no such event to find, and every agent
+still open in it would otherwise read as running forever.
+`boxedai view <session> --web` remains the single-session viewer. Both viewers show overview header (session, policy,
 verdict), timeline table with class badges, event bodies and attributes, action
 and parent-action ids, process tree, file changes, network attempts, and tool
 calls. Every displayed event shows its evidence class. An Agents grouping built
@@ -1325,15 +1369,39 @@ an attribution-strength badge (self-reported children are visibly labeled), the
 harness-declared subagent type, and a lifecycle status (completed, the reported
 outcome, never closed, or running). Children are displayed numbered in
 `agent.started` order ("Child Agent 1 · general-purpose") — a viewer-assigned
-ordinal, since the harness narrates no subagent name and no spawn-call description
-can be tied to a specific child: concurrent same-type spawns were observed
-registering out of call order, and the record contains no spawn↔agent linkage to
-settle it. It always renders two
+ordinal, since the harness narrates no subagent name: concurrent same-type spawns
+were observed registering out of call order, so the ordinal follows the
+registration order the record does carry rather than call order, and stays fixed
+as later evidence arrives. Nesting, by contrast, is DERIVED. `agent.parent.id`
+always names the Primary (ownership invariant 4), so the grouping joins the
+`agent.spawned.id` edges that completed spawn calls carry to the registrations
+they name — set-wise over the whole event list, never by arrival order or
+adjacency, because a synchronous spawn's edge is sequenced after its child
+registered and a backgrounded one before it. A child whose edge is missing (a
+dropped PostToolUse hook — hooks are fail-open) keeps the wire parent and renders
+flat under the Primary; an edge naming an id that never registered is dropped
+rather than inventing an agent; the walk's existing cycle guard and rootless sweep
+still apply. The join is `self_reported` narration joined to `self_reported`
+registration, so it earns no badge and promotes no attribution strength: the same
+trust ceiling, a truer shape. It always renders two
 groups: "Unattributed Workload", now the residue (recordings made before Primary
 attribution, hooks that ran without a Primary id, non-hook workload channels), and
 "BoxedAi Infrastructure" (controller/recorder/supervisor events). A session with no
 agent events shows "no agent decomposition reported", never a fabricated single
-agent. Process-tree nodes are badged by `audit.producer`/`audit.evidence.class`,
+agent.
+
+The Agents tab renders that hierarchy in two sections — "Active Agents" (no closure
+recorded while the session is still live, including an id that carries activity but
+was never registered, which keeps its unregistered badge) and "Past Agents" (closed
+by the harness, plus everything once the session has ended, where a child the harness
+never closed still says so) — and offers a Graph sub-view that draws only the
+currently-active agents as a top-down tree, each node showing its most recent tool
+calls, with the unattributed residue as a dashed satellite connected to nothing. Both
+are presentations of the same grouping: no agent is dropped from the tab, none is
+promoted past `self_reported`, and neither view is gated on verification facets —
+`agent_hierarchy_valid=false` with an INCOMPLETE verdict is the expected shape of a
+real multi-subagent session (hooks are fail-open and get dropped at scale) and must
+still render. Process-tree nodes are badged by `audit.producer`/`audit.evidence.class`,
 so a workload-forged `process.executed` cannot render as a trusted
 kernel-observed process. Verdict output names
 SHA-256, COSE Sign1, EdDSA/Ed25519, the public-key fingerprint, segment/chain
