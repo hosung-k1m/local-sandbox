@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"boxedai/internal/blobstore"
 	"boxedai/internal/broker"
 	"boxedai/internal/evidence"
 	"boxedai/internal/image"
@@ -70,6 +71,10 @@ type RunOptions struct {
 	Profile policy.Profile
 	// ExtraCaps are additional capability flags, e.g. "external-write:github".
 	ExtraCaps []string
+	// SecretGlobs are extra "--secret" globs merged into the profile's
+	// file-capture policy: workspace files they match keep digest-only evidence,
+	// their content is never captured.
+	SecretGlobs []string
 	// Cmd is the shell command for the "exec" harness (required for exec).
 	Cmd string
 	// HarnessArgs are extra argv appended after "claude"/"codex" inside the
@@ -192,7 +197,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if prof == "" {
 		prof = policy.ProfileDevelop
 	}
-	pol, err := policy.Resolve(prof, opts.ExtraCaps)
+	pol, err := policy.Resolve(prof, opts.ExtraCaps, opts.SecretGlobs)
 	if err != nil {
 		return Result{}, err
 	}
@@ -261,11 +266,16 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err != nil {
 		return result, err
 	}
-	counter := newCountingEmitter(rec)
-	emit := func(ev evidence.Event) error { return counter.Emit(evidence.ChannelController, ev) }
-
 	workspace := filepath.Join(sessionDir, workspaceDirName)
 	origWorkspace := filepath.Join(sessionDir, workspaceOrigDirName)
+
+	// Emitter chain, innermost last: recorder <- capture <- counter. Capture sits
+	// directly above the recorder so its host-asserted content-capture stamp lands
+	// on the event before the record is sealed, making capture="full" part of the
+	// signature rather than a claim beside it.
+	capturer := newCaptureEmitter(rec, workspace, blobstore.Dir(sessionDir), pol.FileCapture)
+	counter := newCountingEmitter(capturer)
+	emit := func(ev evidence.Event) error { return counter.Emit(evidence.ChannelController, ev) }
 
 	// Teardown state, declared before the deferred handler so it can observe how
 	// far setup progressed.
