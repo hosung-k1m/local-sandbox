@@ -107,6 +107,84 @@ func TestCheckAgentsHappyPath(t *testing.T) {
 	}
 }
 
+// TestCheckAgentsNestedChainIsDepthGeneric pins that the ownership invariants are
+// stated over the parent graph, not over "child of the Primary": a grandchild
+// naming another child as its parent verifies exactly like a flat one, and the
+// registration order that arrives — a grandchild ahead of its parent, which a
+// backgrounded spawn produces — does not matter, because the checks are set-based
+// (ownership invariant 8). Claude Code's SubagentStart hook supplies no parent, so
+// the guest cannot emit this shape today (invariant 4); the check is the standing
+// guarantee that reconstructing depth from spawn edges would not need verifier
+// surgery to be accepted.
+func TestCheckAgentsNestedChainIsDepthGeneric(t *testing.T) {
+	primaryID := evidence.PrimaryAgentID(agentsTestSession)
+	orchestratorID := evidence.ChildAgentID(agentsTestSession, "orchestrator-1")
+	grandchildID := evidence.ChildAgentID(agentsTestSession, "grandchild-1")
+	records := []record{
+		primaryStartedRec(1, nil),
+		childStartedRec(2, "grandchild-1", orchestratorID),
+		childStartedRec(3, "orchestrator-1", primaryID),
+		agentCompletedRec(4, evidence.ChannelWorkload, grandchildID),
+		agentCompletedRec(5, evidence.ChannelWorkload, orchestratorID),
+		agentCompletedRec(6, evidence.ChannelController, primaryID),
+	}
+	ok, facets, detail := checkAgents(agentsTestSession, records)
+	if !ok {
+		t.Errorf("depth-2 hierarchy rejected: %s", detail)
+	}
+	if facets.count != 3 || !facets.hierarchyValid || facets.openChildren != 0 {
+		t.Errorf("facets = %+v, want 3 agents, valid, no open children", facets)
+	}
+}
+
+// TestCheckAgentsNestedChainAnomalies asserts the anomaly paths stay armed at
+// depth: a grandchild whose parent was never registered is still caught, and a
+// two-child parent cycle that never touches the Primary is still caught. Both are
+// INCOMPLETE-shaped, never TAMPER.
+func TestCheckAgentsNestedChainAnomalies(t *testing.T) {
+	primaryID := evidence.PrimaryAgentID(agentsTestSession)
+	orchestratorID := evidence.ChildAgentID(agentsTestSession, "orchestrator-1")
+	tests := []struct {
+		name    string
+		records []record
+		want    string
+	}{
+		{
+			name: "grandchild names an unregistered parent",
+			records: []record{
+				primaryStartedRec(1, nil),
+				childStartedRec(2, "grandchild-1", orchestratorID),
+				agentCompletedRec(3, evidence.ChannelWorkload, evidence.ChildAgentID(agentsTestSession, "grandchild-1")),
+				agentCompletedRec(4, evidence.ChannelController, primaryID),
+			},
+			want: "names unknown parent",
+		},
+		{
+			name: "two children parent each other, never reaching the Primary",
+			records: []record{
+				primaryStartedRec(1, nil),
+				childStartedRec(2, "a", evidence.ChildAgentID(agentsTestSession, "b")),
+				childStartedRec(3, "b", evidence.ChildAgentID(agentsTestSession, "a")),
+				agentCompletedRec(4, evidence.ChannelWorkload, evidence.ChildAgentID(agentsTestSession, "a")),
+				agentCompletedRec(5, evidence.ChannelWorkload, evidence.ChildAgentID(agentsTestSession, "b")),
+				agentCompletedRec(6, evidence.ChannelController, primaryID),
+			},
+			want: "has a cycle through",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ok, facets, detail := checkAgents(agentsTestSession, tt.records)
+			if ok || facets.hierarchyValid {
+				t.Fatalf("ok/facets = %t/%+v, want the anomaly reported", ok, facets)
+			}
+			if !strings.Contains(detail, tt.want) {
+				t.Errorf("detail = %q, want it to contain %q", detail, tt.want)
+			}
+		})
+	}
+}
+
 func TestCheckAgentsCompletionProducerMustMatchRegistration(t *testing.T) {
 	primaryID := evidence.PrimaryAgentID(agentsTestSession)
 	childID := evidence.ChildAgentID(agentsTestSession, "task-1")
