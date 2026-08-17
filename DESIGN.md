@@ -52,6 +52,7 @@ internal/verify        offline verifier, verdicts
 internal/broker        host HTTP: model proxy, internal tools, external effects,
                        approvals, guest event ingest
 internal/snapshot      APFS-clone workspace snapshot, content manifest, diff, apply
+internal/blobstore     per-session content-addressed store for captured file bytes (unsigned)
 internal/vm            lima template generation, VM lifecycle, provisioning, launch
 internal/view          SQLite projection, CLI timeline, embedded web viewer
 guest/agent            guest supervisor binary (linux/arm64 + linux/amd64)
@@ -60,13 +61,17 @@ internal/vm/provision.go provisioning shell scripts embedded into lima.yaml
 
 Dependency direction (no cycles):
 `cli → setup → {session, image}`; `cli → {session, trustrecord}`;
-`session → {vm, image, snapshot, broker, recorder, trustrecord, view, verify}`; `cli → image`
+`session → {vm, image, snapshot, blobstore, broker, recorder, trustrecord, view, verify}`;
+`cli → image`
 (`build-image` calls it directly); `image → vm` (drives `vm.BakeConfig`/`vm.BakeVM` to
 provision the bake boot); `broker → {evidence, policy}`; `vm → {evidence, policy}`;
-`recorder → evidence`; `trustrecord → evidence`; `verify → {evidence, trustrecord}`
+`recorder → evidence`; `trustrecord → evidence`; `blobstore → evidence`;
+`verify → {evidence, trustrecord}`
 (verify reads raw files; it must NOT import
-recorder internals — independent implementation of digest/signature checking is the
-point); `view → evidence`. `evidence` and `policy` import nothing else in the repo.
+recorder internals, and for the same reason must NOT import `blobstore` — an
+independent implementation of digest/signature checking, and of blob addressing, is
+the point); `view → {evidence, session, verify, blobstore, policy, snapshot}`.
+`evidence` and `policy` import nothing else in the repo.
 
 ## Host filesystem layout
 
@@ -84,6 +89,8 @@ State root `~/.boxedai/` (override: env `BOXEDAI_HOME`):
     trust-record.json          signed session trust record (new v2 grants; see below)
     policy.json                resolved policy manifest (canonical JSON)
     workspace/                 APFS clone of the repo, mounted rw into the VM
+    workspace.orig/            pristine session-start clone, never mounted; baseline for
+                               workspace.diff and the viewer's /api/filediff
     harness-home/              guest-mounted fresh Claude/Codex home and selected global instructions
       settings.json            BoxedAi-authored Claude hook wiring (lefthook/righthook; never host-copied)
       debug/claude-code.log    native verbose debug log
@@ -100,6 +107,8 @@ State root `~/.boxedai/` (override: env `BOXEDAI_HOME`):
       segment-000001.otlp           length-delimited OTLP LogRecords (raw, authoritative)
       segment-000001.manifest.json  segment manifest (canonical JSON)
       segment-000001.manifest.cose  COSE Sign1 over the manifest bytes
+    blobs/sha256/<hex>         captured workload file bytes, named by the signed digest
+                               they hash to (unsigned side artifact; created on first capture)
     projection/timeline.sqlite      disposable, rebuilt from evidence at view time
     vm/lima.yaml               generated lima instance config
     vm/serial.log              guest console log if available
@@ -164,6 +173,45 @@ is present by default only in `develop`; it can be added to another profile via
 `--cap external-write:<adapter>`. No root/unrestricted-internet
 profile exists.
 
+The resolved policy also carries the host-side file-capture rules (see "File content
+capture"), so the rules in force are covered by the `audit.policy.digest` stamped on
+every record rather than living in a separate, unattested config:
+
+```json
+{"file_capture": {
+  "max_bytes": 8388608,
+  "secret_globs": [".env*", "*.pem", "*.key", "*.p12", "*.pfx", "id_rsa*", "id_ed25519*"],
+  "exclude_dirs": ["node_modules", "vendor", ".venv", "venv", "target", "build", "dist",
+                   "__pycache__", ".gradle"]}}
+```
+
+The defaults are identical in all three profiles: the profiles differ in what the
+agent may reach, not in what an observer may later read back. `boxedai run --secret
+<glob>` (repeatable) appends to a profile's secret globs; it never removes a default,
+and there is no flag to widen capture. Every supplied glob is dry-run through
+`path.Match` while the policy resolves, so a malformed pattern fails the session at
+resolution instead of silently matching nothing at capture time — a glob the operator
+believes is protecting a key file but that quietly matches nothing is a secret leak,
+not a cosmetic error.
+
+Matching semantics are user-facing policy behavior, not an implementation detail. A
+secret glob containing `/` is matched against the whole workspace-relative path, so a
+rule can be scoped to a subtree (`deploy/*.json`); a glob without `/` is matched
+against the base name alone, so `.env*` catches `.env.local` at any depth — which is
+what a bare filename pattern is expected to mean, and what `path.Match` over the full
+path would NOT do, since its `*` never crosses `/`. An `exclude_dirs` entry is a plain
+directory name compared exactly against each path segment: never a glob, never a path.
+`build` therefore excludes `build/out.js` and `app/build/out.js`, at any nesting depth,
+but not `buildscripts/main.go`.
+
+`max_bytes` MUST equal the guest scanner's digest cap (`fileDigestCapBytes` in
+`guest/agent/filewatcher.go`, 8 MiB). The scan digest attests only the first 8 MiB of a
+file, so content captured past that bound could never be checked against the digest the
+`file.changed` record carries — it would be bytes in the store that no signed evidence
+vouches for. Changing one cap without the other silently manufactures unverifiable
+content, and the coupling is also what makes a capture-time hash mismatch mean
+"the file changed" rather than "the two sides hashed different amounts of it".
+
 ## Evidence model (internal/evidence — scaffolded, do not redesign)
 
 Events are OTLP `logs.v1.LogRecord`s. `EventName` = catalog name. Session=trace, tool
@@ -217,7 +265,11 @@ effect.denied effect.dispatched effect.completed effect.failed credential.issued
 credential.revoked sensor.started sensor.loss sensor.restarted segment.sealed`.
 
 Signed evidence content capture defaults to `redacted` metadata + sha256 digests; the
-broker's model evidence stores digest + token counts + model id only. Token usage is
+broker's model evidence stores digest + token counts + model id only. The one record
+that carries `audit.content.capture=full` is a `file.changed` whose bytes the host
+stored (see "File content capture"), and even there the value names a blob in an
+unsigned side store — no workload content of any kind is ever written into a signed
+OTLP segment. Token usage is
 parsed from both plain-JSON and SSE-streaming response bodies (Anthropic
 `message_start`/`message_delta` usage, OpenAI chat-completions and Responses API
 usage) and recorded on `model.completed` as `llm.usage.input_tokens` /
@@ -286,19 +338,46 @@ schema, key, signature, semantic, and independent cross-derivation gates;
 (12) when agent tracking is present, the hierarchy reconstructed from the signed
 segments satisfies the ownership invariants (see "Agent hierarchy and
 attribution") — hierarchy anomalies and unattributed workload in a
-capability-gated category are INCOMPLETE, never TAMPER.
+capability-gated category are INCOMPLETE, never TAMPER;
+(13) `file-content-store`: every kernel-observed `file.changed` stamped
+`audit.content.capture=full` resolves in the unsigned per-session blob store and
+re-hashes to the digest its sealed segment signed (see "File content capture"). The
+number is its position in this list; the verifier emits it directly after check (10),
+before the trust-record and agent checks. The verifier re-derives the blob path
+and the hash itself and must NOT import `internal/blobstore`: a check that resolves a
+blob through the code that wrote it proves only that the code is self-consistent. Only
+`guest_supervisor`/`kernel_observed` records are counted, so workload narration cannot
+move the content facets. A session that captured nothing and has no store passes with
+an explicit skip; a store directory holding blobs no signed event points at is
+reported, never judged — unreferenced bytes make no claim.
 
 Verdicts: `LOCAL_ONLY` (all checks pass; ceiling in v0.1), `INCOMPLETE` (missing
-close/seal, sensor loss, unresolved tail, or an invalid agent hierarchy),
+close/seal, sensor loss, unresolved tail, an invalid agent hierarchy, or a captured
+blob that is absent or unreadable),
 `BYPASS_DETECTED` (flow invariant violated), `TAMPER_SUSPECTED`
-(signature/digest/sequence/grant/trust-record inconsistency — all host-side
-artifacts). No workload-forgeable input maps to `TAMPER_SUSPECTED`: the distrusted
+(signature/digest/sequence/grant/trust-record inconsistency, or a blob present under a
+digest it does not hash to — all host-side
+artifacts). The two content failures are deliberately split: the store is unsigned and
+derivable, so a pruned, lost, or never-written blob forges nothing and costs only
+inspectability — history degrades honestly and must not be dressed up as an attack —
+whereas a blob that is present while hashing to something other than its signed digest
+is an artifact wearing a verified label while being something else. That is the
+output-manifest mismatch class, and content addressing proves it without key material.
+The store sits beside the mounted workspace rather than inside it and no guest mount
+reaches it, so the existing rule stands unchanged.
+No workload-forgeable input maps to `TAMPER_SUSPECTED`: the distrusted
 workload can force at most `INCOMPLETE`, never brand its own session host-tampered.
 `VERIFIED` is unreachable in v0.1 and the verifier must say why when asked.
 Also report facets: signature validity, chain validity, sequence continuity, close
 status, sensor-loss count, ungated-activity count, trust-record status/profile,
 trust-record signature validity, cross-derivation status, agent tracking, agent
-count, agent-hierarchy validity, unattributed-workload count, and assurance level.
+count, agent-hierarchy validity, unattributed-workload count, captured-content count,
+content withheld by policy, content capture misses, content-store validity, and
+assurance level. `file_content_store_valid` is true only when every claimed blob is
+both present and correct, so it reads false for a merely incomplete store as well as a
+wrong one; the three counts are what say which. All four are omitted from the CLI
+summary when the session neither captured nor declined to capture anything, where four
+zeroes would read as a finding rather than as the feature's absence.
 
 ## Session trust record (boxedai.trust-record/v1)
 
@@ -780,6 +859,107 @@ and cgroup-joined ingestion that would raise the
 process-level ceiling are deferred (no Tetragon cgroup export exists for a
 non-containerized workload at any current version).
 
+## File content capture (internal/session, internal/blobstore)
+
+The guest's periodic workspace scan reports that a file changed and what it hashes to;
+it never ships the bytes. Host-side content capture is what turns that digest into
+something a reader can open. At evidence ingest — before the record is sealed — the
+host reads the changed file out of its own view of the session workspace and stores
+the bytes in the session's content-addressed store.
+
+`captureEmitter` (`internal/session/capture.go`) sits in the emitter chain directly
+above the recorder: innermost last, `recorder ← capture ← counter`. Every producer
+reaches it, including the broker's `POST /v1/events` ingest handler, and its stamp
+lands on the event before the recorder assigns `audit.sequence` and appends the record
+to the WAL. It touches exactly one shape of event: a `file.changed` arriving on the
+`guest_supervisor` channel. `file.deleted` carries no content, and a `file.changed` on
+any other channel is workload narration rather than an observation of the workspace,
+where a host capture stamp would not be the producer's to make. Nothing else about an
+event is dropped, reordered, or rewritten, and no capture problem can fail an `Emit` —
+only the inner emitter's error propagates. A signed record of the change must flow
+even when its bytes could not be kept, because that is precisely the case where an
+observer most needs the record.
+
+Who claims what. `audit.content.digest` stays the GUEST's `kernel_observed` claim:
+capture never recomputes it, never overwrites it, and never invents one where the guest
+left none — an event missing `file.path` or the digest passes through unstamped, since
+a reason there would describe the host's confusion rather than the capture policy.
+`audit.content.capture`, `file.size`, and `file.capture.reason` are the HOST's own
+assertion about an action the host itself performed, stamped before sealing so they
+ride inside the signature instead of beside it. That is what makes `capture="full"` a
+checkable claim rather than a note: the blob it names must exist and must still hash to
+the signed digest, which is exactly what verifier check (13) enforces.
+
+Outcome vocabulary. `audit.content.capture` flips from the guest's `digest_only` to
+`full`, and `file.size` is added, only when the bytes actually reached the store.
+Otherwise the guest's `digest_only` stands and `file.capture.reason` records which of
+two very different things happened. The ladder is evaluated in this order:
+
+| `file.capture.reason`    | Meaning                                                                 |
+|--------------------------|-------------------------------------------------------------------------|
+| `secret_policy`          | the path matches a secret glob; the file is never opened                |
+| `excluded_by_policy`     | the path lies under an excluded directory; the file is never opened     |
+| `read_error`             | the host refused or failed the read: a `file.path` that is not workspace-local, or an I/O error |
+| `missing_before_capture` | the file was gone by the time capture read it                          |
+| `size_cap`               | the file is larger than `max_bytes`                                     |
+| `changed_before_capture` | the bytes read do not hash to the digest the guest recorded            |
+| `store_error`            | the blob store refused or failed the write                             |
+
+The first two are decided before the file is opened at all: a secret's bytes must not
+be read into the host process merely to be discarded, and an excluded tree's churn
+should cost no I/O to ignore. Locality is checked on the converted path *before* the
+join, because an authenticated channel is not a containment argument — a `..`, an
+absolute path, or a volume name must never be opened by the host no matter who sent it,
+and that is a read the host refused rather than content it withheld. `read_error` is
+therefore the one reason reached from two places: a path the host refuses to open, and
+a read that fails once opened.
+
+The vocabulary splits in two, and the verifier counts the halves separately.
+`secret_policy`, `excluded_by_policy`, and `size_cap` are policy WITHHOLDING: capture
+could have run and deliberately did not, so the store is complete with respect to what
+it was allowed to hold (`size_cap` belongs here because `max_bytes` is a policy number,
+not an I/O accident). `changed_before_capture`, `missing_before_capture`, `read_error`,
+and `store_error` are capture MISSES: the host meant to store the bytes and could not,
+so the store holds less than the session intended. Either way the change stays fully
+attested — the digest is on the signed record — which is why this mechanism withholds
+content, never evidence.
+
+The scan → ingest window is real and is reported honestly rather than papered over. The
+guest hashes a file during its ~2s scan tick; the host reads it milliseconds later, by
+which time the file may have changed again (`changed_before_capture`) or been removed
+(`missing_before_capture`). Those are races, not faults, and they self-heal: if the file
+still exists in some state, the next scan tick emits a fresh `file.changed` and capture
+gets another attempt against a digest that matches. Because `max_bytes` equals the
+guest's digest cap, any file small enough to capture was hashed whole by the guest too,
+so a hash mismatch means the file genuinely changed — never that the two sides hashed
+different amounts of the same file.
+
+The store (`internal/blobstore`) is one file per blob at
+`<sessionDir>/blobs/sha256/<64 lowercase hex>`, blobs 0600 under 0700 directories like
+the rest of the session directory. Writes are atomic (temp file, fsync, rename) so a
+crash mid-capture leaves either no blob or a complete one, never a truncated file
+wearing a verified name; the directory entry is deliberately not fsynced, because a blob
+lost to a host crash is a capture that simply did not happen, which an unsigned store
+tolerates. `Put` is idempotent and rejects content that does not hash to its key — a
+blob filed under a name it does not hash to would resolve, look verified, and be wrong.
+`Get` re-verifies on the way out, so serving unverified bytes under a verified label is
+impossible by construction. The algorithm subdirectory leaves room for a second digest
+algorithm beside `sha256` without a migration. There is no global cache and no
+cross-session dedup: workload file content is session-scoped data and must not outlive,
+or leak between, sessions. The store materializes on the first successful capture, so a
+session that captured nothing simply has no `blobs/` directory.
+
+What is NOT claimed. Content bytes NEVER enter a signed OTLP segment. A segment carries
+the guest's digest and the host's capture stamp; the bytes live beside it in an
+unsigned side artifact anchored to the signed stream by nothing but the digest they
+hash to. Nothing in the store is COSE-signed and nothing in it is required for a
+session to verify: losing it costs a reader the ability to see what a file contained
+and takes nothing away from the record. Tampering with it needs no key material to
+detect — rehash and compare against the signed digest — and a modified blob simply
+stops resolving. Capture is also not a read sensor: it observes only what the scan
+reported as changed, so files the agent merely read remain invisible until an LSM read
+policy ships.
+
 ## Snapshot / workspace (internal/snapshot)
 
 - `Snapshot(repo, dest) error` — APFS clone via `cp -Rc` (fallback plain copy),
@@ -791,6 +971,15 @@ non-containerized workload at any current version).
   lists + unified text diff for text files (use `git diff --no-index` against the
   input snapshot copy held in a temp location — v0.1 keeps a second pristine clone at
   `workspace.orig/` for diffing, cheap because APFS COW).
+- `DiffContents(relPath string, from, to []byte) (string, error)` — the per-file
+  counterpart for callers holding content rather than two trees (the viewer's
+  `/api/filediff`): both sides are written to a 0700 temp directory, removed on every
+  return, and diffed with the same `git diff --no-index`, with the temp paths rewritten
+  back to `relPath` in the headers. An empty side is written as a real empty file
+  rather than special-cased, so a creation renders as all-additions and a deletion as
+  all-deletions; the cost is that the result is a plain content diff carrying no "new
+  file mode"/"deleted file mode" metadata. Nothing produced here is meant to be
+  applied — that is `Apply`'s job, from the whole-tree `workspace.diff`.
 - `Apply(sessionDir, repoPath) error` — apply `workspace.diff` via `git apply` (or
   file copy for binaries); refuse if repo dirty; explicit command only.
 
@@ -1028,7 +1217,9 @@ Startup order (fail-closed at every step):
    clear "run `boxedai build-image` first" error before anything else is set up.
 2. Validate harness/repo/profile → resolve policy → write policy.json.
 3. Mint IDs + tokens; LoadOrGenerateKey; NewRecorder (records the resolved image's
-   `Tag`/`DiskDigest` as `VMImage`/`VMImageDigest`); emit session.granted (grant
+   `Tag`/`DiskDigest` as `VMImage`/`VMImageDigest`); build the emitter chain around it
+   (`recorder ← capture ← counter`, so the content-capture stamp lands before sealing —
+   see "File content capture"); emit session.granted (grant
    digest — the grant itself also carries `vm_image`/`vm_image_digest`), policy.loaded.
 4. Snapshot a local repo, or fresh-clone the requested remote branch, into `workspace`;
    record remote/branch/commit provenance in `session.json`; copy only supported
@@ -1078,8 +1269,8 @@ boxedai build-image [--arch arm64|amd64]  build/rebuild the golden VM image (req
             before `run` will work, and again after upgrading); default arch is the host's
 boxedai run <claude|codex|exec> [path] [--profile develop|review|restricted]
             [--repo <remote> [--branch <branch>]]
-            [--cap external-write:github] [--cmd '...' (exec only)] [--keep-vm]
-            [-- harness-args...]
+            [--cap external-write:github] [--secret <glob>] [--cmd '...' (exec only)]
+            [--keep-vm] [-- harness-args...]
 boxedai sessions            list sessions + state + verdict cache
 boxedai view <session> [--web [--addr]]   timeline (evidence-class badges) / web UI
 boxedai diff <session>      show workspace.diff
@@ -1151,6 +1342,78 @@ unsealed `.otlp` tail is explicitly marked provisional; the UI must not imply
 that open-segment events are signed before their manifest and COSE Sign1 sidecar
 exist.
 
+Two endpoints hand back workload bytes rather than evidence metadata (see "File
+content capture"). Both are registered on both muxes, are GET-only, and answer
+`Cache-Control: no-store` — this is the content of files from someone's workspace and
+it must not outlive the session directory in a proxy or an on-disk browser cache. The
+dashboard resolves the session from the same `?id=<session>` its timeline fetch uses,
+with the same "not a session id is 400, missing directory is 404" behavior; the
+single-session viewer is already bound to one directory and takes no id.
+
+- `GET /api/blob?digest=sha256:<64 hex>` — one captured blob's raw bytes as
+  `application/octet-stream` with `X-Content-Type-Options: nosniff`, so a browser can
+  never be talked into rendering captured workload content as HTML or script inside
+  the viewer's own origin. A malformed digest is 400, a digest nothing captured is 404
+  (expected, not exceptional — the capture policy declines files whose `file.changed`
+  events still carry a digest), and a blob that no longer hashes to its own name is 500.
+- `GET /api/filediff?path=&from=&to=` — `{path, from, to, diff}` as JSON. `from` is
+  `baseline` (the session-start copy) or a blob digest; `to` is `empty` (a deletion) or
+  a blob digest. The vocabularies are closed sets, so everything a client can ask for is
+  either content the session already captured under its own policy, or content that
+  policy is re-checked against here before it is read.
+
+`/api/blob` needs no policy read: the store can only hold what the capture policy
+already allowed into it, so a digest that resolves is by construction content the
+session consented to keep. `/api/filediff` can reach past the store into
+`workspace.orig`, so it gates on the session's own `policy.json` — never a viewer
+default, and an
+unreadable or unparsable policy is a hard failure rather than a fallback, since serving
+content under rules the session never agreed to is exactly the outcome the gate exists
+to prevent. A policy with no `max_bytes` is a session recorded before content capture
+existed, and it never consented to have workspace content served back, so `/api/filediff`
+answers 403; that is what closes the legacy read path into a `workspace.orig` sitting on
+disk regardless. A path the session's own policy classifies as secret is likewise 403
+even though `workspace.orig` still holds its session-start copy: withholding only counts
+if it also holds on the read side, or a baseline diff would hand back the very `.env` or
+private key capture refused to keep. `from=baseline` reads through `os.OpenRoot` rather
+than a bare join — the validated path settles the literal string but says nothing about
+symlinks, which `workspace.orig` preserves verbatim from the snapshot, and rooting the
+open is what makes "workspace-relative" true of the bytes actually read. A missing file,
+or a session directory with no `workspace.orig` at all, is empty content rather than an
+error (a path created during the session has no session-start version, and a new-file
+diff is what happened); a baseline larger than the capture cap is 422 rather than a
+silent truncation, because half a file rendered as a diff misrepresents the change.
+Diffs are computed on demand by `snapshot.DiffContents` and are never stored, never
+digested, and never signed.
+
+What the UI may claim. Both endpoints re-hash a blob on the way out, so bytes served
+under a digest are bytes that still hash to a digest a sealed segment recorded. A diff
+is a derived view between two endpoints and is trustworthy exactly as far as both of
+those endpoints verify: blob↔blob is anchored at both ends, blob↔`empty` trivially at
+one, and blob↔`baseline` only at the captured end — `workspace.orig` is an unsigned
+host-side copy that the viewer does not re-check against `input-manifest.json`. The
+diff text itself is derived at request time and is signed by nothing.
+
+The Files tab's latest-per-path rows expand into that path's version history: every
+`file.changed`/`file.deleted` carrying that exact `file.path`, newest first, derived
+entirely client-side from events already loaded and deliberately ignoring the tab's
+active filter — the diff base must be resolved against every version, not the visible
+ones. Each version shows its sequence, digest, observer, and a capture chip:
+`content · <size>` when `audit.content.capture=full`, the policy reason when the bytes
+were withheld (secret, excluded, and oversized read muted; a lost scan race reads as a
+warning; a read or store failure as serious), an unrecognized `file.capture.reason`
+reported as an unexplained non-capture rather than flattened into "digest only", and
+plain "digest only" for a session that recorded no capture at all. A version's diff is
+fetched only when a reader opens it — one version at a time, cached per path+from+to,
+dropped whenever the view switches sessions — because what comes back is captured
+workload content. Its base is the nearest OLDER captured version of the same path, else
+the session-start baseline, and the header states how many uncaptured versions the diff
+jumps over instead of implying a change-by-change history. Diff rendering is bounded
+(600 lines, tail dropped with a visible note), every line is escaped before it reaches
+the DOM, and git's binary-content marker is lifted out as a plain note rather than
+rendered as a diff body, which would imply the bytes are renderable text. A file
+event's Timeline detail row offers a "file history" jump into that path's expansion.
+
 ## Failure behavior (binding)
 
 | Condition                          | Response                                   |
@@ -1166,6 +1429,8 @@ exist.
 | Kill switch                        | Revoke → freeze → seal → destroy           |
 | Crash/missing seal                 | session.state=incomplete; verify=INCOMPLETE|
 | Invalid agent hierarchy            | Facets + verify=INCOMPLETE (never TAMPER)  |
+| Captured blob absent/unreadable    | Facets + verify=INCOMPLETE (signed digests stand) |
+| Captured blob digest mismatch      | TAMPER_SUSPECTED (host-side artifact)      |
 
 ## Known gaps (v0.1, keep this list honest)
 
@@ -1208,6 +1473,24 @@ exist.
   written to the old file between the last read and the reattach are not recovered.
 - Live file.changed granularity is the 2s scan interval; changes fully created and
   deleted within one interval are only caught by the authoritative final diff.
+  Per-version content capture inherits that granularity exactly: a version the scan
+  never saw has no digest, therefore no blob and no row in the viewer's file history,
+  so the version list is the scan's view of a file's history and not every write to it.
+- Persisting workload file content is a policy-gated decision, not a default of the
+  evidence model. Captured bytes sit unsigned at 0600 inside the session directory and
+  are deleted with it; secret globs withhold by digest only, so the change stays
+  attested while the bytes never leave the workspace. The globs are a name-shaped
+  heuristic: a credential in a path the defaults (and any `--secret`) do not name is
+  captured like any other file.
+- The blob store can be pruned or lost at any time. That degrades the verdict to
+  INCOMPLETE and flips `file_content_store_valid` — never silently — while the signed
+  digests still stand, so history remains intact and merely becomes less inspectable.
+- Capture races the workload rather than locking against it. A file rewritten faster
+  than the host reads it records `changed_before_capture`/`missing_before_capture` and
+  may never be captured at any version, even though every version's digest is on the
+  record. The race self-heals only while the file still exists to be re-scanned.
+- Content under an excluded directory is never in the store at any version; the only
+  view of what changed there is the authoritative final `workspace.diff`.
 - Evidence at rest is not encrypted (FileVault assumed).
 - VM image digest is verified for LOCAL integrity only: `image.Resolve` recomputes the
   on-disk `disk.img`'s sha256 against `manifest.json` on every `run`, catching
