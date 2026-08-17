@@ -310,6 +310,7 @@ function defaultState() {
     errorsOnly: false,
     filesMode: "latest", // "all" | "latest"
     actionsMode: "chain", // "flat" | "chain"
+    agentsMode: "list", // Agents tab sub-view: "list" | "graph" (in-memory only, like the two modes above — see serializeStateForHash)
     expandedSeqs: new Set(),
     expandedActionGroups: new Set(), // Actions-tab chain groups expanded (in-memory only, not URL-persisted)
     // Files-tab per-path expansion, per-version diff expansion, and the
@@ -1814,14 +1815,25 @@ function agentStrengthChip(meta) {
 
 // computeAgentGroups buckets the visible events by the agent responsible for
 // them. Agent metadata (role/strength/native id/type) is read from ALL
-// agent.started events in the model, and closure state from ALL agent.completed
-// events, so a group still labels correctly when a filter hides the registration
-// itself. Ordering: Primary first, then agents by registration seq.
+// agent.started events in the model, closure state from ALL agent.completed
+// events, and nesting from ALL spawn edges (agent.spawned.id on a completed spawn
+// call), so a group still labels and nests correctly when a filter hides the
+// registration itself. Ordering: Primary first, then agents by registration seq.
 function computeAgentGroups(ctx, indices, seedAllAgents) {
   var model = ctx.model;
   var meta = new Map(); // agent.id -> {role, strength, nativeID, parentID, type, seq, completed, outcome, num}
   var completions = new Map(); // agent.id -> agent.outcome, applied after the scan
-  var sessionEnded = false;
+  var spawnEdges = new Map(); // spawned agent.id -> spawning agent.id, applied after the scan
+  // "Has this session ended" decides whether an unclosed agent is still running
+  // or was never closed, so it is answered from the server's own lifecycle
+  // marker first (webPayload.state, read from session.state: created|running|
+  // sealed|incomplete) and from the event stream second. The event-presence
+  // check stays as a fallback because the two disagree in both directions: a
+  // session killed before it could emit session.stopped carries no such event
+  // (and would otherwise look live forever), while a payload from a viewer
+  // built before `state` existed carries no state at all.
+  var lifecycle = ctx.payload ? ctx.payload.state : "";
+  var sessionEnded = lifecycle === "sealed" || lifecycle === "incomplete";
   for (var i = 0; i < model.events.length; i++) {
     var ev = model.events[i];
     if (ev.name === "session.stopped" || ev.name === "session.sealed") { sessionEnded = true; continue; }
@@ -1829,6 +1841,21 @@ function computeAgentGroups(ctx, indices, seedAllAgents) {
       var doneID = attrRaw(ev, "agent.id");
       if (doneID && !completions.has(doneID)) completions.set(doneID, attrRaw(ev, "agent.outcome") || "");
       continue;
+    }
+    // A completed spawn call carries agent.spawned.id — the id of the agent that
+    // call created — beside the acting agent's own agent.id. That one event names
+    // both ends of a parent→child edge, and it is the ONLY nested-parent signal
+    // Claude Code supplies: agent.parent.id on agent.started always names the
+    // Primary, because SubagentStart's stdin has no parent field at all (DESIGN.md
+    // ownership invariant 4). Collected here, joined set-wise below.
+    var spawnedID = attrRaw(ev, "agent.spawned.id");
+    if (spawnedID) {
+      var spawnerID = attrRaw(ev, "agent.id");
+      // First edge wins. Two events naming the same spawned id is a contradiction
+      // the record cannot resolve (both are self_reported narration and neither
+      // is more authoritative), so the tab picks one deterministically — scan
+      // order over a fixed event list — rather than letting the last writer win.
+      if (spawnerID && !spawnEdges.has(spawnedID)) spawnEdges.set(spawnedID, spawnerID);
     }
     if (ev.name !== "agent.started") continue;
     var id = attrRaw(ev, "agent.id");
@@ -1855,6 +1882,33 @@ function computeAgentGroups(ctx, indices, seedAllAgents) {
     if (!m) return;
     m.completed = true;
     m.outcome = outcome;
+  });
+  // The spawn edges are joined the same way and for the same reason: arrival
+  // order proves nothing in EITHER direction. A synchronous spawn's tool.completed
+  // is sequenced after the child's agent.started, while a backgrounded one
+  // (tool_response.status "async_launched") returns before its child has
+  // registered at all — an edge at seq 1390 whose child registered at 1392 was
+  // observed in a live run. So the join is set-wise over the whole scan, never
+  // "the agent.started nearest this event" (DESIGN.md ownership invariant 4:
+  // pairing a spawn to a child by arrival order or timing is rejected outright).
+  //
+  // This is derived, not claimed: self_reported spawn narration joined to
+  // self_reported registration is still self_reported, so nothing here promotes an
+  // agent's attribution strength or earns a new badge — the tree simply stops
+  // pretending twelve grandchildren were the Primary's own children. A child with
+  // no edge (its PostToolUse hook was dropped — hooks are fail-open) keeps the
+  // wire parent and stays flat under the Primary, exactly as before.
+  spawnEdges.forEach(function (spawnerID, childID) {
+    var m = meta.get(childID);
+    // An edge naming an id that never registered invents no agent, the same rule
+    // an orphan agent.completed gets above.
+    if (!m) return;
+    // An unregistered spawner is not better information than the parent the record
+    // does carry, and a self-edge is not a parent at all: in both cases the wire
+    // parent stands. Every other malformed shape (a cycle through two real agents,
+    // a component with no root) is still caught by the walk's own guards below.
+    if (!meta.has(spawnerID) || spawnerID === childID) return;
+    m.parentID = spawnerID;
   });
   // Number the registered children 1..N in agent.started order so the UI can name
   // them stably. Registration order — not arrival order of their activity — because
@@ -2092,6 +2146,16 @@ function updateActionsTab(ctx) {
 // collapsed), agent blocks here default OPEN — glanceability is the point —
 // and the Infrastructure bucket is intentionally never shown (locked
 // design: agent activity only, not BoxedAi's own plumbing).
+//
+// The tab has two sub-views over that one grouping: the default List, which
+// renders the whole hierarchy split into "Active Agents" (still running) and
+// "Past Agents" (closed, or everything once the session ended), and a Graph
+// (internal/view/agentgraph.js) that draws only the currently-active agents.
+// Both are presentations of the same evidence — neither filters it, neither
+// asserts anything the harness did not narrate, and neither is gated on
+// verification facets: an INCOMPLETE verdict with agent_hierarchy_valid=false
+// is the EXPECTED shape of a real multi-subagent session (dropped hooks at
+// scale) and must still render.
 
 // AGENTS_TAB_COLLAPSE_PREFIX namespaces this tab's collapse-tracking within
 // the SHARED ctx.state.expandedActionGroups Set. The Actions tab's by-agent
@@ -2163,9 +2227,17 @@ function agentActivityLineHtml(ctx, i) {
   // Prefer the salient argument; fall back to the description (a Task spawn has
   // only a description, no command/path/pattern/url) so its line stays labeled.
   var textVal = summary.text || summary.desc;
+  // Both branches use the SAME agent-line-text/ellipsis wrapper as the direct
+  // flex child, with .empty nested one level deeper for the no-argument case,
+  // never handed to the flex row bare: .agent-line-row is a flex container, so
+  // a bare .empty span there is blockified and picks up .dash-main .empty's
+  // unrelated 24px padding (meant for its own "Select a session." placeholder)
+  // in full, roughly doubling this one row's height when the tab is viewed
+  // inside the embedded dashboard. Nesting keeps .empty a plain inline span,
+  // exactly like the graph ticker/popover already do (agentgraph.js).
   var textHtml = textVal
     ? '<span class="agent-line-text ellipsis">' + esc(textVal) + "</span>"
-    : '<span class="empty">(no argument)</span>';
+    : '<span class="agent-line-text ellipsis"><span class="empty">(no argument)</span></span>';
   var html =
     '<tr class="clickable agent-line" data-seq="' + ev.seq + '">' +
       '<td colspan="6">' +
@@ -2237,22 +2309,108 @@ function agentUnattributedBlockHtml(ctx, g, decompositionUnavailable) {
     "</div>";
 }
 
+// agentIsActive is the single "is this agent live right now" predicate, shared
+// by the list view's Active/Past split and by the graph sub-tab (handed over as
+// api.agentIsActive) so the two views can never disagree about who is running.
+//
+// An agent id carrying activity but no registration (meta undefined) counts as
+// ACTIVE while the session is live: it is emitting actions and the record
+// contains no closure for it, so calling it "past" would assert an ending the
+// harness never narrated. It keeps its "unregistered" chip either way. Once the
+// session itself has ended nothing is live — including those unregistered ids
+// and any child the harness never closed.
+function agentIsActive(m, sessionEnded) {
+  if (sessionEnded) return false;
+  return !m || !m.completed;
+}
+
+// partitionAgentGroups splits computeAgentGroups' pre-order forest walk into the
+// two rendered sections. Splitting one walk into two lists breaks its
+// parent-before-child adjacency, so indentation is recomputed PER SECTION rather
+// than carried over from the walk: an agent whose parent landed in the other
+// section (or is not rendered above it at all) becomes a root of its own section,
+// and everything below it follows, so a re-rooted parent never leaves its own
+// subtree floating at an indent level that points at nothing.
+//
+// The walk is pre-order, so a parent in the same section has always been placed
+// before its children and its rendered depth is known; the only entries that miss
+// that lookup are the ones the walk itself rescued (a cycle or a rootless
+// component visited out of order), which correctly start at depth 0. Now that
+// nesting is derived from spawn edges this is N-level generic and routinely
+// exercised: a mid-tree agent completing while its children still run puts a
+// depth-2 subtree in Active whose parent sits in Past.
+function partitionAgentGroups(info) {
+  var sectionOf = new Map(); // agent id -> "active" | "past"
+  info.agentGroups.forEach(function (og) {
+    sectionOf.set(og.group.key, agentIsActive(info.meta.get(og.group.key), info.sessionEnded) ? "active" : "past");
+  });
+  var active = [], past = [];
+  var renderedDepth = new Map(); // agent id -> its indent depth WITHIN its own section
+  info.agentGroups.forEach(function (og) {
+    var key = og.group.key;
+    var section = sectionOf.get(key);
+    var m = info.meta.get(key);
+    var parentID = m ? m.parentID : "";
+    var nested = parentID && sectionOf.get(parentID) === section && renderedDepth.has(parentID);
+    var depth = nested ? renderedDepth.get(parentID) + 1 : 0;
+    renderedDepth.set(key, depth);
+    (section === "active" ? active : past).push({ group: og.group, depth: depth });
+  });
+  return { active: active, past: past };
+}
+
+// agentsSectionHdrHtml renders one section banner, reusing the sidebar's
+// group/section header look (.group-hdr/.section-hdr) with an agents-prefixed
+// class for this tab's wider gutter.
+function agentsSectionHdrHtml(title, count, note) {
+  return '<div class="group-hdr section-hdr agents-section-hdr">' +
+    '<span class="group-name">' + esc(title) + "</span>" +
+    (note ? '<span class="meta agents-section-note">' + esc(note) + "</span>" : "") +
+    '<span class="group-count">' + numFmt(count) + "</span>" +
+    "</div>";
+}
+
+// agentsModeSwitchHtml is the List/Graph sub-view switch, following the same
+// mode-button idiom as the Files and Actions toolbars. The choice is
+// deliberately NOT persisted in the URL hash, like every other mode toggle
+// (see serializeStateForHash).
+function agentsModeSwitchHtml(state) {
+  return (
+    '<button type="button" class="btn small' + (state.agentsMode === "list" ? " active" : "") + '" data-act="agents-mode" data-value="list">list</button>' +
+    '<button type="button" class="btn small' + (state.agentsMode === "graph" ? " active" : "") + '" data-act="agents-mode" data-value="graph">graph</button>'
+  );
+}
+
 function mountAgentsTab(ctx) {
   var el = ctx.els.tabs.agents;
+  // Two panes, both mounted once: switching sub-views toggles .hidden instead
+  // of replacing the tab's markup, so the list's rendered blocks (and the graph
+  // module's own delegated listeners, bound once on a stable container) survive
+  // every trip through the switch.
   el.innerHTML =
     '<div class="subtoolbar" data-role="toolbar"></div>' +
-    '<div class="table-wrap" data-role="tablewrap"></div>';
+    '<div class="table-wrap" data-role="tablewrap"></div>' +
+    '<div class="agraph-pane hidden" data-role="graphwrap"></div>';
   ctx.els.agentsToolbar = el.querySelector('[data-role="toolbar"]');
   ctx.els.agentsTableWrap = el.querySelector('[data-role="tablewrap"]');
+  ctx.els.agentsGraphWrap = el.querySelector('[data-role="graphwrap"]');
   bindAgentsTabEvents(ctx, el);
 }
 
 function updateAgentsTab(ctx) {
   var indices = toolRequestedIndices(ctx.model);
   var info = computeAgentGroups(ctx, indices, true);
+  var graphMode = ctx.state.agentsMode === "graph";
+  ctx.els.agentsTableWrap.classList.toggle("hidden", graphMode);
+  ctx.els.agentsGraphWrap.classList.toggle("hidden", !graphMode);
+  // The graph pane must be visible before it renders: a display:none pane
+  // measures as zero, and the graph's edges are drawn from measured card
+  // positions (see agentgraph.js's own geometry guard).
+  if (graphMode) renderAgentGraph(ctx, info);
 
   if (indices.length === 0) {
-    ctx.els.agentsToolbar.innerHTML = '<span class="meta">no agent activity recorded</span>';
+    ctx.els.agentsToolbar.innerHTML = agentsModeSwitchHtml(ctx.state) +
+      '<span class="meta">no agent activity recorded</span>';
     ctx.els.agentsTableWrap.innerHTML =
       '<div class="empty" style="padding:12px 16px;">no agent activity recorded ' +
       '<span class="meta">(the harness narrated no subagents for this session)</span></div>';
@@ -2260,8 +2418,8 @@ function updateAgentsTab(ctx) {
   }
 
   if (info.agentCount === 0) {
-    ctx.els.agentsToolbar.innerHTML =
-      '<button type="button" class="btn small" data-act="agents-collapse-all" title="collapse every agent block and expanded row">collapse all</button>' +
+    ctx.els.agentsToolbar.innerHTML = agentsModeSwitchHtml(ctx.state) +
+      (graphMode ? "" : '<button type="button" class="btn small" data-act="agents-collapse-all" title="collapse every agent block and expanded row">collapse all</button>') +
       '<span class="meta">0 agents · ' + numFmt(indices.length) + " actions</span>";
     ctx.els.agentsTableWrap.innerHTML = agentUnattributedBlockHtml(ctx, {
       key: UNATTRIBUTED_KEY,
@@ -2270,15 +2428,83 @@ function updateAgentsTab(ctx) {
     return;
   }
 
-  ctx.els.agentsToolbar.innerHTML =
-    '<button type="button" class="btn small" data-act="agents-collapse-all" title="collapse every agent block and expanded row">collapse all</button>' +
+  // Active/Past is a presentation of the same grouping, not a filter over it:
+  // every agent in the walk lands in exactly one of the two sections, so the
+  // tab still shows the whole hierarchy and the tab's count badge (tabCounts)
+  // is unaffected.
+  var sections = partitionAgentGroups(info);
+  ctx.els.agentsToolbar.innerHTML = agentsModeSwitchHtml(ctx.state) +
+    (graphMode ? "" : '<button type="button" class="btn small" data-act="agents-collapse-all" title="collapse every agent block and expanded row">collapse all</button>') +
     '<span class="meta">' + numFmt(info.agentCount) + (info.agentCount === 1 ? " agent" : " agents") +
-    " · " + numFmt(indices.length) + " actions</span>";
+    " · " + numFmt(sections.active.length) + " active · " + numFmt(indices.length) + " actions</span>";
 
   var html = "";
-  info.agentGroups.forEach(function (og) { html += agentBlockHtml(ctx, og.group, info.meta, og.depth, info.sessionEnded); });
+  if (sections.active.length) {
+    html += agentsSectionHdrHtml("Active Agents", sections.active.length,
+      info.sessionEnded ? "" : "no closure recorded yet");
+    sections.active.forEach(function (og) {
+      html += agentBlockHtml(ctx, og.group, info.meta, og.depth, info.sessionEnded);
+    });
+  }
+  if (sections.past.length) {
+    html += agentsSectionHdrHtml("Past Agents", sections.past.length,
+      info.sessionEnded ? "the session has ended" : "closed by the harness");
+    sections.past.forEach(function (og) {
+      html += agentBlockHtml(ctx, og.group, info.meta, og.depth, info.sessionEnded);
+    });
+  }
+  // The Unattributed Workload bucket belongs to no agent and so to neither
+  // section: it stays where it has always been, last and outside both.
   html += agentUnattributedBlockHtml(ctx, info.unattributed);
   ctx.els.agentsTableWrap.innerHTML = html;
+}
+
+// renderAgentGraph hands the ALREADY-DERIVED grouping to the graph sub-view
+// (internal/view/agentgraph.js), the same hook shape updateProcessesTab uses for
+// the Processes tab: the caller empties the container, the module rebuilds its
+// DOM from scratch, and anything that must survive that lives in the module's
+// own state. Passing computeAgentGroups' output rather than raw events is what
+// keeps every honesty rule pinned in this file (registrations only, orphan
+// completions dropped, missing parents rendered as roots, cycle guard, rootless
+// sweep, registered-but-silent agents still present) true of the graph for free.
+//
+// payloadVersion is session-qualified — unlike the Processes hook's, which
+// predates the dashboard being able to swap sessions under a mounted view — so a
+// module-level cache can never carry one session's nodes into the next.
+function renderAgentGraph(ctx, info) {
+  var host = ctx.els.agentsGraphWrap;
+  if (!(window.BoxedAiAgentGraph && typeof window.BoxedAiAgentGraph.render === "function")) {
+    host.innerHTML = '<div class="empty" style="padding:12px 16px;">graph view unavailable ' +
+      '<span class="meta">(/assets/agentgraph.js did not load)</span></div>';
+    return;
+  }
+  var model = ctx.model;
+  var lastSeq = model.events.length ? model.events[model.events.length - 1].seq : 0;
+  var sessionID = (ctx.payload && ctx.payload.session_id) || "";
+  var data = {
+    groups: info.agentGroups, // [{group, depth}], pre-order, parents before children
+    meta: info.meta,
+    unattributed: info.unattributed,
+    sessionEnded: info.sessionEnded,
+    events: model.events,
+    tsLabel: model.tsLabel, // parallel to events, precomputed clock labels
+    bySeq: model.bySeq, // seq -> index, for resolving an agent's registration timestamp
+    sessionId: sessionID,
+  };
+  var api = {
+    esc: esc,
+    numFmt: numFmt,
+    chipHtml: chipHtml,
+    statusColor: statusColor,
+    toolActivitySummary: toolActivitySummary,
+    agentTitle: agentTitle,
+    agentStrengthChip: agentStrengthChip,
+    agentIsActive: agentIsActive,
+    fmtTs: fmtTs,
+    payloadVersion: sessionID + ":" + model.events.length + ":" + lastSeq,
+  };
+  host.innerHTML = "";
+  window.BoxedAiAgentGraph.render(host, data, api);
 }
 
 // collapseAllAgentsTab folds every rendered agent block closed and clears every
@@ -2306,6 +2532,10 @@ function bindAgentsTabEvents(ctx, container) {
     var btn = e.target.closest("[data-act]");
     if (btn) {
       var act = btn.dataset.act;
+      // The sub-view switch is dispatched here, not through ctx.switchTab:
+      // switchTab early-returns on the tab that is already active, and this
+      // moves between two panes INSIDE the Agents tab.
+      if (act === "agents-mode") { ctx.state.agentsMode = btn.dataset.value; updateAgentsTab(ctx); return; }
       if (act === "toggle-agent-group") { toggleAgentsTabGroup(ctx, btn.dataset.key); updateAgentsTab(ctx); return; }
       if (act === "agents-collapse-all") { collapseAllAgentsTab(ctx); updateAgentsTab(ctx); return; }
       if (act === "copy-json") { copyEventJSON(ctx, Number(btn.dataset.seq), btn); return; }
@@ -2453,7 +2683,10 @@ function proofSegmentsTableHtml(segments) {
 }
 
 function mountProofTab(ctx) {
-  ctx.els.tabs.proof.innerHTML = '<div data-role="body"></div>';
+  // Unlike the other tabs the proof pane has no .table-wrap to scroll: its
+  // whole stack of sections is one body, so that body is the scroller (see
+  // .proof-body in app.css, and activeScrollEl which saves its position).
+  ctx.els.tabs.proof.innerHTML = '<div class="proof-body" data-role="body"></div>';
   ctx.els.proofBody = ctx.els.tabs.proof.querySelector('[data-role="body"]');
   ctx.els.proofBody.addEventListener("click", function (e) {
     var btn = e.target.closest('[data-act="copy-text"]');
@@ -2569,12 +2802,14 @@ function renderActiveTab(ctx, appendMode) {
   }
 }
 
-// activeScrollEl finds the scrollable table area of whichever tab is
-// currently visible, so callers can save/restore scrollTop around a
-// rebuild (spec: re-renders must preserve scroll position).
+// activeScrollEl finds the scrollable area of whichever tab is currently
+// visible, so callers can save/restore scrollTop around a rebuild (spec:
+// re-renders must preserve scroll position). Every tab but Proof scrolls in a
+// .table-wrap; Proof has no table to wrap, so its own body is the scroller.
+// Both are direct children of the pane, so the first match is the right one.
 function activeScrollEl(ctx) {
   var container = ctx.els.tabs[ctx.state.tab];
-  return container ? container.querySelector(".table-wrap") : null;
+  return container ? container.querySelector(".table-wrap, .proof-body") : null;
 }
 
 function switchTab(ctx, tab) {
@@ -2896,6 +3131,12 @@ function sessionCardHtml(s, selected, opts) {
   if (opts.showRepo) {
     var rb = [repoLabel(s.repository), s.branch ? branchLabel(s.branch) : ""].filter(Boolean).join(" · ");
     repoLine = '<div class="row-repo">' + esc(rb) + "</div>";
+  } else if (opts.showBranch) {
+    // Branch only: previous-session cards already sit under a repo › branch
+    // header pair, but a card is read on its own (and copied, and linked), so
+    // it names its own branch. branchLabel supplies "(detached)" for a session
+    // recorded off any branch, so this line is never blank.
+    repoLine = '<div class="row-branch">⎇ ' + esc(branchLabel(s.branch)) + "</div>";
   }
   var check = opts.selectable
     ? '<input type="checkbox" class="session-check" data-select-id="' + esc(s.session_id) + '"' + (opts.checked ? " checked" : "") + ' aria-label="select session">'
@@ -2962,6 +3203,7 @@ function renderSidebarList(dash) {
           return sessionCardHtml(s, s.session_id === dash.selectedId, {
             selectable: dash.selectMode,
             checked: !!dash.selected[s.session_id],
+            showBranch: true,
           });
         }).join("");
       });

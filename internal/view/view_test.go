@@ -650,6 +650,76 @@ func TestBuildWebPayloadUsesRunningLifecycleStateForProof(t *testing.T) {
 	if !payload.Proof.Provisional || payload.Proof.Status != "provisional" {
 		t.Fatalf("proof = %+v, want provisional for a running session even before an open segment is visible", payload.Proof)
 	}
+	// The same lifecycle marker is also published verbatim so the viewer can tell
+	// "still running" from "ended without a session.stopped event" without
+	// guessing from event presence alone.
+	if payload.State != string(session.StateRunning) {
+		t.Fatalf("payload state = %q, want %q", payload.State, session.StateRunning)
+	}
+	encoded, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal payload: %v", err)
+	}
+	if !strings.Contains(string(encoded), `"state":"running"`) {
+		t.Errorf("payload JSON missing lifecycle state field: %s", encoded)
+	}
+}
+
+// TestDashboardSessionsExposeRepositoryAndBranch pins the provenance the sidebar
+// cards render: the grant's repository and branch have to survive session.json ->
+// SessionInfo -> /api/sessions so a previous-session card can label the branch the
+// work happened on.
+func TestDashboardSessionsExposeRepositoryAndBranch(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BOXEDAI_HOME", home)
+	resetDashboardCacheForTest(t)
+
+	id := "bx-20260812-090000-eeee5555"
+	dir := filepath.Join(home, "sessions", id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir session: %v", err)
+	}
+	grant := map[string]any{
+		"schema":     "boxedai.session-grant/v1",
+		"session_id": id,
+		"harness":    "claude",
+		"profile":    "dev",
+		"repository": "git@github.com:boxedai/boxedai.git",
+		"branch":     "agents-tab-revamp",
+		"commit":     "9f2c1a7d4b6e8f0a2c4d6e8f0a2c4d6e8f0a2c4d",
+		"created_at": "2026-08-12T09:00:00Z",
+	}
+	grantBytes, err := json.Marshal(grant)
+	if err != nil {
+		t.Fatalf("marshal grant: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "session.json"), grantBytes, 0o644); err != nil {
+		t.Fatalf("write grant: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "session.state"), []byte(session.StateSealed), 0o644); err != nil {
+		t.Fatalf("write state: %v", err)
+	}
+
+	recorder := httptest.NewRecorder()
+	newDashboardMux().ServeHTTP(recorder, httptest.NewRequest(http.MethodGet, "/api/sessions", nil))
+	if recorder.Code != http.StatusOK {
+		t.Fatalf("/api/sessions status = %d, want 200", recorder.Code)
+	}
+	var payload dashboardPayload
+	if err := json.Unmarshal(recorder.Body.Bytes(), &payload); err != nil {
+		t.Fatalf("decode sessions: %v", err)
+	}
+	if len(payload.Sessions) != 1 {
+		t.Fatalf("sessions = %d, want 1", len(payload.Sessions))
+	}
+	if payload.Sessions[0].Repository != "git@github.com:boxedai/boxedai.git" || payload.Sessions[0].Branch != "agents-tab-revamp" {
+		t.Fatalf("session provenance = %+v, want the grant's repository and branch", payload.Sessions[0])
+	}
+	for _, want := range []string{`"repository":"git@github.com:boxedai/boxedai.git"`, `"branch":"agents-tab-revamp"`} {
+		if !strings.Contains(recorder.Body.String(), want) {
+			t.Errorf("/api/sessions body missing %s: %s", want, recorder.Body.String())
+		}
+	}
 }
 
 func TestDashboardPayloadOrdersRunningSessionsFirst(t *testing.T) {
@@ -947,7 +1017,8 @@ func TestDashboardDeleteEndpointRejectsGET(t *testing.T) {
 // TestAssetsServedByBothMuxes verifies the shared vanilla-JS/CSS client
 // (registerAssets) is wired into both the single-session viewer mux and the
 // dashboard mux with the right content types, and that each mux's thin HTML
-// shell references /assets/app.js and /assets/processes.js.
+// shell references /assets/app.js, /assets/processes.js and
+// /assets/agentgraph.js.
 func TestAssetsServedByBothMuxes(t *testing.T) {
 	muxes := map[string]*http.ServeMux{
 		"web":       newWebMux(t.TempDir()),
@@ -994,6 +1065,21 @@ func TestAssetsServedByBothMuxes(t *testing.T) {
 				t.Errorf("/assets/processes.js body missing BoxedAiProc marker")
 			}
 
+			graphRec := httptest.NewRecorder()
+			mux.ServeHTTP(graphRec, httptest.NewRequest(http.MethodGet, "/assets/agentgraph.js", nil))
+			if graphRec.Code != http.StatusOK {
+				t.Fatalf("/assets/agentgraph.js status = %d, want 200", graphRec.Code)
+			}
+			if ct := graphRec.Header().Get("Content-Type"); ct != "application/javascript; charset=utf-8" {
+				t.Errorf("/assets/agentgraph.js Content-Type = %q, want application/javascript; charset=utf-8", ct)
+			}
+			if graphRec.Body.Len() == 0 {
+				t.Errorf("/assets/agentgraph.js body is empty")
+			}
+			if !strings.Contains(graphRec.Body.String(), "BoxedAiAgentGraph") {
+				t.Errorf("/assets/agentgraph.js body missing BoxedAiAgentGraph marker")
+			}
+
 			indexRec := httptest.NewRecorder()
 			mux.ServeHTTP(indexRec, httptest.NewRequest(http.MethodGet, "/", nil))
 			if indexRec.Code != http.StatusOK {
@@ -1004,6 +1090,9 @@ func TestAssetsServedByBothMuxes(t *testing.T) {
 			}
 			if !strings.Contains(indexRec.Body.String(), "/assets/processes.js") {
 				t.Errorf("/ body missing reference to /assets/processes.js: %s", indexRec.Body.String())
+			}
+			if !strings.Contains(indexRec.Body.String(), "/assets/agentgraph.js") {
+				t.Errorf("/ body missing reference to /assets/agentgraph.js: %s", indexRec.Body.String())
 			}
 		})
 	}
@@ -1057,6 +1146,409 @@ func TestEmbeddedAgentGroupsKeepOrphansAndRootlessComponentsVisible(t *testing.T
 	}
 	if strings.Contains(source, "if (parent && meta.has(parent))") {
 		t.Fatal("app.js still attaches visible groups beneath filtered-out metadata-only parents")
+	}
+}
+
+// TestEmbeddedAgentsSplitActiveAndPastSections pins the Agents tab's two-section
+// rendering: liveness is decided by one shared predicate that is clamped by the
+// session's own lifecycle marker, and splitting the single pre-order walk into
+// two lists re-roots any agent whose parent landed in the other section instead
+// of leaving it indented under a parent that is no longer above it.
+func TestEmbeddedAgentsSplitActiveAndPastSections(t *testing.T) {
+	source := string(appJS)
+	for _, want := range []string{
+		"function agentIsActive(m, sessionEnded) {",
+		"if (sessionEnded) return false;",
+		`var sessionEnded = lifecycle === "sealed" || lifecycle === "incomplete";`,
+		`agentsSectionHdrHtml("Active Agents"`,
+		`agentsSectionHdrHtml("Past Agents"`,
+		"var nested = parentID && sectionOf.get(parentID) === section && renderedDepth.has(parentID);",
+		"var depth = nested ? renderedDepth.get(parentID) + 1 : 0;",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("app.js missing active/past agent partition behavior %q", want)
+		}
+	}
+	// The walk is partitioned, never filtered: dropping entries would hide agents
+	// from the tab entirely instead of moving them into the other section.
+	if strings.Contains(source, "agentGroups.filter(") {
+		t.Fatal("app.js filters the agent walk instead of partitioning it, which hides agents from both sections")
+	}
+	// Every liveness question has to pass the session lifecycle in, so a sealed
+	// session can never leave an unclosed agent advertised as running.
+	if strings.Contains(source, "agentIsActive(m)") {
+		t.Fatal("app.js calls agentIsActive without the session-ended clamp")
+	}
+	// Indentation inside a section is derived from the parent that is actually
+	// rendered above, not carried over from the walk: a re-rooted parent whose
+	// own subtree kept the walk's depth would leave that subtree indented under
+	// nothing (visible as soon as the tree is more than one level deep).
+	if strings.Contains(source, "var depth = og.depth;") {
+		t.Fatal("app.js reuses the walk's depth inside a section instead of recomputing it from the rendered parent")
+	}
+}
+
+// TestEmbeddedAgentsDeriveNestingFromSpawnEdges pins the join that gives the tab
+// true nesting: a completed spawn call carries agent.spawned.id (the child it
+// created) beside its own agent.id (the spawner), and the two are joined SET-WISE
+// after the scan. agent.parent.id on the wire always names the Primary, so
+// without this join every generation renders flat under it.
+func TestEmbeddedAgentsDeriveNestingFromSpawnEdges(t *testing.T) {
+	source := string(appJS)
+	for _, want := range []string{
+		`var spawnedID = attrRaw(ev, "agent.spawned.id");`,
+		`var spawnerID = attrRaw(ev, "agent.id");`,
+		"if (spawnerID && !spawnEdges.has(spawnedID)) spawnEdges.set(spawnedID, spawnerID);",
+		"spawnEdges.forEach(function (spawnerID, childID) {",
+		"m.parentID = spawnerID;",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("app.js missing derived spawn-edge nesting %q", want)
+		}
+	}
+	// The join is applied after the whole scan, alongside the closures, and never
+	// while walking: a synchronous spawn's edge is sequenced after its child's
+	// registration and a backgrounded one before it, so no seq/timing/adjacency
+	// relationship between the two events may be relied on.
+	scan := strings.Index(source, `var spawnedID = attrRaw(ev, "agent.spawned.id");`)
+	join := strings.Index(source, "spawnEdges.forEach(function (spawnerID, childID) {")
+	if scan < 0 || join < 0 || join < scan {
+		t.Fatal("app.js applies spawn edges during the scan instead of set-wise after it")
+	}
+	// An edge naming an id that never registered must not invent an agent, the
+	// same rule the orphan-closure path follows.
+	if !strings.Contains(source[join:], "if (!m) return;") {
+		t.Fatal("app.js does not drop spawn edges whose child never registered")
+	}
+	// The tree is derived narration joined to narration: same trust ceiling, so
+	// no view may hand the joined agents a stronger attribution than the harness
+	// claimed for them.
+	if strings.Contains(source, `m.strength = "strong"`) || strings.Contains(source, "m.strength = spawner") {
+		t.Fatal("app.js promotes attribution strength off the derived spawn-edge join")
+	}
+}
+
+// TestEmbeddedAgentActivityLineNoArgumentMatchesRowStructure pins the Agents
+// tab list view's no-argument row to the SAME structural slot a normal row's
+// argument text gets: nested inside the agent-line-text/ellipsis flex-item
+// wrapper, never handed to .agent-line-row (a flex container) as a bare
+// .empty span. A bare .empty span there is a direct flex child, so it gets
+// blockified, and .dash-main .empty's unrelated 24px padding (styling the
+// dashboard's own "Select a session." placeholder) then applies to it in
+// full -- roughly doubling this one row's height whenever the tab is viewed
+// inside the embedded dashboard, while every neighboring row stays at the
+// table's 30px floor.
+func TestEmbeddedAgentActivityLineNoArgumentMatchesRowStructure(t *testing.T) {
+	source := string(appJS)
+	start := strings.Index(source, "function agentActivityLineHtml(")
+	end := strings.Index(source, "function agentActivityTableHtml(")
+	if start < 0 || end <= start {
+		t.Fatal("app.js has no agentActivityLineHtml renderer to pin")
+	}
+	line := source[start:end]
+	for _, want := range []string{
+		`'<span class="agent-line-text ellipsis">' + esc(textVal) + "</span>"`,
+		`'<span class="agent-line-text ellipsis"><span class="empty">(no argument)</span></span>'`,
+	} {
+		if !strings.Contains(line, want) {
+			t.Fatalf("app.js agentActivityLineHtml missing uniform no-argument row structure %q", want)
+		}
+	}
+	// The regression itself: the no-argument branch must never hand the bare
+	// .empty span straight to the flex row.
+	if strings.Contains(line, `: '<span class="empty">(no argument)</span>'`) {
+		t.Fatal("app.js hands the bare .empty span straight to the agent-line-row flex container instead of nesting it inside agent-line-text")
+	}
+}
+
+// TestEmbeddedAgentGraphConsumesPrecomputedGroups pins the graph sub-view's
+// contract with app.js: it renders the grouping/liveness decisions it is handed
+// (so the orphan- and cycle-safety of computeAgentGroups is not re-litigated
+// here) and tracks departures in module state so a node can fade out after the
+// container has been wiped and rebuilt.
+func TestEmbeddedAgentGraphConsumesPrecomputedGroups(t *testing.T) {
+	source := string(agentGraphJS)
+	for _, want := range []string{
+		"window.BoxedAiAgentGraph",
+		"data.groups",
+		"data.meta",
+		"api.agentIsActive(",
+		"uiState.exiting",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("agentgraph.js missing precomputed-group/exit-state behavior %q", want)
+		}
+	}
+	// Cards are found by scanning rendered nodes and comparing dataset values;
+	// building a selector out of a workload-controlled agent id would let a
+	// crafted id break out of the query.
+	if strings.Contains(source, `[data-agent-id="`) {
+		t.Fatal("agentgraph.js builds an attribute selector from a workload-controlled agent id")
+	}
+	// The graph is a presentation layer over derived data; re-deriving agents
+	// from raw event names here would fork the honesty rules in computeAgentGroups.
+	if strings.Contains(source, "ev.name") {
+		t.Fatal("agentgraph.js re-derives agents from raw events instead of the grouping it is handed")
+	}
+}
+
+// TestEmbeddedAgentGraphTickerShowsFullSummaryLines pins the node ticker's
+// shape: each line renders the whole tool summary and wraps, because a command
+// or path cut mid-token tells a reader nothing. Timestamps belong to the hover
+// popover, which is the "more detail" surface; the ticker answers what an agent
+// is doing, not when.
+func TestEmbeddedAgentGraphTickerShowsFullSummaryLines(t *testing.T) {
+	source := string(agentGraphJS)
+	start := strings.Index(source, "function tickerHtml(")
+	end := strings.Index(source, "function statusHtml(")
+	if start < 0 || end <= start {
+		t.Fatal("agentgraph.js has no tickerHtml renderer to pin")
+	}
+	ticker := source[start:end]
+	for _, want := range []string{
+		`'<span class="agraph-tick-text">'`,
+		"api.esc(text)",
+	} {
+		if !strings.Contains(ticker, want) {
+			t.Fatalf("agentgraph.js ticker missing full-summary rendering %q", want)
+		}
+	}
+	// The ticker line is never clipped by the renderer: no ellipsis helper, and
+	// no timestamp column stealing width from the summary.
+	if strings.Contains(ticker, "truncateEnd") {
+		t.Fatal("agentgraph.js ticker truncates the summary instead of wrapping it")
+	}
+	if strings.Contains(ticker, "tsLabel") {
+		t.Fatal("agentgraph.js ticker still renders a timestamp; timestamps belong to the hover popover")
+	}
+
+	css := string(appCSS)
+	for _, want := range []string{
+		"overflow-wrap: anywhere;",
+		"-webkit-line-clamp: 10;",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("app.css ticker missing wrap/clamp rule %q", want)
+		}
+	}
+	if strings.Contains(css, ".agraph-tick-ts") {
+		t.Fatal("app.css still styles a ticker timestamp column")
+	}
+}
+
+// cssRuleBody returns the declarations of the first rule with the given
+// selector, so a test can assert about one rule instead of the whole file.
+func cssRuleBody(t *testing.T, css, selector string) string {
+	t.Helper()
+	start := strings.Index(css, selector+" {")
+	if start < 0 {
+		t.Fatalf("app.css has no %q rule", selector)
+	}
+	rest := css[start+len(selector)+2:]
+	end := strings.Index(rest, "}")
+	if end < 0 {
+		t.Fatalf("app.css rule %q is unterminated", selector)
+	}
+	return rest[:end]
+}
+
+// TestEmbeddedViewerPanesFillTheViewport pins the full-height layout: the shell
+// is a flex column that runs to the bottom of the window and the scroller
+// inside the active tab takes whatever the toolbars left, on both pages. The
+// panes used to stop at a fixed 70vh, which left a dead band under every tab.
+func TestEmbeddedViewerPanesFillTheViewport(t *testing.T) {
+	css := string(appCSS)
+
+	app := cssRuleBody(t, css, "#app")
+	for _, want := range []string{"height: 100%;", "display: flex;", "flex-direction: column;"} {
+		if !strings.Contains(app, want) {
+			t.Fatalf("app.css #app is not a full-height flex column: missing %q", want)
+		}
+	}
+	pane := cssRuleBody(t, css, ".tab-content")
+	for _, want := range []string{"flex: 1 1 auto;", "min-height: 0;", "flex-direction: column;"} {
+		if !strings.Contains(pane, want) {
+			t.Fatalf("app.css .tab-content does not fill the shell column: missing %q", want)
+		}
+	}
+	// Every scrollable region grows into the pane instead of capping itself at
+	// a fraction of the viewport. The Proof tab has no table, so its own body
+	// is the scroller (activeScrollEl saves the position of both).
+	for _, selector := range []string{".table-wrap", ".proof-body", ".agraph-pane", ".proc-layout"} {
+		body := cssRuleBody(t, css, selector)
+		if !strings.Contains(body, "flex: 1 1 auto;") {
+			t.Fatalf("app.css %s does not flex to fill its pane", selector)
+		}
+		if strings.Contains(body, "vh;") {
+			t.Fatalf("app.css %s still sizes itself as a fraction of the viewport: %q", selector, body)
+		}
+	}
+	if !strings.Contains(string(appJS), `.querySelector(".table-wrap, .proof-body")`) {
+		t.Fatal("app.js activeScrollEl no longer finds both tab scrollers, so scroll position is lost across a re-render")
+	}
+	// A height derived by subtracting the chrome would go wrong the moment the
+	// header or a filter bar wrapped onto a second line.
+	if strings.Contains(css, "calc(100vh") {
+		t.Fatal("app.css hardcodes a viewport-height offset instead of letting the flex chain size the panes")
+	}
+}
+
+// TestEmbeddedAgentGraphPansAndZoomsOneSharedLayer pins the navigation contract:
+// the pane is clipped by a viewport and moved by a transform on ONE inner layer
+// that carries both the cards and their SVG edge underlay, so nodes and edges
+// can never drift apart. The framing survives a live poll (it lives in module
+// state, not the DOM) and the user's own panning outranks a recomputed fit.
+func TestEmbeddedAgentGraphPansAndZoomsOneSharedLayer(t *testing.T) {
+	source := string(agentGraphJS)
+	for _, want := range []string{
+		`data-role="viewport"`,
+		`data-role="canvas"`,
+		"canvas.style.transform =",
+		"uiState.transform",
+		"uiState.userAdjusted",
+		`{ passive: false }`, // the wheel handler preventDefaults, so it cannot be passive
+		`data-act="graph-fit"`,
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("agentgraph.js missing pan/zoom behavior %q", want)
+		}
+	}
+	// The wheel handler is delegated on the whole pane and must cancel the
+	// gesture everywhere in it, header strip included. Gating on the target
+	// being inside the viewport (a SIBLING of the header) let a wheel that
+	// landed on the counts text or the fit button bubble to the document and
+	// scroll the page out from under the graph.
+	wheelStart := strings.Index(source, "function handleWheel(")
+	wheelEnd := strings.Index(source, "function handlePointerDown(")
+	if wheelStart < 0 || wheelEnd <= wheelStart {
+		t.Fatal("agentgraph.js has no handleWheel to pin")
+	}
+	wheel := source[wheelStart:wheelEnd]
+	if !strings.Contains(wheel, "e.preventDefault();") {
+		t.Fatal("agentgraph.js handleWheel does not cancel the gesture, so the page scrolls under the graph")
+	}
+	if strings.Contains(wheel, "e.target.closest(") {
+		t.Fatal("agentgraph.js handleWheel gates on where in the pane the wheel landed; the whole pane is the gesture surface")
+	}
+
+	// The edge underlay lives INSIDE the transformed layer, so it must be
+	// measured in untransformed layout coordinates. A client rect reports scaled
+	// screen pixels and would put every edge in the wrong place at any zoom
+	// other than 1.
+	start := strings.Index(source, "function drawEdges(")
+	end := strings.Index(source, "// ---- pan / zoom ----")
+	if start < 0 || end <= start {
+		t.Fatal("agentgraph.js has no drawEdges renderer to pin")
+	}
+	edges := source[start:end]
+	if !strings.Contains(edges, "offsetLeft") {
+		t.Fatal("agentgraph.js drawEdges does not measure cards from layout offsets")
+	}
+	if strings.Contains(edges, "getBoundingClientRect") {
+		t.Fatal("agentgraph.js drawEdges measures screen rects, which are wrong inside the zoomed layer")
+	}
+
+	css := string(appCSS)
+	for _, want := range []string{
+		".agraph-viewport {",
+		"transform-origin: 0 0;",
+	} {
+		if !strings.Contains(css, want) {
+			t.Fatalf("app.css missing agent graph viewport rule %q", want)
+		}
+	}
+}
+
+// TestEmbeddedAgentGraphSatelliteRidesTopBandAndPopoverIsReachable pins the two
+// layout honesty rules that survived the refinement pass: unattributed activity
+// is a dashed peer in the TOP band (never a child of the Primary, and never a
+// divider that renders when there is nothing to divide), and the hover panel
+// takes pointer events so its scrollback can actually be read.
+func TestEmbeddedAgentGraphSatelliteRidesTopBandAndPopoverIsReachable(t *testing.T) {
+	source := string(agentGraphJS)
+	for _, want := range []string{
+		"model.levels[0].push(satellite)",
+		"if (!g || !g.members || !g.members.length) return null;", // no activity, no satellite, nothing extra
+		"HOVER_GRACE_MS",
+		"scheduleHidePopover",
+		"stillWithinPopoverPair",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("agentgraph.js missing satellite/hover-intent behavior %q", want)
+		}
+	}
+	// The satellite is appended to a band, never to the node list, so it can
+	// never acquire an edge — it belongs to no agent, and drawing one would make
+	// exactly the attribution claim the record refuses to make.
+	if strings.Contains(source, "nodes.push(satellite)") {
+		t.Fatal("agentgraph.js puts the unattributed satellite in the node list, where it can acquire an edge")
+	}
+
+	css := string(appCSS)
+	if strings.Contains(css, "agraph-satellite-row") {
+		t.Fatal("app.css still styles a separate satellite row; the satellite rides in the top band")
+	}
+	popStart := strings.Index(css, ".agraph-popover {")
+	if popStart < 0 {
+		t.Fatal("app.css has no agent graph popover rule to pin")
+	}
+	popEnd := strings.Index(css[popStart:], "}")
+	if popEnd < 0 {
+		t.Fatal("app.css agent graph popover rule is unterminated")
+	}
+	popover := css[popStart : popStart+popEnd]
+	for _, want := range []string{
+		"pointer-events: auto;",
+		"overflow-y: auto;",
+		"overscroll-behavior: contain;",
+	} {
+		if !strings.Contains(popover, want) {
+			t.Fatalf("app.css popover missing reachable/scrollable rule %q", want)
+		}
+	}
+	if strings.Contains(popover, "pointer-events: none;") {
+		t.Fatal("app.css popover is transparent to the pointer, so it can never be moved into or scrolled")
+	}
+}
+
+// TestEmbeddedAgentGraphAnimationsRespectReducedMotion pins that every animation
+// the graph introduces is decoration: each new keyframe has a matching entry in
+// the prefers-reduced-motion kill switch, the same guard the pulse animations
+// near the top of app.css carry.
+func TestEmbeddedAgentGraphAnimationsRespectReducedMotion(t *testing.T) {
+	source := string(appCSS)
+	for _, want := range []string{
+		"@keyframes agraph-pop",
+		"@keyframes agraph-vanish",
+		"@keyframes agraph-slide",
+		"@keyframes agraph-edge-pulse",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("app.css missing agent graph keyframes %q", want)
+		}
+	}
+	guard := strings.LastIndex(source, "@media (prefers-reduced-motion: reduce)")
+	if guard < 0 {
+		t.Fatal("app.css has no reduced-motion guard for the agent graph animations")
+	}
+	for _, want := range []string{
+		".agraph-card-enter",
+		".agraph-card-exit",
+		".agraph-tick-new",
+		".agraph-edge-live",
+	} {
+		if !strings.Contains(source[guard:], want) {
+			t.Fatalf("app.css reduced-motion guard does not disable %q", want)
+		}
+	}
+	// The graph section must resolve every color through the existing :root
+	// tokens so the dark theme (and the evidence-class colors) stay in one place.
+	start := strings.Index(source, "/* ---- agents tab: live agent graph ---- */")
+	if start < 0 {
+		t.Fatal("app.css has no agent graph section header comment")
+	}
+	if hex := strings.Index(source[start:], "#"); hex >= 0 {
+		t.Fatalf("app.css agent graph section introduces a raw color literal instead of a token: %q", source[start+hex:])
 	}
 }
 

@@ -34,6 +34,9 @@ var appJS []byte
 //go:embed processes.js
 var processesJS []byte
 
+//go:embed agentgraph.js
+var agentGraphJS []byte
+
 // webEvent is one events row shaped for the web UI's JSON payload.
 type webEvent struct {
 	Seq            int64          `json:"seq"`
@@ -54,7 +57,13 @@ type webEvent struct {
 // vanilla JS derives the file-changes, network-attempts and internal-tool-call
 // views from Events client-side.
 type webPayload struct {
-	SessionID          string         `json:"session_id"`
+	SessionID string `json:"session_id"`
+	// State is the session's persisted lifecycle marker (created|running|
+	// sealed|incomplete, see internal/session.State). The client needs it to
+	// tell a live session from a finished one WITHOUT inferring it from the
+	// event stream alone: a session killed before it could emit
+	// session.stopped/session.sealed otherwise reads as still running forever.
+	State              string         `json:"state"`
 	PolicyDigest       string         `json:"policy_digest"`
 	Verify             *verify.Report `json:"verify,omitempty"`
 	VerifyError        string         `json:"verify_error,omitempty"`
@@ -217,6 +226,10 @@ func registerAssets(mux *http.ServeMux) {
 	mux.HandleFunc("/assets/processes.js", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		w.Write(processesJS)
+	})
+	mux.HandleFunc("/assets/agentgraph.js", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+		w.Write(agentGraphJS)
 	})
 }
 
@@ -480,14 +493,15 @@ func buildWebPayload(sessionDir string) (webPayload, error) {
 		return webPayload{}, err
 	}
 
+	state := loadSessionState(sessionDir)
 	payload := webPayload{
 		SessionID:          sessionID,
+		State:              string(state),
 		PolicyDigest:       policyDigest,
 		ProcessTree:        tree,
 		Events:             events,
 		AgentActivityNames: AgentActivityNames(),
 	}
-	state := loadSessionState(sessionDir)
 	if report, err := verify.Verify(sessionDir); err != nil {
 		payload.VerifyError = err.Error()
 		payload.Proof = buildProofState(sessionDir, state, verify.Report{}, err)
