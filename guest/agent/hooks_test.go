@@ -142,6 +142,269 @@ func TestRunHook_RighthookIsError(t *testing.T) {
 	}
 }
 
+// TestRunHook_StampsActingAgent asserts a tool hook fired inside a subagent
+// carries the derived agent.id/native_id/type and parents the action to the agent,
+// plus the common harness.* context and the self pid anchor.
+func TestRunHook_StampsActingAgent(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv(sessionIDEnv, "bx-hooktest")
+
+	fixture := `{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t1",` +
+		`"agent_id":"sub-42","agent_type":"Explore","session_id":"cc-sess","cwd":"/workspace",` +
+		`"transcript_path":"/t.json","hook_event_name":"PreToolUse"}`
+	if got := runHook("lefthook", strings.NewReader(fixture)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	if len(capture.req.Events) != 1 {
+		t.Fatalf("events = %d, want 1", len(capture.req.Events))
+	}
+	ev := capture.req.Events[0]
+
+	wantChild := evidence.ChildAgentID("bx-hooktest", "sub-42")
+	if got := ev.Attrs[evidence.AttrAgentID]; got != wantChild {
+		t.Errorf("agent.id = %v, want %s (derived from native id)", got, wantChild)
+	}
+	if got := ev.Attrs[evidence.AttrAgentNativeID]; got != "sub-42" {
+		t.Errorf("agent.native_id = %v, want sub-42", got)
+	}
+	if got := ev.Attrs[evidence.AttrAgentType]; got != "Explore" {
+		t.Errorf("agent.type = %v, want Explore", got)
+	}
+	if ev.ParentActionID != wantChild {
+		t.Errorf("ParentActionID = %q, want %s (tool nested under its agent)", ev.ParentActionID, wantChild)
+	}
+	for k, want := range map[string]any{
+		attrHarnessSessionID: "cc-sess",
+		attrHarnessCwd:       "/workspace",
+		attrHarnessHookEvent: "PreToolUse",
+	} {
+		if got := ev.Attrs[k]; got != want {
+			t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+		}
+	}
+	if _, ok := ev.Attrs[evidence.AttrProcessPID]; !ok {
+		t.Error("hook event is missing its own process.pid anchor")
+	}
+}
+
+// TestRunHook_StampsPrimaryWhenNoAgentID asserts a main-loop tool call — hook JSON
+// with no agent_id, the shape Claude Code sends outside a subagent — is attributed
+// to the controller-minted Primary named by BOXEDAI_AGENT_ID, and that no
+// harness-native identity is invented for it (the Primary has none).
+func TestRunHook_StampsPrimaryWhenNoAgentID(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv(sessionIDEnv, "bx-hooktest")
+	t.Setenv(agentIDEnv, "ag-primary000000")
+
+	if got := runHook("lefthook", strings.NewReader(lefthookFixture)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	ev := capture.req.Events[0]
+	if got := ev.Attrs[evidence.AttrAgentID]; got != "ag-primary000000" {
+		t.Errorf("agent.id = %v, want the Primary id from %s", got, agentIDEnv)
+	}
+	if ev.ParentActionID != "ag-primary000000" {
+		t.Errorf("ParentActionID = %q, want the Primary id (tool nested under the Primary)", ev.ParentActionID)
+	}
+	for _, k := range []string{evidence.AttrAgentNativeID, evidence.AttrAgentType} {
+		if _, ok := ev.Attrs[k]; ok {
+			t.Errorf("Attrs[%q] present, want absent: the Primary has no harness-native identity", k)
+		}
+	}
+}
+
+// TestRunHook_UnattributedWithoutPrimaryID asserts the residual Unattributed
+// Workload path: with no Primary id in the hook environment there is nothing honest
+// to stamp, so the event carries no agent.id rather than a guessed one.
+func TestRunHook_UnattributedWithoutPrimaryID(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv(sessionIDEnv, "bx-hooktest")
+	t.Setenv(agentIDEnv, "")
+
+	if got := runHook("lefthook", strings.NewReader(lefthookFixture)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	ev := capture.req.Events[0]
+	if _, ok := ev.Attrs[evidence.AttrAgentID]; ok {
+		t.Error("tool call with no agent_id and no Primary id must not carry an agent.id")
+	}
+	if ev.ParentActionID != "" {
+		t.Errorf("ParentActionID = %q, want empty for unattributed tool", ev.ParentActionID)
+	}
+}
+
+// TestRunHook_ChildAttributionBeatsPrimary asserts the harness's own subagent tag
+// wins: a tool call inside a child is never relabelled as the Primary's, even though
+// the Primary id is in the hook environment for every hook process.
+func TestRunHook_ChildAttributionBeatsPrimary(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv(sessionIDEnv, "bx-hooktest")
+	t.Setenv(agentIDEnv, "ag-primary000000")
+
+	fixture := `{"tool_name":"Bash","tool_input":{"command":"ls"},"tool_use_id":"t1",` +
+		`"agent_id":"sub-42","agent_type":"Explore"}`
+	if got := runHook("lefthook", strings.NewReader(fixture)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	ev := capture.req.Events[0]
+	wantChild := evidence.ChildAgentID("bx-hooktest", "sub-42")
+	if got := ev.Attrs[evidence.AttrAgentID]; got != wantChild {
+		t.Errorf("agent.id = %v, want the child id %s (never the Primary)", got, wantChild)
+	}
+	if ev.ParentActionID != wantChild {
+		t.Errorf("ParentActionID = %q, want %s", ev.ParentActionID, wantChild)
+	}
+}
+
+const taskToolInput = `{"description":"Explore backend pipeline","prompt":"<long text>","subagent_type":"Explore"}`
+
+// TestRunHook_TaskSpawnNarration asserts a spawn tool call lifts the harness's
+// description and requested subagent type into dedicated attrs (the tool_input
+// excerpt is capped and the embedded prompt can crowd them out) and reads as what
+// the spawn was for in the timeline body. Claude Code has shipped the tool as both
+// "Task" and "Agent" — a live v2.x CLI reports "Agent" — and both must behave
+// identically, so the regression is pinned on both names.
+func TestRunHook_TaskSpawnNarration(t *testing.T) {
+	for _, toolName := range []string{"Task", "Agent"} {
+		t.Run(toolName, func(t *testing.T) {
+			capture := hookEventServer(t)
+
+			fixture := `{"tool_name":"` + toolName + `","tool_input":` + taskToolInput + `,"tool_use_id":"task-1"}`
+			if got := runHook("lefthook", strings.NewReader(fixture)); got != 0 {
+				t.Fatalf("runHook = %d, want 0", got)
+			}
+			ev := capture.req.Events[0]
+			for k, want := range map[string]any{
+				evidence.AttrHarnessTaskDescription:  "Explore backend pipeline",
+				evidence.AttrHarnessTaskSubagentType: "Explore",
+			} {
+				if got := ev.Attrs[k]; got != want {
+					t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+				}
+			}
+			if ev.Body != "task: Explore backend pipeline" {
+				t.Errorf("Body = %q, want %q", ev.Body, "task: Explore backend pipeline")
+			}
+		})
+	}
+}
+
+// TestRunHook_TaskSpawnSkipsUnusableInput asserts the narration is skipped silently
+// when tool_input is malformed or carries neither field — hooks fail open, so a
+// harness shape change drops the attribute, never the event.
+func TestRunHook_TaskSpawnSkipsUnusableInput(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		fixture  string
+		wantBody string
+	}{
+		{"tool_input is not an object", `{"tool_name":"Task","tool_input":"not-an-object","tool_use_id":"t"}`, "harness tool Task"},
+		{"neither field present", `{"tool_name":"Agent","tool_input":{"prompt":"x"},"tool_use_id":"t"}`, "harness tool Agent"},
+		{"no tool_input at all", `{"tool_name":"Task","tool_use_id":"t"}`, "harness tool Task"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := hookEventServer(t)
+			if got := runHook("lefthook", strings.NewReader(tc.fixture)); got != 0 {
+				t.Fatalf("runHook = %d, want 0", got)
+			}
+			if len(capture.req.Events) != 1 {
+				t.Fatalf("events = %d, want 1 (hooks fail open, the event still ships)", len(capture.req.Events))
+			}
+			ev := capture.req.Events[0]
+			for _, k := range []string{evidence.AttrHarnessTaskDescription, evidence.AttrHarnessTaskSubagentType} {
+				if _, ok := ev.Attrs[k]; ok {
+					t.Errorf("Attrs[%q] present, want absent", k)
+				}
+			}
+			if ev.Body != tc.wantBody {
+				t.Errorf("Body = %q, want the generic tool summary %q", ev.Body, tc.wantBody)
+			}
+		})
+	}
+}
+
+// TestRunAgentHook_SubagentStartRegistersChild asserts SubagentStart mints an
+// agent.started on the workload channel with the derived child id, the Primary as
+// parent, and the agent-lifecycle action chain.
+func TestRunAgentHook_SubagentStartRegistersChild(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv(sessionIDEnv, "bx-agenttest")
+	t.Setenv(agentIDEnv, "ag-primary000000")
+
+	fixture := `{"hook_event_name":"SubagentStart","agent_id":"sub-1","agent_type":"Explore","session_id":"cc","cwd":"/workspace"}`
+	if got := runAgentHook(strings.NewReader(fixture)); got != 0 {
+		t.Fatalf("runAgentHook = %d, want 0", got)
+	}
+	if len(capture.req.Events) != 1 {
+		t.Fatalf("events = %d, want 1", len(capture.req.Events))
+	}
+	ev := capture.req.Events[0]
+	wantChild := evidence.ChildAgentID("bx-agenttest", "sub-1")
+
+	if ev.Name != evidence.EventAgentStarted {
+		t.Errorf("Name = %q, want %q", ev.Name, evidence.EventAgentStarted)
+	}
+	if ev.Class != evidence.ClassHarnessObserved {
+		t.Errorf("Class = %q, want %q", ev.Class, evidence.ClassHarnessObserved)
+	}
+	for k, want := range map[string]any{
+		evidence.AttrAgentID:       wantChild,
+		evidence.AttrAgentNativeID: "sub-1",
+		evidence.AttrAgentParentID: "ag-primary000000",
+		evidence.AttrAgentRole:     string(evidence.AgentRoleChild),
+		evidence.AttrAgentType:     "Explore",
+	} {
+		if got := ev.Attrs[k]; got != want {
+			t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+		}
+	}
+	if ev.ActionID != wantChild || ev.ParentActionID != "ag-primary000000" {
+		t.Errorf("action chain = %q/%q, want %s/ag-primary000000", ev.ActionID, ev.ParentActionID, wantChild)
+	}
+}
+
+// TestRunAgentHook_SubagentStopClosesChild asserts SubagentStop closes the same
+// derived child id with a success outcome.
+func TestRunAgentHook_SubagentStopClosesChild(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv(sessionIDEnv, "bx-agenttest")
+	t.Setenv(agentIDEnv, "ag-primary000000")
+
+	fixture := `{"hook_event_name":"SubagentStop","agent_id":"sub-1","agent_type":"Explore"}`
+	if got := runAgentHook(strings.NewReader(fixture)); got != 0 {
+		t.Fatalf("runAgentHook = %d, want 0", got)
+	}
+	ev := capture.req.Events[0]
+	if ev.Name != evidence.EventAgentCompleted {
+		t.Errorf("Name = %q, want %q", ev.Name, evidence.EventAgentCompleted)
+	}
+	if got := ev.Attrs[evidence.AttrAgentID]; got != evidence.ChildAgentID("bx-agenttest", "sub-1") {
+		t.Errorf("agent.id = %v, want derived child id", got)
+	}
+	if got := ev.Attrs[evidence.AttrAgentOutcome]; got != string(evidence.OutcomeSuccess) {
+		t.Errorf("agent.outcome = %v, want success", got)
+	}
+}
+
+// TestRunAgentHook_IgnoresUnhandled asserts an agenthook with no agent_id or an
+// unrecognized hook_event_name submits nothing and still exits 0 (fail open).
+func TestRunAgentHook_IgnoresUnhandled(t *testing.T) {
+	for _, fixture := range []string{
+		`{"hook_event_name":"SubagentStart"}`,                // no agent_id
+		`{"hook_event_name":"SomethingElse","agent_id":"x"}`, // unhandled event
+	} {
+		capture := hookEventServer(t)
+		t.Setenv(sessionIDEnv, "bx-agenttest")
+		t.Setenv(agentIDEnv, "ag-primary000000")
+		if got := runAgentHook(strings.NewReader(fixture)); got != 0 {
+			t.Fatalf("runAgentHook(%s) = %d, want 0", fixture, got)
+		}
+		if capture.path != "" {
+			t.Errorf("fixture %s submitted an event (path %q), want none", fixture, capture.path)
+		}
+	}
+}
+
 func TestRunHook_MissingEnv(t *testing.T) {
 	for _, tc := range []struct {
 		name      string

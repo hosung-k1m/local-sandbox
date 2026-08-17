@@ -42,6 +42,10 @@ func main() {
 		// workload defeats the point of capturing its evidence.
 		os.Exit(runHook(os.Args[1], os.Stdin))
 	}
+	if len(os.Args) > 1 && os.Args[1] == "agenthook" {
+		// SubagentStart/SubagentStop child registration; also fail-open.
+		os.Exit(runAgentHook(os.Stdin))
+	}
 
 	cfg, err := LoadConfig(configPath)
 	if err != nil {

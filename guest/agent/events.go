@@ -19,7 +19,6 @@ const (
 	attrProcessExitCode       = "process.exit_code"
 	attrProcessExitSignal     = "process.exit_signal"
 	attrProcessExitStatus     = "process.exit_status"
-	attrProcessParentExecID   = "process.parent_exec_id"
 	attrProcessClassification = "process.classification"
 	attrObserver              = "observer" // "tetragon" | "procfs" | "scan" | "nftables"
 	attrFilePath              = "file.path"
@@ -41,7 +40,7 @@ func monotonicNS() int64 {
 	return time.Since(procStart).Nanoseconds()
 }
 
-// ProcInfo is the mechanism-agnotic process observation shared by the
+// ProcInfo is the mechanism-agnostic process observation shared by the
 // Tetragon and procfs watchers. ExecID and CgroupID are empty under the
 // procfs fallback, which has no exec-id/cgroup lineage.
 type ProcInfo struct {
@@ -150,7 +149,7 @@ func procCorrelation(pi ProcInfo, attrs map[string]any) evidence.Correlation {
 		correlation = evidence.CorrelationLineage
 	}
 	if pi.ParentExecID != "" {
-		attrs[attrProcessParentExecID] = pi.ParentExecID
+		attrs[evidence.AttrProcessParentExecID] = pi.ParentExecID
 	}
 	if pi.CgroupID != "" {
 		attrs[evidence.AttrProcessCgroupID] = pi.CgroupID

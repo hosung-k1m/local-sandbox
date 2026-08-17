@@ -11,8 +11,8 @@ func TestProcessExecutedIncludesParentExecIdentity(t *testing.T) {
 		Pid: 10, Ppid: 1, Uid: 4242, ExecID: "child", ParentExecID: "parent", Observer: "tetragon",
 	})
 
-	if event.Attrs[attrProcessParentExecID] != "parent" {
-		t.Fatalf("parent exec id = %v, want parent", event.Attrs[attrProcessParentExecID])
+	if event.Attrs[evidence.AttrProcessParentExecID] != "parent" {
+		t.Fatalf("parent exec id = %v, want parent", event.Attrs[evidence.AttrProcessParentExecID])
 	}
 }
 

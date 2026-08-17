@@ -13,8 +13,14 @@ import (
 )
 
 const (
-	brokerURLEnv       = "BOXEDAI_BROKER_URL"
-	workloadTokenEnv   = "BOXEDAI_WORKLOAD_TOKEN"
+	brokerURLEnv     = "BOXEDAI_BROKER_URL"
+	workloadTokenEnv = "BOXEDAI_WORKLOAD_TOKEN"
+	// sessionIDEnv and agentIDEnv carry the BoxedAi session id and the
+	// controller-minted Primary Agent id into the Claude hooks, so the hook
+	// derives child agent ids and names the Primary as parent (DESIGN.md "Agent
+	// hierarchy and attribution"). Neither is a secret.
+	sessionIDEnv       = "BOXEDAI_SESSION_ID"
+	agentIDEnv         = "BOXEDAI_AGENT_ID"
 	gitExitTrailer     = "X-BoxedAI-Git-Exit"
 	gitErrorTrailer    = "X-BoxedAI-Git-Error"
 	gitEvidenceTrailer = "X-BoxedAI-Git-Evidence"
