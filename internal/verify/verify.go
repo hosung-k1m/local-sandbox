@@ -87,6 +87,17 @@ type Facets struct {
 	// attribution is lineage-scoped, not strong).
 	HookProcessesAnchored   int `json:"hook_processes_anchored"`
 	HookProcessesUnanchored int `json:"hook_processes_unanchored"`
+	// File content capture (DESIGN "File content capture"). FileContentCaptured
+	// counts file.changed events whose bytes the host says it stored; Withheld and
+	// Misses split the rest by whether policy refused the capture or the capture
+	// failed — a deliberate withholding is a working store, a miss is a lossy one.
+	// FileContentStoreValid is true only when every claimed blob is present and
+	// still hashes to its signed digest; it is false for a store that is merely
+	// incomplete as well as for one that is wrong, so read it with the check.
+	FileContentCaptured   int  `json:"file_content_captured"`
+	FileContentWithheld   int  `json:"file_content_withheld"`
+	FileContentMisses     int  `json:"file_content_misses"`
+	FileContentStoreValid bool `json:"file_content_store_valid"`
 }
 
 // Check is one named verification step and its outcome (DESIGN "Verifier"
@@ -117,6 +128,9 @@ const (
 	stepSensor     = "sensor-invariants"
 	stepFlow       = "flow-invariants"
 	stepOutput     = "output-manifest"
+	// stepContentStore re-resolves the unsigned per-session blob store against the
+	// signed file.changed digests (DESIGN "File content capture").
+	stepContentStore = "file-content-store"
 )
 
 // segFiles bundles the three files that make up one sealed segment.
@@ -230,6 +244,13 @@ func Verify(sessionDir string) (Report, error) {
 
 	// (10) output manifest digest matches the recorded workspace.manifested event.
 	outputOK, outputDetail := checkOutputManifest(sessionDir, records)
+
+	// Captured file content still resolves in the unsigned per-session blob store.
+	// The check passes only when the store is both complete and correct; the two
+	// failure classes are read apart below because they carry different verdicts.
+	contentStore := checkFileContentStore(records, sessionDir)
+	contentStoreOK := !contentStore.tamper && !contentStore.incomplete
+
 	grantOK, grantDetail := checkSessionGrantBinding(sessionDir, g, records)
 	trustResult := checkTrustRecord(sessionDir, g, publicKey, segs, manifests, records)
 	trustOK := !trustResult.tamper && !trustResult.incomplete
@@ -249,6 +270,7 @@ func Verify(sessionDir string) (Report, error) {
 		{stepSensor, sensorOK, sensorDetail},
 		{stepFlow, flowOK, flowDetail},
 		{stepOutput, outputOK, outputDetail},
+		{stepContentStore, contentStoreOK, contentStore.detail},
 		{stepTrustRecord, trustOK, trustResult.detail},
 		{stepAgents, agentsOK, agentDetail},
 	}
@@ -273,6 +295,10 @@ func Verify(sessionDir string) (Report, error) {
 	rep.Facets.UnregisteredAgentActivity = agFacets.unregisteredActivity
 	rep.Facets.HookProcessesAnchored = agFacets.hookAnchored
 	rep.Facets.HookProcessesUnanchored = agFacets.hookUnanchored
+	rep.Facets.FileContentCaptured = contentStore.captured
+	rep.Facets.FileContentWithheld = contentStore.withheld
+	rep.Facets.FileContentMisses = contentStore.misses
+	rep.Facets.FileContentStoreValid = contentStore.storeValid
 	for _, c := range rep.Checks {
 		status := "ok"
 		if !c.Passed {
@@ -286,11 +312,15 @@ func Verify(sessionDir string) (Report, error) {
 
 	// Verdict selection (DESIGN "Verifier"), most-severe wins.
 	switch {
-	case !sigOK || !digestOK || !chainOK || !seqOK || !grantOK || !policyOK || !outputOK || trustResult.tamper:
+	// A blob that hashes to something other than its signed digest is an artifact
+	// contradicting the signed record, so it joins the tamper class alongside the
+	// output-manifest mismatch. A blob that is merely gone takes nothing away from
+	// the signed record and only costs inspectability, so it degrades to INCOMPLETE.
+	case !sigOK || !digestOK || !chainOK || !seqOK || !grantOK || !policyOK || !outputOK || trustResult.tamper || contentStore.tamper:
 		rep.Verdict = VerdictTamperSuspected
 	case !flowOK:
 		rep.Verdict = VerdictBypassDetected
-	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete || !agentsOK:
+	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete || !agentsOK || contentStore.incomplete:
 		rep.Verdict = VerdictIncomplete
 	default:
 		rep.Verdict = VerdictLocalOnly
@@ -392,6 +422,14 @@ func (r Report) String() string {
 		fmt.Fprintf(&b, "  unregistered work:   %d\n", r.Facets.UnregisteredAgentActivity)
 		fmt.Fprintf(&b, "  hook pids anchored:   %d\n", r.Facets.HookProcessesAnchored)
 		fmt.Fprintf(&b, "  hook pids unanchored: %d\n", r.Facets.HookProcessesUnanchored)
+	}
+	// Content facets are omitted entirely for a session that neither captured nor
+	// declined to capture anything (every legacy session), where all four values are
+	// zero and would read as a finding rather than as an absence of the feature.
+	if r.Facets.FileContentCaptured > 0 || r.Facets.FileContentWithheld > 0 || r.Facets.FileContentMisses > 0 {
+		fmt.Fprintf(&b, "  content captured:    %d (withheld %d, misses %d)\n",
+			r.Facets.FileContentCaptured, r.Facets.FileContentWithheld, r.Facets.FileContentMisses)
+		fmt.Fprintf(&b, "  content store valid: %v\n", r.Facets.FileContentStoreValid)
 	}
 	b.WriteString("\nChecks:\n")
 	for _, c := range r.Checks {

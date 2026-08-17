@@ -8,6 +8,7 @@ import (
 	"io"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"boxedai/internal/evidence"
 )
@@ -345,6 +346,212 @@ func checkOutputManifest(sessionDir string, records []record) (bool, string) {
 		return false, fmt.Sprintf("output-manifest.json digest %s != recorded %s", got, recorded)
 	}
 	return true, "output-manifest.json digest matches the recorded event"
+}
+
+// Wire names owned by the session host's content-capture middleware, mirrored here
+// as local constants rather than imported. The verifier already does this for
+// "observer" and "sensor.mechanism" above, for the same reason: the producer and
+// the verifier must agree on the wire, not on a Go symbol. A shared constant would
+// let a rename on the producer side silently carry the verifier with it, which is
+// exactly the agreement this package exists to refuse.
+const (
+	// attrFileCaptureReason explains why a file.changed event's bytes were not
+	// stored. It is absent on legacy events and on events that were captured.
+	attrFileCaptureReason = "file.capture.reason"
+
+	// Policy withholding. The host could have stored the bytes and deliberately did
+	// not, so the store is complete with respect to what it was allowed to hold.
+	reasonSecretPolicy     = "secret_policy"
+	reasonExcludedByPolicy = "excluded_by_policy"
+	reasonSizeCap          = "size_cap"
+
+	// Capture misses. The host intended to store the bytes and could not; the file
+	// had already moved on, vanished, or the read/store failed. Nothing is wrong with
+	// the evidence — the signed digest is still the record — but the side store holds
+	// less than the session intended, which is worth counting separately from a
+	// deliberate withholding.
+	reasonChangedBeforeCapture = "changed_before_capture"
+	reasonMissingBeforeCapture = "missing_before_capture"
+	reasonReadError            = "read_error"
+	reasonStoreError           = "store_error"
+)
+
+// Blob store layout, re-derived here instead of importing internal/blobstore. The
+// package doc's stance on internal/recorder applies verbatim: a check that resolves
+// a blob through the same code that wrote it proves only that the code is
+// self-consistent. Re-deriving the path and the hash from the recorded digest is
+// what makes a passing content-store check mean anything.
+const (
+	blobsDirName     = "blobs"
+	blobAlgoDirName  = "sha256"
+	blobDigestPrefix = "sha256:"
+	blobDigestHexLen = 64
+
+	// contentStoreExamples caps how many offending blobs a failure detail names. A
+	// session that lost or had its whole store rewritten would otherwise render a
+	// wall of digests; the counts carry the magnitude, the examples give a starting
+	// point for inspection.
+	contentStoreExamples = 3
+)
+
+// contentStoreResult is the outcome of the file-content-store check. The two
+// failure classes are kept apart deliberately, because they say opposite things
+// about the record:
+//
+//   - missing → INCOMPLETE. The blob store is unsigned and derivable: a pruned,
+//     lost, or never-written blob costs a reader the ability to see what a file
+//     contained, but it forges nothing. The signed file.changed event still carries
+//     the digest, so history is intact and merely less inspectable. That degrades
+//     honestly and must not be dressed up as an attack.
+//   - mismatched → TAMPER_SUSPECTED. A blob that is present but hashes to something
+//     other than the digest a sealed segment signed is an artifact presenting itself
+//     as verified content while being something else. That is the same integrity
+//     violation class as the output-manifest mismatch, and content addressing makes
+//     it provable without any key material: rehash the file, compare to the signed
+//     digest.
+type contentStoreResult struct {
+	captured        int // file.changed records claiming capture="full"
+	withheld        int // not captured because policy said no
+	misses          int // not captured because capture failed
+	missingBlobs    int // claimed capture whose blob is absent or unreadable
+	mismatchedBlobs int // blob present, hashes to something other than the signed digest
+	storeValid      bool
+	incomplete      bool
+	tamper          bool
+	detail          string
+}
+
+// checkFileContentStore verifies the unsigned per-session content store against the
+// signed record (DESIGN "File content capture"). For every kernel-observed
+// file.changed event stamped audit.content.capture="full", the blob named by the
+// event's audit.content.digest must exist under <sessionDir>/blobs/sha256/<hex> and
+// must still hash to that digest.
+//
+// Only records passing isGuestKernelRecord are considered. A file.changed on any
+// other channel is workload narration, not an observation of the workspace, and the
+// host's capture stamp is not the workload's to make — counting those would let the
+// workload inflate or deflate the content facets at will.
+//
+// A session that captured nothing and has no store passes with an explicit skip
+// rather than a silent success, mirroring checkOutputManifest: the verifier says
+// what it did not check.
+func checkFileContentStore(records []record, sessionDir string) contentStoreResult {
+	var res contentStoreResult
+	blobsDir := filepath.Join(sessionDir, blobsDirName)
+	var missingExamples, mismatchExamples []string
+	// note records at most contentStoreExamples offenders per class.
+	note := func(dst *[]string, format string, args ...any) {
+		if len(*dst) < contentStoreExamples {
+			*dst = append(*dst, fmt.Sprintf(format, args...))
+		}
+	}
+
+	for _, r := range records {
+		if r.name != evidence.EventFileChanged || !isGuestKernelRecord(r) {
+			continue
+		}
+		if r.str(evidence.AttrContentCapture) != string(evidence.CaptureFull) {
+			// Not captured. The reason attribute is the host's account of why; an
+			// absent or unrecognized reason (every legacy digest_only event) lands in
+			// neither bucket rather than being guessed into one.
+			switch r.str(attrFileCaptureReason) {
+			case reasonSecretPolicy, reasonExcludedByPolicy, reasonSizeCap:
+				res.withheld++
+			case reasonChangedBeforeCapture, reasonMissingBeforeCapture, reasonReadError, reasonStoreError:
+				res.misses++
+			}
+			continue
+		}
+
+		res.captured++
+		digest := r.str(evidence.AttrContentDigest)
+		path, ok := blobPath(blobsDir, digest)
+		if !ok {
+			// The event claims stored content but gives no address that can name a
+			// blob. Nothing can be produced for it, so the store is short by one
+			// entry — unresolvable, not falsified.
+			res.missingBlobs++
+			note(&missingExamples, "seq %d: capture=full with unusable digest %q", r.seq, digest)
+			continue
+		}
+		if !fileExists(path) {
+			res.missingBlobs++
+			note(&missingExamples, "seq %d: no blob for %s", r.seq, digest)
+			continue
+		}
+		got, err := fileDigest(path)
+		if err != nil {
+			// Present but unreadable proves nothing about its bytes, so it is counted
+			// with the absent ones. The verifier does not accuse on an I/O error.
+			res.missingBlobs++
+			note(&missingExamples, "seq %d: blob for %s unreadable: %v", r.seq, digest, err)
+			continue
+		}
+		if got != digest {
+			res.mismatchedBlobs++
+			note(&mismatchExamples, "seq %d: blob hashes to %s, signed digest is %s", r.seq, got, digest)
+		}
+	}
+
+	res.storeValid = res.missingBlobs == 0 && res.mismatchedBlobs == 0
+	res.incomplete = res.missingBlobs > 0
+	res.tamper = res.mismatchedBlobs > 0
+
+	// Failures first, most severe named first, so the CLI line leads with the worst
+	// thing found.
+	var problems []string
+	if res.mismatchedBlobs > 0 {
+		problems = append(problems, fmt.Sprintf("%d captured blob(s) do not hash to their signed digest: %s",
+			res.mismatchedBlobs, joinStrings(mismatchExamples)))
+	}
+	if res.missingBlobs > 0 {
+		problems = append(problems, fmt.Sprintf("%d captured blob(s) absent or unreadable (signed digests still stand): %s",
+			res.missingBlobs, joinStrings(missingExamples)))
+	}
+	if len(problems) > 0 {
+		res.detail = joinStrings(problems)
+		return res
+	}
+
+	if res.captured == 0 {
+		// Nothing claims stored content. A store directory that exists anyway holds
+		// blobs no signed event points at; unreferenced bytes make no integrity claim,
+		// so they are reported, not judged.
+		if fileExists(blobsDir) {
+			res.detail = "no captured content to check (blob store directory present but unreferenced)"
+			return res
+		}
+		res.detail = "no captured content to check"
+		return res
+	}
+	res.detail = fmt.Sprintf("%d captured blob(s) re-hash to their signed digest", res.captured)
+	if res.withheld > 0 {
+		res.detail += fmt.Sprintf("; %d withheld by policy", res.withheld)
+	}
+	if res.misses > 0 {
+		res.detail += fmt.Sprintf("; %d capture miss(es)", res.misses)
+	}
+	return res
+}
+
+// blobPath re-derives the on-disk address of a captured blob from the digest a
+// sealed segment recorded. The digest must be exactly "sha256:" plus 64 lowercase
+// hex characters; anything else returns false rather than being normalized. The
+// strictness is what makes the join safe — a validated digest contains no path
+// separator, no "..", and no absolute prefix — and it is also honest about the only
+// address format the recorded evidence is allowed to use.
+func blobPath(blobsDir, digest string) (string, bool) {
+	hex, ok := strings.CutPrefix(digest, blobDigestPrefix)
+	if !ok || len(hex) != blobDigestHexLen {
+		return "", false
+	}
+	for i := 0; i < len(hex); i++ {
+		c := hex[i]
+		if (c < '0' || c > '9') && (c < 'a' || c > 'f') {
+			return "", false
+		}
+	}
+	return filepath.Join(blobsDir, blobAlgoDirName, hex), true
 }
 
 // firstSeq returns the smallest sequence recorded for an event name.
