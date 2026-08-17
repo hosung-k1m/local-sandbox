@@ -196,6 +196,7 @@ func newWebMux(sessionDir string) *http.ServeMux {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
+	registerContentRoutes(mux, fixedSessionResolver(sessionDir))
 	registerAssets(mux)
 	return mux
 }
@@ -312,6 +313,7 @@ func newDashboardMux() *http.ServeMux {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
+	registerContentRoutes(mux, querySessionResolver)
 	registerAssets(mux)
 	return mux
 }

@@ -116,7 +116,19 @@ func unifiedDiff(orig, cur string) (string, error) {
 		return "", fmt.Errorf("snapshot: prune non-regular files in %s: %w", curAbs, err)
 	}
 
-	cmd := exec.Command("git", "diff", "--no-index", "--no-color", "--", origAbs, curAbs)
+	out, err := gitDiffNoIndex(origAbs, curAbs)
+	if err != nil {
+		return "", err
+	}
+	return normalizeDiffPaths(out, origAbs, curAbs), nil
+}
+
+// gitDiffNoIndex runs `git diff --no-index --no-color` over two paths (directories
+// for unifiedDiff, single files for DiffContents) and returns its stdout verbatim.
+// Header rewriting is each caller's job, because they embed different paths and
+// want different labels back.
+func gitDiffNoIndex(a, b string) (string, error) {
+	cmd := exec.Command("git", "diff", "--no-index", "--no-color", "--", a, b)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -127,7 +139,7 @@ func unifiedDiff(orig, cur string) (string, error) {
 			return "", fmt.Errorf("snapshot: git diff --no-index: %w: %s", err, stderr.String())
 		}
 	}
-	return normalizeDiffPaths(stdout.String(), origAbs, curAbs), nil
+	return stdout.String(), nil
 }
 
 // normalizeDiffPaths strips the origAbs/curAbs directory prefixes that `git diff
@@ -160,6 +172,67 @@ func normalizeDiffPaths(diff, origAbs, curAbs string) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// DiffContents renders a unified diff between two in-memory versions of the single
+// file at relPath. It is the per-file counterpart to unifiedDiff above, for callers
+// that hold content rather than two trees on disk — the viewer's /api/filediff
+// diffing a captured blob against the session-start copy of the same path.
+//
+// Both sides are always written as real files, an empty side included. Diffing two
+// files that exist keeps this function free of /dev/null special cases: an empty
+// "from" already renders as an all-additions hunk and an empty "to" as all
+// deletions, which is what a creation and a deletion look like to a reader. The
+// cost is that the result is a plain content diff rather than a patch carrying
+// "new file mode"/"deleted file mode" metadata — nothing produced here is meant to
+// be applied (that is Apply's job, from the whole-tree workspace.diff).
+//
+// relPath is a label only: it names the two sides in the rewritten headers and is
+// never joined to a filesystem path. Identical content yields "".
+//
+// The sides go through an os.MkdirTemp directory (0700, removed on every return)
+// because git diffs paths, not pipes. That briefly places workload file content on
+// the host's temp filesystem — the same content the caller is about to serve.
+func DiffContents(relPath string, from, to []byte) (string, error) {
+	dir, err := os.MkdirTemp("", "boxedai-filediff-")
+	if err != nil {
+		return "", fmt.Errorf("snapshot: create temporary diff directory: %w", err)
+	}
+	defer os.RemoveAll(dir)
+
+	fromPath := filepath.Join(dir, "from")
+	toPath := filepath.Join(dir, "to")
+	if err := os.WriteFile(fromPath, from, 0o600); err != nil {
+		return "", fmt.Errorf("snapshot: write %s: %w", fromPath, err)
+	}
+	if err := os.WriteFile(toPath, to, 0o600); err != nil {
+		return "", fmt.Errorf("snapshot: write %s: %w", toPath, err)
+	}
+
+	out, err := gitDiffNoIndex(fromPath, toPath)
+	if err != nil {
+		return "", err
+	}
+	return rewriteContentDiffPaths(out, fromPath, toPath, relPath), nil
+}
+
+// rewriteContentDiffPaths replaces the temporary file paths git embedded in the
+// headers with relPath, so the diff reads as "a/<relPath>" / "b/<relPath>" — the
+// path the content actually came from — instead of exposing a scratch directory
+// that no longer exists by the time anyone reads the output.
+//
+// Like normalizeDiffPaths, it accounts for git rendering an absolute path inside an
+// a/ b/ prefix with the leading slash dropped (a/tmp/... for /tmp/...). The two
+// temp paths differ in their final component, so each side rewrites to exactly one
+// target and the substitutions cannot collide.
+func rewriteContentDiffPaths(diff, fromPath, toPath, relPath string) string {
+	if diff == "" {
+		return diff
+	}
+	return strings.NewReplacer(
+		"a/"+strings.TrimPrefix(fromPath, "/"), "a/"+relPath,
+		"b/"+strings.TrimPrefix(toPath, "/"), "b/"+relPath,
+	).Replace(diff)
 }
 
 // WriteDiff writes r's unified diff to workspace.diff inside sessionDir.

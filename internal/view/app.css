@@ -455,6 +455,59 @@ tr.detail-row td {
   font-size: 12px;
 }
 
+/* ---- files tab: per-path version history + inline content diff ---- */
+/* Reuses .detail-row/.chip/.ktext/.copy-btn/.btn/.meta/.empty/.mono-num as-is
+   (see the timeline expansion and chip sections above); only the nested history
+   table and the diff block are new here. */
+.file-row .caret {
+  color: var(--ink-3);
+  display: inline-block;
+  width: 1em;
+}
+.file-history {
+  font-size: 12px;
+}
+/* .table-wrap makes every th sticky so the outer table's header survives
+   scrolling; a nested table's header must not float over its own rows. */
+.file-history th {
+  position: static;
+  background: transparent;
+}
+.file-diff-hdr {
+  padding: 6px 0 4px;
+}
+.file-diff {
+  max-height: 22rem;
+  overflow: auto;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 0;
+}
+.diff-line {
+  padding: 0 10px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  color: var(--ink-2);
+}
+.diff-add {
+  color: var(--s-good);
+}
+.diff-del {
+  color: var(--s-crit);
+}
+.diff-meta {
+  color: var(--ink-3);
+}
+.file-diff-note {
+  padding: 4px 0;
+  color: var(--ink-2);
+}
+.file-diff-error {
+  padding: 4px 0;
+  color: var(--s-serious);
+}
+
 /* ---- network tab summary strip ---- */
 .summary-strip {
   padding: 8px 16px;

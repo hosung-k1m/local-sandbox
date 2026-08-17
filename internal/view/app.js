@@ -47,6 +47,21 @@ function numFmt(n) {
   return Number(n || 0).toLocaleString("en-US");
 }
 
+// fmtBytes renders a byte count compactly ("812 B", "12.4 KiB", "3.1 MiB").
+// Binary units, not decimal: the only byte counts the UI shows are captured
+// file sizes, which are read against a capture cap the policy states in binary
+// (max_bytes 8388608 = 8 MiB), and a "8.4 MB" label next to an "8 MiB" cap
+// reads like a contradiction.
+function fmtBytes(n) {
+  var v = Number(n);
+  if (!isFinite(v) || v < 0) return String(n);
+  if (v < 1024) return v + " B";
+  var units = ["KiB", "MiB", "GiB"];
+  var u = -1;
+  do { v /= 1024; u++; } while (v >= 1024 && u < units.length - 1);
+  return (v < 10 ? v.toFixed(1) : String(Math.round(v))) + " " + units[u];
+}
+
 // relTime buckets a timestamp against now into a coarse human label for the
 // dashboard's session cards ("just now", "4m ago", "3h ago", "2d ago").
 function relTime(ts) {
@@ -211,6 +226,10 @@ var BOOKKEEPING_ATTRS = new Set([
 var OUTCOMES = ["success", "failure", "denied", "cancelled", "interrupted"];
 
 var FILES_DOMAIN = new Set(["file.changed", "file.deleted", "workspace.manifested"]);
+// FILE_VERSION_NAMES are the two events that make up one path's version
+// history. Deliberately narrower than FILES_DOMAIN, which also carries
+// workspace.manifested — a whole-tree event that belongs to no single path.
+var FILE_VERSION_NAMES = new Set(["file.changed", "file.deleted"]);
 var NETWORK_DOMAIN = new Set(["network.connected", "network.denied"]);
 var ACTIONS_DOMAIN = new Set([
   "authorization.decided", "tool.requested", "tool.completed",
@@ -258,6 +277,12 @@ function isGuestAgentBinaryExec(ev) {
   return typeof argv === "string" && argv.indexOf(GUEST_AGENT_BINARY_PATH) !== -1;
 }
 
+// DIFF_MAX_LINES bounds how much of one unified diff is rendered. Diff text is
+// derived from workload-controlled file content, so a single expansion could
+// otherwise ask the browser for hundreds of thousands of DOM nodes; the tail is
+// dropped with a visible note rather than silently.
+var DIFF_MAX_LINES = 600;
+
 var HASH_DEBOUNCE_MS = 200;
 var SEARCH_DEBOUNCE_MS = 150;
 var POLL_MS = 3000;
@@ -287,6 +312,13 @@ function defaultState() {
     actionsMode: "chain", // "flat" | "chain"
     expandedSeqs: new Set(),
     expandedActionGroups: new Set(), // Actions-tab chain groups expanded (in-memory only, not URL-persisted)
+    // Files-tab per-path expansion, per-version diff expansion, and the
+    // one-shot "scroll this path into view" request the Timeline's "file
+    // history" action sets. All in-memory only, like the two sets above and
+    // filesMode itself — none of them are URL-persisted.
+    expandedFilePaths: new Set(),
+    expandedFileDiffs: new Set(), // fileDiffKey(path, from, to) values
+    filesFocusPath: "",
     // Files/Network/Actions have no chunk cap of their own — those domains
     // are inherently small subsets of the full event stream (see the doc
     // comment above the Timeline renderers section), so only Timeline needs
@@ -867,6 +899,13 @@ function timelineDetailRowHtml(ev) {
   if (pid !== undefined && pid !== null && pid !== "") {
     actions.push('<button type="button" class="btn small" data-act="focus-pid" data-value="' + esc(String(pid)) + '">focus pid ' + esc(String(pid)) + "</button>");
   }
+  // A file event's most useful next question is "what else happened to this
+  // path", which the Files tab answers in full; this jumps there rather than
+  // duplicating the version history inside the detail row.
+  var filePath = attrRaw(ev, "file.path");
+  if (FILE_VERSION_NAMES.has(ev.name) && filePath) {
+    actions.push('<button type="button" class="btn small" data-act="file-history" data-value="' + esc(String(filePath)) + '">file history →</button>');
+  }
   return (
     '<tr class="detail-row" data-detail-for="' + ev.seq + '"><td colspan="6">' +
       '<div class="detail-body">' + (ev.body ? esc(ev.body) : '<span class="empty">no body</span>') + "</div>" +
@@ -1050,6 +1089,7 @@ function bindTimelineEvents(ctx, container) {
       if (act === "copy-json") { copyEventJSON(ctx, Number(btn.dataset.seq), btn); return; }
       if (act === "filter-chain") { ctx.setSearch(btn.dataset.value); return; }
       if (act === "focus-pid") { ctx.focusPid(btn.dataset.value); return; }
+      if (act === "file-history") { ctx.showFileHistory(btn.dataset.value); return; }
       return;
     }
     var row = e.target.closest("tr.tl-row");
@@ -1205,18 +1245,324 @@ function filesLatestRowsHtml(ctx, grouped) {
   return grouped.paths.map(function (path) {
     var entry = grouped.byPath.get(path);
     var ev = model.events[entry.lastIdx];
+    var expanded = ctx.state.expandedFilePaths.has(path);
     var deleted = ev.name === "file.deleted";
     var kindChip = deleted ? ktextHtml("deleted", statusColor("crit")) : ktextHtml("changed", statusColor("good"));
     var digest = attrRaw(ev, "audit.content.digest");
-    return "<tr>" +
-      '<td class="ellipsis">' + esc(path) + "</td>" +
+    var html = '<tr class="clickable file-row" data-act="toggle-file-path" data-path="' + esc(path) + '">' +
+      '<td class="ellipsis"><span class="caret">' + (expanded ? "▾" : "▸") + "</span>" + esc(path) + "</td>" +
       "<td>" + kindChip + "</td>" +
       '<td class="mono-num">' + entry.count + "</td>" +
       "<td>" + digestCellHtml(digest) + "</td>" +
       '<td class="mono-num">' + ev.seq + "</td>" +
       "<td>" + esc(model.tsLabel[entry.lastIdx]) + "</td>" +
     "</tr>";
+    if (expanded) html += fileHistoryRowHtml(ctx, path);
+    return html;
   }).join("");
+}
+
+// ---- files tab: per-path version history + inline content diff ----
+//
+// Expanding a path row shows every version of that file the record contains,
+// derived entirely client-side from the events already loaded — no extra
+// request. /api/filediff is called only when the reader explicitly opens one
+// version's diff, because what comes back is captured workload file content: it
+// is fetched on demand, one version at a time, never eagerly.
+
+// CAPTURE_REASON_CHIPS maps file.capture.reason — the host capture path's word
+// for why a changed file's bytes were NOT stored — to a chip label and status
+// role. Withholding is normal and policy-driven (secret/excluded/too large), so
+// those read muted rather than alarming; losing a race with the workload is a
+// warn (the digest and the bytes on disk drifted apart); a read/store failure
+// is serious, because capture was supposed to happen and didn't.
+var CAPTURE_REASON_CHIPS = {
+  secret_policy: {
+    label: "secret — withheld", role: "muted",
+    title: "the capture policy classifies this path as secret; the change is still attested by its digest",
+  },
+  excluded_by_policy: {
+    label: "excluded", role: "muted",
+    title: "the path lives under a directory the capture policy excludes",
+  },
+  size_cap: {
+    label: "too large", role: "muted",
+    title: "the file is larger than the capture policy's size cap",
+  },
+  changed_before_capture: {
+    label: "not captured (changed mid-scan)", role: "warn",
+    title: "the file changed again between the digest scan and the capture read, so no bytes match the recorded digest",
+  },
+  missing_before_capture: {
+    label: "not captured (changed mid-scan)", role: "warn",
+    title: "the file was gone by the time capture tried to read it",
+  },
+  read_error: { label: "capture error", role: "serious", title: "the host could not read the file" },
+  store_error: { label: "capture error", role: "serious", title: "the host could not store the content" },
+};
+
+// fileCaptureChipHtml renders one version's capture state. capture=="full" is
+// the ONLY value that means bytes exist in the blob store (and therefore that a
+// diff can be fetched); every other value — including no attribute at all,
+// which is the shape of every session recorded before content capture existed —
+// means digest-only evidence.
+function fileCaptureChipHtml(ev) {
+  var capture = attrRaw(ev, "audit.content.capture");
+  if (capture === "full") {
+    var size = attrRaw(ev, "file.size");
+    var known = size !== undefined && size !== null && size !== "";
+    return chipHtml(known ? "content · " + fmtBytes(size) : "content", statusColor("good"), null,
+      "the content is stored in this session's blob store");
+  }
+  var reason = attrRaw(ev, "file.capture.reason");
+  var mapped = reason ? CAPTURE_REASON_CHIPS[reason] : null;
+  if (mapped) return chipHtml(mapped.label, statusColor(mapped.role), null, mapped.title);
+  if (reason) {
+    // Forward compatibility: a reason this client doesn't know is reported as
+    // an unexplained non-capture rather than flattened into "digest only",
+    // which would claim content capture was never attempted for it.
+    return chipHtml("not captured", statusColor("muted"), null, "file.capture.reason=" + String(reason));
+  }
+  return chipHtml("digest only", statusColor("muted"), null,
+    capture ? "audit.content.capture=" + String(capture) : "this session recorded no content capture");
+}
+
+// filePathVersions derives one path's full version history from the loaded
+// events: every file.changed/file.deleted carrying that exact file.path, in
+// ascending seq order, each annotated with the diff base its "diff" toggle
+// should ask the server for.
+//
+// It deliberately ignores the tab's search/outcome filter. The expansion
+// answers "what happened to this file", not "what matches the filter" — and,
+// more importantly, `from` resolution must see every version: a filtered-out
+// captured version would otherwise be skipped and the diff taken against the
+// wrong base while still naming a seq in its header.
+//
+// from-resolution: the nearest OLDER version of the same path whose content was
+// actually captured, else "baseline" (the session-start copy, which the server
+// resolves; a file absent at session start yields a new-file diff). Everything
+// between that base and this version is by construction uncaptured — the scan
+// stops at the first captured predecessor — so `skipped` is exactly how many
+// versions the diff jumps over, and the header says so instead of implying a
+// change-by-change history.
+function filePathVersions(model, path) {
+  var out = [];
+  for (var i = 0; i < model.events.length; i++) {
+    var ev = model.events[i];
+    if (!FILE_VERSION_NAMES.has(ev.name)) continue;
+    if (attrRaw(ev, "file.path") !== path) continue;
+    out.push({
+      idx: i,
+      ev: ev,
+      deleted: ev.name === "file.deleted",
+      captured: attrRaw(ev, "audit.content.capture") === "full",
+      digest: attrRaw(ev, "audit.content.digest") || "",
+      from: "",
+      fromSeq: 0,
+      skipped: 0,
+    });
+  }
+  out.forEach(function (v, k) {
+    if (!v.captured || !v.digest) return;
+    for (var j = k - 1; j >= 0; j--) {
+      if (out[j].captured && out[j].digest) {
+        v.from = out[j].digest;
+        v.fromSeq = out[j].ev.seq;
+        v.skipped = k - j - 1;
+        return;
+      }
+    }
+    v.from = "baseline";
+    v.skipped = k; // every earlier version of this path went uncaptured
+  });
+  return out;
+}
+
+// fileDiffBaseLabel names what a version is being diffed against, honestly: the
+// exact seq when the base is another recorded version, the session-start copy
+// when it is the baseline, and in both cases how many versions were jumped.
+function fileDiffBaseLabel(v) {
+  var base = v.from === "baseline" ? "vs session start" : "vs seq " + v.fromSeq;
+  if (!v.skipped) return base;
+  return base + " (" + numFmt(v.skipped) +
+    (v.skipped === 1 ? " uncaptured version" : " uncaptured versions") + " in between)";
+}
+
+// fileDiffKey identifies one cached diff. path+from+to rather than path+digest:
+// `from` is derived from the version list, so keying on it too means a cached
+// entry can never be shown under a different base than the one it was fetched
+// with. " " occurs in neither a path nor a digest, so it separates
+// unambiguously.
+function fileDiffKey(path, from, to) {
+  return path + " " + from + " " + to;
+}
+
+// apiSessionParam is the trailing query parameter the per-session content
+// endpoints need on the dashboard, whose one global mux serves every session —
+// the same "id=<session>" the sidebar's own /api/session fetch passes. The
+// single-session viewer's mux is already bound to one session directory, so
+// there it is empty.
+function apiSessionParam(ctx) {
+  if (ctx.mode !== "embedded") return "";
+  var id = ctx.payload && ctx.payload.session_id;
+  return id ? "&id=" + encodeURIComponent(id) : "";
+}
+
+// fetchFileDiff resolves one /api/filediff request into the per-view cache and
+// re-renders the Files tab when it lands. Failures are cached as inline
+// messages rather than retried: all three failure modes (403 withheld by
+// policy, 404 blob absent, anything else) are durable for a given
+// path+from+to, so retrying would only re-ask the same question.
+function fetchFileDiff(ctx, key, path, from, to) {
+  ctx.diffCache.set(key, { status: "loading" });
+  var forSession = ctx.payload && ctx.payload.session_id;
+  var url = "/api/filediff?path=" + encodeURIComponent(path) +
+    "&from=" + encodeURIComponent(from) + "&to=" + encodeURIComponent(to) + apiSessionParam(ctx);
+  fetch(url).then(function (r) {
+    if (r.ok) {
+      return r.json().then(function (d) {
+        return { status: "ok", diff: d && typeof d.diff === "string" ? d.diff : "" };
+      });
+    }
+    if (r.status === 403) return { status: "error", message: "content withheld by policy" };
+    if (r.status === 404) return { status: "error", message: "content unavailable" };
+    return r.text().then(function (t) {
+      return { status: "error", message: t.trim() || "request failed (HTTP " + r.status + ")" };
+    });
+  }).catch(function (err) {
+    return { status: "error", message: String((err && err.message) || err) };
+  }).then(function (entry) {
+    // The dashboard can switch sessions while this is in flight. A late result
+    // must never land in the next session's cache — "from=baseline" resolves
+    // against the session's own workspace.orig, so it is genuinely
+    // session-specific (same guard fetchDashboardSession applies to its own
+    // late payloads).
+    if ((ctx.payload && ctx.payload.session_id) !== forSession) return;
+    ctx.diffCache.set(key, entry);
+    if (ctx.state.tab === "files") updateFilesTab(ctx);
+  });
+}
+
+// toggleFileDiff opens or closes one version's inline diff, fetching it the
+// first time and never again: a sealed session's content is immutable and the
+// cache is keyed by path+from+to, so re-expanding is always served from memory.
+function toggleFileDiff(ctx, path, from, to) {
+  var key = fileDiffKey(path, from, to);
+  if (ctx.state.expandedFileDiffs.has(key)) {
+    ctx.state.expandedFileDiffs.delete(key);
+  } else {
+    ctx.state.expandedFileDiffs.add(key);
+    if (!ctx.diffCache.has(key)) fetchFileDiff(ctx, key, path, from, to);
+  }
+  updateFilesTab(ctx);
+}
+
+// fileDiffBodyHtml renders one unified diff. EVERY line goes through esc()
+// before it reaches the DOM: this block is the one place in the viewer that
+// renders captured workload file bytes, so it is also the easiest place to hand
+// a workload an injection if a single line ever skipped escaping.
+function fileDiffBodyHtml(entry) {
+  if (!entry || entry.status === "loading") return '<div class="meta">loading diff…</div>';
+  if (entry.status === "error") return '<div class="file-diff-error">' + esc(entry.message) + "</div>";
+  if (!entry.diff) return '<div class="meta">no content change (identical bytes)</div>';
+  var lines = entry.diff.split("\n");
+  if (lines.length && lines[lines.length - 1] === "") lines.pop(); // trailing newline, not a blank line
+  // git reports binary content as a "Binary files a/… and b/… differ" line in
+  // place of hunks — after the diff/index header lines, not necessarily as the
+  // very first line. Rendering it as a diff body would imply the bytes are
+  // renderable text, so it is lifted out as a plain note instead.
+  for (var b = 0; b < lines.length; b++) {
+    if (lines[b].indexOf("@@") === 0) break;
+    if (lines[b].indexOf("Binary files ") === 0) {
+      return '<div class="file-diff-note">' + esc(lines[b]) + "</div>";
+    }
+  }
+  var shown = lines.slice(0, DIFF_MAX_LINES);
+  var seenHunk = false;
+  var html = shown.map(function (line) {
+    var cls = "diff-line";
+    if (line.indexOf("@@") === 0) { seenHunk = true; cls += " diff-meta"; }
+    else if (!seenHunk) cls += " diff-meta"; // the diff/index/---/+++ preamble
+    else if (line.indexOf("+") === 0) cls += " diff-add";
+    else if (line.indexOf("-") === 0) cls += " diff-del";
+    else if (line.indexOf("\\") === 0) cls += " diff-meta"; // "\ No newline at end of file"
+    return '<div class="' + cls + '">' + (esc(line) || "&nbsp;") + "</div>";
+  }).join("");
+  if (lines.length > shown.length) {
+    html += '<div class="diff-line diff-meta">… ' + numFmt(lines.length - shown.length) + " more lines not shown</div>";
+  }
+  return '<div class="file-diff">' + html + "</div>";
+}
+
+// fileVersionRowHtml renders one version line plus, when its diff is open, the
+// diff block beneath it. file.deleted rows carry no content and get no diff
+// affordance — a deletion's "before" is the previous version, which is already
+// diffable from that version's own row.
+function fileVersionRowHtml(ctx, path, v) {
+  var ev = v.ev;
+  var kindChip = v.deleted ? ktextHtml("deleted", statusColor("crit")) : ktextHtml("changed", statusColor("good"));
+  // A capture with no digest to name it can't be fetched (and never resolved a
+  // `from` either), so it gets no diff affordance rather than a broken request.
+  var diffable = v.captured && !!v.digest;
+  var diffKey = fileDiffKey(path, v.from, v.digest);
+  var open = diffable && ctx.state.expandedFileDiffs.has(diffKey);
+  var diffCell = diffable
+    ? '<button type="button" class="btn small' + (open ? " active" : "") + '" data-act="file-diff"' +
+      ' data-path="' + esc(path) + '" data-from="' + esc(v.from) + '" data-to="' + esc(v.digest) + '">diff</button>'
+    : '<span class="empty">—</span>';
+  var html = "<tr>" +
+    '<td class="mono-num">' + ev.seq + "</td>" +
+    "<td>" + esc(ctx.model.tsLabel[v.idx]) + "</td>" +
+    "<td>" + kindChip + "</td>" +
+    "<td>" + (v.digest ? digestCellHtml(v.digest) : '<span class="empty">—</span>') + "</td>" +
+    "<td>" + (v.deleted ? '<span class="empty">—</span>' : fileCaptureChipHtml(ev)) + "</td>" +
+    "<td>" + esc(attrRaw(ev, "observer") || "") + "</td>" +
+    "<td>" + diffCell + "</td>" +
+  "</tr>";
+  if (open) {
+    html += '<tr class="file-diff-row"><td colspan="7">' +
+      '<div class="file-diff-hdr meta">' + esc(fileDiffBaseLabel(v)) + "</div>" +
+      fileDiffBodyHtml(ctx.diffCache.get(diffKey)) +
+    "</td></tr>";
+  }
+  return html;
+}
+
+// fileHistoryRowHtml is the expansion under one path row: its versions newest
+// first, matching the Timeline's default order.
+function fileHistoryRowHtml(ctx, path) {
+  var versions = filePathVersions(ctx.model, path);
+  if (!versions.length) {
+    // Reachable for the "(no path)" bucket filesLatestGroups creates for file
+    // events that carry no file.path at all.
+    return '<tr class="detail-row"><td colspan="6"><span class="empty">no version history</span></td></tr>';
+  }
+  var rows = versions.slice().reverse().map(function (v) {
+    return fileVersionRowHtml(ctx, path, v);
+  }).join("");
+  return '<tr class="detail-row"><td colspan="6">' +
+    '<table class="file-history"><thead><tr>' +
+      "<th>Seq</th><th>Time</th><th>Change</th><th>Digest</th><th>Capture</th><th>Observer</th><th></th>" +
+    "</tr></thead><tbody>" + rows + "</tbody></table>" +
+  "</td></tr>";
+}
+
+// scrollFilesFocusIntoView honours the one-shot focus request the Timeline's
+// "file history" action sets. The row is found by comparing dataset values, not
+// by building an attribute selector — a workload-controlled path may contain
+// quotes — and the request is cleared whether or not the row exists, so a path
+// hidden by the active filter can't leave a focus that re-scrolls on every poll.
+function scrollFilesFocusIntoView(ctx) {
+  var want = ctx.state.filesFocusPath;
+  if (!want) return;
+  ctx.state.filesFocusPath = "";
+  var rows = ctx.els.filesTableWrap.querySelectorAll("tr[data-path]");
+  for (var i = 0; i < rows.length; i++) {
+    if (rows[i].dataset.path === want) {
+      rows[i].scrollIntoView({ block: "center" });
+      return;
+    }
+  }
 }
 
 function filesToolbarHtml(state, countsText) {
@@ -1241,6 +1587,24 @@ function mountFilesTab(ctx) {
     var btn = e.target.closest("[data-act]");
     if (btn && btn.dataset.act === "files-mode") { ctx.state.filesMode = btn.dataset.value; updateFilesTab(ctx); }
   });
+  // The table's own actions: path expand/collapse, per-version diff toggle, and
+  // the digest copy affordance digestCellHtml renders into every row (the
+  // filter-bar listener bindCommonFilterEvents installs never sees clicks in
+  // the table, so copy-text has to be handled here).
+  ctx.els.filesTableWrap.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-act]");
+    if (!btn) return;
+    var act = btn.dataset.act;
+    if (act === "copy-text") { copyToClipboard(btn.dataset.value, btn); return; }
+    if (act === "toggle-file-path") {
+      var path = btn.dataset.path;
+      if (ctx.state.expandedFilePaths.has(path)) ctx.state.expandedFilePaths.delete(path);
+      else ctx.state.expandedFilePaths.add(path);
+      updateFilesTab(ctx);
+      return;
+    }
+    if (act === "file-diff") { toggleFileDiff(ctx, btn.dataset.path, btn.dataset.from, btn.dataset.to); return; }
+  });
 }
 
 function updateFilesTab(ctx) {
@@ -1257,6 +1621,7 @@ function updateFilesTab(ctx) {
     ctx.els.filesTableWrap.innerHTML =
       "<table><thead><tr><th>Path</th><th>Last event</th><th>Changes</th><th>Last digest</th><th>Last seq</th><th>Last time</th></tr></thead><tbody>" +
       (filesLatestRowsHtml(ctx, grouped) || '<tr><td colspan="6" class="empty">no matching events</td></tr>') + "</tbody></table>";
+    scrollFilesFocusIntoView(ctx);
   }
 }
 
@@ -2272,6 +2637,10 @@ function createSessionView(rootEl, opts) {
     payload: null,
     model: null,
     agentActivityNames: new Set(), // repopulated per payload in setSessionViewPayload from payload.agent_activity_names
+    // Per-view /api/filediff cache, keyed by fileDiffKey. Lives on the view (not
+    // in state) because it holds fetched content rather than UI intent, and is
+    // dropped whenever the view switches sessions — blobs are session-scoped.
+    diffCache: new Map(),
     root: rootEl,
     els: {},
     mode: opts.mode || "standalone",
@@ -2311,6 +2680,17 @@ function createSessionView(rootEl, opts) {
     resetTimelineChunk(ctx.state);
     if (ctx.state.tab !== "timeline") ctx.switchTab("timeline");
     else ctx.refreshAll();
+  };
+  // showFileHistory is the Timeline's "file history" jump: the Files tab in
+  // latest-per-path mode, with that path already expanded and scrolled to.
+  // switchTab renders the tab itself, so it only re-renders directly when the
+  // reader is already on Files.
+  ctx.showFileHistory = function (path) {
+    ctx.state.filesMode = "latest";
+    ctx.state.expandedFilePaths.add(path);
+    ctx.state.filesFocusPath = path;
+    if (ctx.state.tab !== "files") ctx.switchTab("files");
+    else updateFilesTab(ctx);
   };
   ctx.manualRefresh = function () {
     if (ctx.mode === "standalone") fetchStandalone(ctx);
@@ -2380,6 +2760,10 @@ function setSessionViewPayload(ctx, payload) {
     ctx.model = buildModel(newEvents);
     ctx.state.expandedSeqs = new Set(); // seqs from a different session are meaningless here
     ctx.state.expandedActionGroups = new Set();
+    ctx.state.expandedFilePaths = new Set();
+    ctx.state.expandedFileDiffs = new Set();
+    ctx.state.filesFocusPath = "";
+    ctx.diffCache = new Map(); // blob content is session-scoped: never show one session's bytes under another
     ctx.tlRenderedCount = 0;
     resetTimelineChunk(ctx.state);
     if (isNewSession && payload.proof) {
