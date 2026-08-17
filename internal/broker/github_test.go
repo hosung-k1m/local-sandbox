@@ -15,7 +15,7 @@ import (
 
 func githubConfig(t *testing.T, extraCaps []string, approver Approver) Config {
 	t.Helper()
-	pol, err := policy.Resolve(policy.ProfileDevelop, extraCaps)
+	pol, err := policy.Resolve(policy.ProfileDevelop, extraCaps, nil)
 	if err != nil {
 		t.Fatalf("resolve policy: %v", err)
 	}
@@ -392,7 +392,7 @@ func TestGitBridgeRejectsWrongAuthAndServiceBeforeSSH(t *testing.T) {
 }
 
 func TestLegacyHostGitPushAdapterIsDisabled(t *testing.T) {
-	pol, err := policy.Resolve(policy.ProfileDevelop, []string{"external-write:github"})
+	pol, err := policy.Resolve(policy.ProfileDevelop, []string{"external-write:github"}, nil)
 	if err != nil {
 		t.Fatalf("resolve policy: %v", err)
 	}

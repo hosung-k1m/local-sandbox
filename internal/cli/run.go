@@ -28,6 +28,7 @@ func newRunCmd() *cobra.Command {
 	var (
 		profile    string
 		caps       []string
+		secrets    []string
 		execCmd    string
 		keepVM     bool
 		repository string
@@ -45,7 +46,7 @@ func newRunCmd() *cobra.Command {
 		Args: runArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			positional, harnessArgs := splitDashArgs(c, args)
-			opts, err := buildRunOptions(positional, profile, caps, execCmd, keepVM, repository, branch, harnessArgs)
+			opts, err := buildRunOptions(positional, profile, caps, secrets, execCmd, keepVM, repository, branch, harnessArgs)
 			if err != nil {
 				return err
 			}
@@ -74,6 +75,7 @@ func newRunCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&profile, "profile", string(policy.ProfileDevelop), "isolation profile: develop|review|restricted")
 	cmd.Flags().StringArrayVar(&caps, "cap", nil, "grant an extra capability, e.g. external-write:github (repeatable)")
+	cmd.Flags().StringArrayVar(&secrets, "secret", nil, `glob for workspace files whose content is never captured (digest-only evidence), e.g. "*.secret"; repeatable, adds to the profile's defaults`)
 	cmd.Flags().StringVar(&execCmd, "cmd", "", "shell command for the exec harness")
 	cmd.Flags().BoolVar(&keepVM, "keep-vm", false, "leave the Lima VM in place after the session (debugging)")
 	cmd.Flags().StringVar(&repository, "repo", "", "remote Git repository to clone fresh for this session")
@@ -108,7 +110,7 @@ func splitDashArgs(c *cobra.Command, args []string) (positional, harnessArgs []s
 // front so the CLI fails fast with a clear message before any session setup
 // begins. Factored out so tests can assert the flag→options mapping without
 // launching a VM.
-func buildRunOptions(args []string, profile string, caps []string, execCmd string, keepVM bool, repository, branch string, harnessArgs []string) (session.RunOptions, error) {
+func buildRunOptions(args []string, profile string, caps, secrets []string, execCmd string, keepVM bool, repository, branch string, harnessArgs []string) (session.RunOptions, error) {
 	harness := args[0]
 	switch harness {
 	case "claude", "codex", "exec":
@@ -132,6 +134,9 @@ func buildRunOptions(args []string, profile string, caps []string, execCmd strin
 	if branch != "" && repository == "" {
 		return session.RunOptions{}, fmt.Errorf("cli: --branch requires --repo")
 	}
+	// Secret globs are not validated here: policy.Resolve rejects malformed
+	// patterns while resolving, so the CLI keeps one validation site rather than
+	// a second, drifting copy of the rule.
 	return session.RunOptions{
 		Harness:     harness,
 		RepoPath:    repoPath,
@@ -139,6 +144,7 @@ func buildRunOptions(args []string, profile string, caps []string, execCmd strin
 		Branch:      branch,
 		Profile:     prof,
 		ExtraCaps:   caps,
+		SecretGlobs: secrets,
 		Cmd:         execCmd,
 		HarnessArgs: harnessArgs,
 		KeepVM:      keepVM,

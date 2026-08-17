@@ -151,6 +151,16 @@ func TestRunFlagsMapToRunOptions(t *testing.T) {
 				Profile:    policy.ProfileDevelop,
 			},
 		},
+		{
+			name: "claude with repeated secret globs",
+			args: []string{"run", "claude", "/tmp/repo", "--secret", "*.secret", "--secret", "config/*.json"},
+			want: session.RunOptions{
+				Harness:     "claude",
+				RepoPath:    "/tmp/repo",
+				Profile:     policy.ProfileDevelop,
+				SecretGlobs: []string{"*.secret", "config/*.json"},
+			},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -212,33 +222,40 @@ func TestRunDashArgsRejectedForExecHarness(t *testing.T) {
 
 // buildRunOptions validates the harness and profile before any session setup.
 func TestBuildRunOptionsValidation(t *testing.T) {
-	if _, err := buildRunOptions([]string{"bogus"}, "develop", nil, "", false, "", "", nil); err == nil {
+	if _, err := buildRunOptions([]string{"bogus"}, "develop", nil, nil, "", false, "", "", nil); err == nil {
 		t.Error("expected error for unknown harness")
 	}
-	if _, err := buildRunOptions([]string{"claude"}, "bogus", nil, "", false, "", "", nil); err == nil {
+	if _, err := buildRunOptions([]string{"claude"}, "bogus", nil, nil, "", false, "", "", nil); err == nil {
 		t.Error("expected error for unknown profile")
 	}
-	if _, err := buildRunOptions([]string{"exec"}, "develop", nil, "true", false, "", "", []string{"-p", "ping"}); err == nil {
+	if _, err := buildRunOptions([]string{"exec"}, "develop", nil, nil, "true", false, "", "", []string{"-p", "ping"}); err == nil {
 		t.Error("expected error for exec harness with passthrough args")
 	}
-	opts, err := buildRunOptions([]string{"claude"}, "develop", nil, "", false, "", "", nil)
+	opts, err := buildRunOptions([]string{"claude"}, "develop", nil, nil, "", false, "", "", nil)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if opts.Harness != "claude" || opts.Profile != policy.ProfileDevelop || opts.RepoPath != "" {
 		t.Errorf("unexpected options: %+v", opts)
 	}
-	opts, err = buildRunOptions([]string{"claude"}, "develop", nil, "", false, "", "", []string{"-p", "ping pong"})
+	opts, err = buildRunOptions([]string{"claude"}, "develop", nil, nil, "", false, "", "", []string{"-p", "ping pong"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	if len(opts.HarnessArgs) != 2 || opts.HarnessArgs[0] != "-p" || opts.HarnessArgs[1] != "ping pong" {
 		t.Errorf("HarnessArgs = %v, want [-p, ping pong]", opts.HarnessArgs)
 	}
-	if _, err := buildRunOptions([]string{"claude", "."}, "develop", nil, "", false, "remote", "main", nil); err == nil {
+	opts, err = buildRunOptions([]string{"claude"}, "develop", nil, []string{"*.secret", "config/*.json"}, "", false, "", "", nil)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(opts.SecretGlobs) != 2 || opts.SecretGlobs[0] != "*.secret" || opts.SecretGlobs[1] != "config/*.json" {
+		t.Errorf("SecretGlobs = %v, want [*.secret, config/*.json]", opts.SecretGlobs)
+	}
+	if _, err := buildRunOptions([]string{"claude", "."}, "develop", nil, nil, "", false, "remote", "main", nil); err == nil {
 		t.Error("expected error when [path] and --repo are combined")
 	}
-	if _, err := buildRunOptions([]string{"claude"}, "develop", nil, "", false, "", "main", nil); err == nil {
+	if _, err := buildRunOptions([]string{"claude"}, "develop", nil, nil, "", false, "", "main", nil); err == nil {
 		t.Error("expected error when --branch is used without --repo")
 	}
 }
