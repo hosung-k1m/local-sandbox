@@ -55,7 +55,7 @@ internal/snapshot      APFS-clone workspace snapshot, content manifest, diff, ap
 internal/vm            lima template generation, VM lifecycle, provisioning, launch
 internal/view          SQLite projection, CLI timeline, embedded web viewer
 guest/agent            guest supervisor binary (linux/arm64 + linux/amd64)
-guest/provision        provisioning shell scripts embedded into lima.yaml
+internal/vm/provision.go provisioning shell scripts embedded into lima.yaml
 ```
 
 Dependency direction (no cycles):
@@ -180,6 +180,19 @@ plus when applicable: `audit.action.id`, `audit.parent_action.id`,
 `audit.correlation` (`strong|lineage|none`), `vm.id`, `vm.boot.id`,
 `process.exec.id`, `process.pid`, `process.parent_pid`, `process.cgroup.id`.
 
+An `agent.*` family groups workload activity under the logical agent (Primary
+Agent or subagent) responsible: `agent.id` (session-scoped BoxedAi id — see
+"Agent hierarchy and attribution"), `agent.native_id` (the harness-reported id
+the BoxedAi id derives from — an attribute only, never identity),
+`agent.parent.id`, `agent.role` (`primary|child`), `agent.type` (harness
+subagent type), `agent.harness`, `agent.outcome`, `agent.execution_scope`
+(`session`; `cgroup` is reserved for a future trusted-executor phase and is
+produced by nothing today), `agent.attribution.method`
+(`controller|native_harness|trusted_cgroup|process_inheritance|broker_context|unattributed`),
+and `agent.attribution.strength` (`strong|lineage|self_reported|none`). Like
+`audit.evidence.class`, the method and strength are assigned by the recorder from
+the authenticated producer channel, never accepted from the payload.
+
 Evidence classes (assigned by the recorder from the authenticated producer channel,
 NEVER accepted from the payload):
 
@@ -197,7 +210,7 @@ the attempt.
 
 Event catalog (v0.1 set): `session.granted session.started session.stopped
 session.sealed policy.loaded authorization.decided model.requested model.completed
-tool.requested tool.completed process.created process.executed process.exited file.changed file.deleted
+tool.requested tool.completed agent.started agent.completed process.created process.executed process.exited file.changed file.deleted
 workspace.manifested network.connected network.denied internal_tool.dispatched
 internal_tool.completed internal_tool.failed effect.requested effect.approved
 effect.denied effect.dispatched effect.completed effect.failed credential.issued
@@ -269,15 +282,23 @@ invariants: every `effect.dispatched` is preceded by a successful `effect.approv
 with matching action digest, and every `internal_tool.dispatched` is preceded by a
 successful `authorization.decided` for the same action; (10) output-manifest digest
 matches `workspace.manifested`; (11) the session trust record passes its profile,
-schema, key, signature, semantic, and independent cross-derivation gates.
+schema, key, signature, semantic, and independent cross-derivation gates;
+(12) when agent tracking is present, the hierarchy reconstructed from the signed
+segments satisfies the ownership invariants (see "Agent hierarchy and
+attribution") — hierarchy anomalies and unattributed workload in a
+capability-gated category are INCOMPLETE, never TAMPER.
 
 Verdicts: `LOCAL_ONLY` (all checks pass; ceiling in v0.1), `INCOMPLETE` (missing
-close/seal, sensor loss, or unresolved tail), `BYPASS_DETECTED` (flow invariant
-violated), `TAMPER_SUSPECTED` (signature/digest/sequence inconsistency).
+close/seal, sensor loss, unresolved tail, or an invalid agent hierarchy),
+`BYPASS_DETECTED` (flow invariant violated), `TAMPER_SUSPECTED`
+(signature/digest/sequence/grant/trust-record inconsistency — all host-side
+artifacts). No workload-forgeable input maps to `TAMPER_SUSPECTED`: the distrusted
+workload can force at most `INCOMPLETE`, never brand its own session host-tampered.
 `VERIFIED` is unreachable in v0.1 and the verifier must say why when asked.
 Also report facets: signature validity, chain validity, sequence continuity, close
 status, sensor-loss count, ungated-activity count, trust-record status/profile,
-trust-record signature validity, cross-derivation status, and assurance level.
+trust-record signature validity, cross-derivation status, agent tracking, agent
+count, agent-hierarchy validity, unattributed-workload count, and assurance level.
 
 ## Session trust record (boxedai.trust-record/v1)
 
@@ -521,18 +542,25 @@ approver does not preapprove it, so it remains fail-closed.
 
 ## Harness hook capture — lefthook / righthook
 
-Claude sessions record every harness tool invocation — each Bash command, file read,
-edit, search, and subagent tool call — as workload-channel evidence, independent of
-the kernel sensor (whose diagnostic procfs path cannot see short-lived processes like `ls`,
-and can never see shell builtins like `cd`). The controller stages a BoxedAi-authored
+Claude sessions can narrate harness tool invocations — Bash commands, file reads,
+edits, searches, and subagent tool calls — as workload-channel evidence independent
+of the kernel sensor (whose diagnostic procfs path can miss short-lived processes like
+`ls` and can never see shell builtins like `cd`). The controller stages a BoxedAi-authored
 `settings.json` into the session harness home (never copied from the host — the
 existing host-settings exclusion stands) wiring two Claude Code hooks, named for the
 box the agent runs in:
 
 - `PreToolUse` → `boxedai-guest-agent lefthook` → emits `tool.requested`
 - `PostToolUse` → `boxedai-guest-agent righthook` → emits `tool.completed`
+- `SubagentStart`/`SubagentStop` → `boxedai-guest-agent agenthook` → emit
+  `agent.started`/`agent.completed` for subagents (see "Agent hierarchy and
+  attribution")
 
-Both hooks match every tool (`matcher: "*"`). Each reads the harness's hook JSON on
+The Pre/PostToolUse hooks match every tool (`matcher: "*"`); the subagent hooks
+carry no matcher. The controller records the SHA-256 digest of the exact staged
+`settings.json` bytes as controller evidence. This proves which staged artifact was
+measured, not that the workload ran under those settings: the harness home is
+writable by the untrusted workload. Each hook reads the harness's hook JSON on
 stdin and POSTs one event to `POST /v1/events` using `BOXEDAI_BROKER_URL` and the
 workload token from `BOXEDAI_WORKLOAD_TOKEN` (token W, already present in the
 workload environment as the harness auth token — no new exposure), so the recorder
@@ -547,6 +575,36 @@ Bash the event body carries the command string (workspace command lines are not
 secrets by policy). `tool.completed` adds the tool-response digest and byte size,
 never response content. A `tool.requested` with no matching `tool.completed` means
 the tool was denied, failed, or interrupted before completing.
+
+Each hook additionally records the harness-supplied `session_id`,
+`transcript_path`, `cwd`, and `hook_event_name` as bounded `harness.*`
+attributes, and — when the harness identifies the acting agent — its
+`agent_id`/`agent_type` (Claude Code sends these in every hook fired inside a
+subagent). Because that tagging is exhaustive for subagents, a tool event with no
+`agent_id` is the harness main loop's own call and is stamped with the
+controller-minted Primary's id from `BOXEDAI_AGENT_ID` — `self_reported` like all
+hook narration, and without `agent.native_id`/`agent.type`, which the Primary does
+not have. A hook process with no Primary id in its environment leaves the event
+Unattributed Workload rather than guessing.
+
+A subagent-spawning call additionally records its spawn narration, lifted out of the
+size-capped `harness.tool.input` excerpt because the embedded subagent prompt can
+crowd the description out of it. Claude Code names that tool `Task` in some versions
+and `Agent` in others — both are in the wild, so both are matched:
+
+- `harness.task.description` — the harness's one-line description of the spawn.
+- `harness.task.subagent_type` — the subagent type it asked for.
+
+Both are `self_reported` narration used for display-only spawn pairing: the viewer
+pairs a spawn with the child that likely followed it, and the record claims no such
+linkage (nothing correlates a spawn call to a `SubagentStart`).
+
+The hook also records its own `process.pid`/`process.parent_pid`. When
+authenticated guest-supervisor evidence contains exactly one trusted incarnation
+for that PID, offline verification can use it as a plausibility anchor for the
+self-reported hook event. It is recorded with `audit.correlation=none` — the join
+is derived in verify/view, never claimed on the wire (the
+no-cross-channel-causal-join rule stands).
 
 Hook and kernel events arrive over independent authenticated channels. The recorder
 sequences them in arrival order; a harness tool-use id does not authenticate a
@@ -568,11 +626,159 @@ procfs.
 
 Hook capture is honest-but-self-reported: it originates inside the distrusted
 workload, so a compromised harness can suppress or forge it. It exists to make the
-timeline complete, not to strengthen the security claim — hook events never enter
-the trust record's broker-derived activity claims or tool-transcript binding. Hooks
-fail open (always exit 0, errors to stderr → native debug log) so evidence-capture
-problems never break the workload. Codex and exec harnesses have no hook mechanism
-in v0.1 (gap-noted).
+timeline more useful, not to make it complete or strengthen the security claim —
+hook events (tool capture AND subagent `agent.*` registration) never enter the trust
+record's broker-derived activity claims or tool-transcript binding. Hooks fail open (always
+exit 0, errors to stderr → native debug log) so evidence-capture problems never
+break the workload. The `exec` harness has no hook mechanism; Codex ships a
+compatible hooks system but its adapter is deferred, so only Claude sessions stage
+hook wiring in v0.1 (gap-noted).
+
+## Agent hierarchy and attribution
+
+BoxedAi groups positively labelled workload events under the claimed logical agent
+— the Primary Agent (the top-level harness loop) or a Child Agent (a subagent it
+spawned) — and leaves all other workload activity explicitly Unattributed. Grouping
+is narrated by the distrusted harness and is therefore self-reported; it never
+strengthens the security claim, and no self-reported label is ever presented as
+authenticated fact.
+
+Two tracks, never merged:
+
+- Narration (distrusted, fail-open): hook-submitted `agent.started`/
+  `agent.completed` registrations and the `agent.id` label stamped on tool
+  events. Class `harness_observed`, strength `self_reported`, always.
+- Observation (authenticated and independent of narration): Tetragon or explicitly
+  degraded procfs process evidence, broker-mediated model/tool/git egress, nftables
+  denials, and workspace scans. Coverage is category-limited rather than complete:
+  fail-open hooks can suppress tool and lifecycle narration, file reads remain
+  invisible, and some short-lived activity can be missed under degraded sensing.
+  "Did the available observation corroborate it" and "who claims it" (attribution
+  strength) are orthogonal and reported separately; corroboration never upgrades
+  strength.
+
+Identity. A BoxedAi agent id is `ag-` followed by the first 16 hex characters of
+`sha256("boxedai.agent/v1|" + session_id + "|" + scope + "|" + native_id)`.
+Derivation is deterministic, so the stateless hook processes, the controller, and
+the offline verifier all compute the same id independently; an id that does not
+match its claimed `agent.native_id` is mechanically detectable, and duplicate
+registrations collapse. The Primary Agent is controller-minted and
+controller-emitted (`agent.started` right after `session.started`, closed in
+teardown before `session.stopped`), attribution `controller`/`strong`. Child
+Agents are hook-registered on the workload channel, attribution
+`native_harness`/`self_reported`; a child's `native_id` is the harness-native
+subagent id supplied by Claude Code's `SubagentStart`/`SubagentStop` hooks. The
+recorder derives `agent.attribution.method`/`strength` from the
+authenticated channel and clobbers any payload value, so a workload event can
+never present as `controller`/`strong`.
+
+Ownership invariants (checked offline; a violation is INCOMPLETE, never TAMPER):
+
+1. Exactly one Primary Agent per session, on the controller channel.
+2. A process's agent is inherited by its forked/exec'd children; fork and exec
+   never create a new agent.
+3. Model, tool, and network calls never create an agent.
+4. A Child Agent exists only from `SubagentStart` lifecycle evidence and is closed
+   by the corresponding `SubagentStop`; v0.1 registers every child directly under
+   the Primary because these hooks provide no trusted nested-parent relationship.
+5. Every child id equals the deterministic derivation of its `native_id`.
+6. Every child has a nonempty `agent.parent.id` referring to an agent in the same
+   session; accepted parent links are acyclic and rooted at the Primary. Sequence
+   order is not used to require that the parent arrived first.
+7. Child registration arrives only on the workload channel; provenance is the
+   authenticated producer, never a payload string.
+8. Ordering is set-based: `audit.sequence` is arrival order, so an
+   `agent.started` MAY be sequenced after its child's activity (hook POSTs race
+   kernel forwarding by design). Checks are id-uniqueness, parent-existence,
+   acyclicity, and closure accounting — never "parent sequence < child sequence".
+9. For an adapter whose hooks positively tag subagent activity (the Claude
+   adapter, Claude Code v2.1.69+), a workload TOOL event carrying no harness
+   `agent_id` is main-loop activity and is attributed to the Primary at
+   `self_reported` strength; if no Primary id is available to the hook process the
+   event remains Unattributed Workload. Per-agent attribution never exceeds
+   `self_reported`. Non-hook channels (`model.*`, kernel events) remain
+   unattributed by construction.
+10. Concurrent byte-identical commands from different agents that cannot be
+    disambiguated are marked ambiguous, never resolved by timestamp.
+11. A missing child or Primary closure makes the hierarchy INCOMPLETE; the
+    controller emits only the Primary closure and does not synthesize missing
+    `SubagentStop` events.
+
+Per-category attribution capability (what strength each evidence category can
+carry in v0.1):
+
+| Category | Attribution         | Notes                                                                      |
+|----------|---------------------|----------------------------------------------------------------------------|
+| process  | lineage-to-session  | kernel truth, uid-scoped; in-process subagents have no pid, so no per-agent kernel id exists |
+| tool     | self_reported       | hook `agent_id` when present, else the Primary (main-loop call); Unattributed only when the hook has no Primary id |
+| model    | session (self_reported labels) | broker sees a session TCP connection, not an agent; claimed agent headers are recorded then stripped upstream |
+| file     | session_only        | scan/manifest have no actor                                                |
+| network  | session_only        | nftables log lines carry no pid/uid                                        |
+
+The adapter's capabilities are declared on the Primary's `agent.started` as
+controller-attested `agent.capability.*` attributes. Unattributed events flip the
+verdict to INCOMPLETE only in categories the declaration claims to attribute;
+categories declared `session_only`/`self_reported` are reported in facets without
+gating (otherwise every session is INCOMPLETE from day one). This is the same
+honesty principle as "no unavailable cgroup filter is claimed".
+
+Verifier. A twelfth check reconstructs the hierarchy from the signed segment
+events and validates the invariants above, emitting facets (`agent_tracking`,
+`agent_count`, `agent_hierarchy_valid`, `unattributed_workload_count`). Hierarchy
+anomalies — forged or duplicate ids, unknown parents, cycles, or a workload event
+claiming `role=primary`/`method=controller` — map to INCOMPLETE, never
+TAMPER_SUSPECTED: these inputs are workload-forgeable, and letting the distrusted
+workload force a TAMPER verdict would hand it a repudiation attack.
+TAMPER_SUSPECTED stays reserved for signed-evidence inconsistency (signature,
+digest, chain, sequence, grant, or trust-record rederivation), all host-side.
+Sessions with zero agent events verify exactly as before (`agent_tracking: none`)
+— legacy records are unaffected.
+
+Trust record. The agent hierarchy is NOT a top-level claim in
+`boxedai.trust-record/v1`. The `agent.*` lifecycle and label events live in the
+signed OTLP segments, so they are already tamper-evident through the record's
+existing `evidence` claim and `chain_tip` binding; an external verifier holding an
+older embedded copy of the strict (`additionalProperties:false`) schema is
+therefore never surprised by a new record property. A future profile may promote a
+signed `agents` block once external conformance is settled.
+
+Harness version. Harness CLIs are not pinned to a fixed version — the golden image
+installs the latest at bake time, and the image manifest records the package
+identity that produced it (`claude_code_package`/`codex_package` names plus the
+`npm_registry`), not a frozen version string. The precise resolved version is
+deliberately not captured in v0.1: reading it back would mean shelling into the
+bake VM and copying a file out before teardown — real machinery for a nicety (see
+`internal/image/manifest.go`). Because every identity signal above is
+version-gated and hooks are fail-open with optional fields, some drift is
+therefore silent at the manifest level; the hook events are partly
+self-describing (they record which optional fields were present), which bounds
+the blind spot. Capturing the resolved `claude`/`codex` version — either as a bake
+provisioning step that writes it into the manifest, or as a `harness.version`
+guest-supervisor observation at session start — is a known, low-risk follow-up.
+
+Reconciliation (offline). Every hook invocation launches a process that Tetragon
+can observe when coverage captures the hook-binary exec. v0.1 performs only a
+one-way, non-gating PID plausibility check from workload narration to trusted kernel
+observation: `hook_processes_unanchored` records a submitted hook event whose self-reported PID
+has zero or multiple trusted guest-supervisor process incarnations. This does not
+prove fabrication or detect suppression.
+
+The reverse direction (a hook-binary exec with no submitted event), plus
+exec-narration coverage, effect-narration coverage, and agent-liveness
+decomposition, is deferred. Each needs real-probe calibration to separate a genuine
+gap from normalization noise and would couple the independent verifier to
+guest-agent argv/path vocabulary. The one-way PID facet never gates a verdict:
+process attribution is lineage, not strong.
+
+Honest ceiling. Per-agent labels never exceed `self_reported` in v0.1: a
+compromised harness can suppress or forge hook narration and shuffle labels among
+its own agents. Authenticated observation remains independent, but covers only the
+categories and sensor quality described above and cannot recover an in-process
+agent decomposition. File reads are invisible until an LSM read policy ships;
+concurrent byte-identical commands pair ambiguously. The trusted per-agent executor
+and cgroup-joined ingestion that would raise the
+process-level ceiling are deferred (no Tetragon cgroup export exists for a
+non-containerized workload at any current version).
 
 ## Snapshot / workspace (internal/snapshot)
 
@@ -922,7 +1128,23 @@ populated. Full event projection and cryptographic verification run on the
 selected `/api/session` payload. `boxedai view <session> --web` remains the single-session viewer. Both viewers show overview header (session, policy,
 verdict), timeline table with class badges, event bodies and attributes, action
 and parent-action ids, process tree, file changes, network attempts, and tool
-calls. Every displayed event shows its evidence class. Verdict output names
+calls. Every displayed event shows its evidence class. An Agents grouping built
+from `agent.started`/`agent.completed` events nests children under their parent with
+an attribution-strength badge (self-reported children are visibly labeled), the
+harness-declared subagent type, and a lifecycle status (completed, the reported
+outcome, never closed, or running). Children are displayed numbered in
+`agent.started` order ("Child Agent 1 · general-purpose") — a viewer-assigned
+ordinal, since the harness narrates no subagent name and no spawn-call description
+can be tied to a specific child: concurrent same-type spawns were observed
+registering out of call order, and the record contains no spawn↔agent linkage to
+settle it. It always renders two
+groups: "Unattributed Workload", now the residue (recordings made before Primary
+attribution, hooks that ran without a Primary id, non-hook workload channels), and
+"BoxedAi Infrastructure" (controller/recorder/supervisor events). A session with no
+agent events shows "no agent decomposition reported", never a fabricated single
+agent. Process-tree nodes are badged by `audit.producer`/`audit.evidence.class`,
+so a workload-forged `process.executed` cannot render as a trusted
+kernel-observed process. Verdict output names
 SHA-256, COSE Sign1, EdDSA/Ed25519, the public-key fingerprint, segment/chain
 outcomes, close status, and sensor-loss count. A running session with an
 unsealed `.otlp` tail is explicitly marked provisional; the UI must not imply
@@ -943,6 +1165,7 @@ exist.
 | Broker shutdown grace expires      | Force-close connections; log; still seal + write the record |
 | Kill switch                        | Revoke → freeze → seal → destroy           |
 | Crash/missing seal                 | session.state=incomplete; verify=INCOMPLETE|
+| Invalid agent hierarchy            | Facets + verify=INCOMPLETE (never TAMPER)  |
 
 ## Known gaps (v0.1, keep this list honest)
 
@@ -992,10 +1215,25 @@ exist.
   verification on top of that — no signature over who ran `build-image`, and no
   reproducible-build guarantee that a rebuild yields identical bytes.
 - Model request/response bodies stored as digest+usage only (no forensic body capture).
-- Harness hook capture (`tool.requested`/`tool.completed`) is workload self-reported
-  and fail-open: a compromised harness can suppress it, and a hook that cannot reach
-  the broker loses that event silently (stderr only). Claude only — codex and exec
-  have no hook mechanism.
+- Harness hook capture (`tool.requested`/`tool.completed`, and subagent `agent.*`
+  registration) is workload self-reported and fail-open: a compromised harness can
+  suppress or forge it. v0.1 only offers a one-way, non-gating PID plausibility
+  check from submitted hook events to kernel observations; reverse suppression
+  detection and agent/activity decomposition are deferred. Per-agent grouping is a
+  `self_reported` ceiling. The `exec` harness has no hooks; Codex ships a compatible
+  hooks system but its adapter is deferred, so only Claude sessions register
+  subagents today.
+- Subagents run in-process inside the harness (no pid ever exists for them), so the
+  kernel sensor cannot see them by construction. Per-agent attribution above the
+  process level is narration-derived; the observation track attributes activity to
+  the session, and to a process subtree by lineage, but never to an in-process
+  agent. The trusted per-agent executor and cgroup-joined ingestion that would
+  raise this ceiling are deferred (no Tetragon cgroup export exists for a
+  non-containerized workload at any current version).
+- Concurrent byte-identical Bash commands from different agents pair ambiguously
+  and are marked ambiguous rather than timestamp-guessed. An optional PreToolUse
+  argv marker that would make the tool-use id kernel-visible is deferred — it would
+  rewrite the workload's own command line.
 - Codex adapter untested against a real OpenAI credential.
 - ChatGPT-mode Codex device credentials (`access_token`+`account_id` from `codex login`)
   are proxied best-effort: host-side token expiry is never checked, so a stale token

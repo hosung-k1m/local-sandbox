@@ -151,6 +151,10 @@ the sandbox. `model.completed` events carry the provider-reported token usage
 (`llm.usage.*`), parsed from streaming and non-streaming responses alike, and the
 session trust record aggregates per-model totals.
 
+Claude's `SubagentStart`/`SubagentStop` hooks narrate a self-reported agent
+hierarchy in the viewer. The Agents view puts unregistered or untagged activity in
+Unattributed Workload rather than presenting it as independently verified.
+
 Every displayed event carries an evidence class distinguishing what was self-reported by
 the harness from what was independently observed by the guest kernel witness, mediated by
 the broker, or confirmed by a target. Timeline rows show event bodies and curated
@@ -171,11 +175,12 @@ manifest-declared segment digest as `declared_segment_digest`. Selecting a sessi
 runs the full projection and verifier, including recomputed hashes, chain checks,
 verdict, and recorder fingerprint.
 
-`verify-record` verifies a portable `boxedai.trust-record/v1` envelope without a session
-directory or network access. It requires the recorder's external PKIX PEM Ed25519 public
-key (normally `~/.boxedai/keys/recorder.pub`), checks the profile, schema, key binding,
-RFC 8785 signature, and Level 0 software-only assurance, then reports evidence counts,
-chain tip, model/tool activity, and the tool-transcript digest. `--json` emits the same
+`verify-record` verifies a portable `boxedai.trust-record/v1` envelope without a
+session directory or network access. Its mandatory `--public-key` flag supplies the
+recorder's external PKIX PEM Ed25519 public key (normally
+`~/.boxedai/keys/recorder.pub`). It checks the profile, schema, key binding, RFC 8785
+signature, and Level 0 software-only assurance, then reports evidence counts, chain
+tip, model/tool activity, and the tool-transcript digest. `--json` emits the same
 report as one machine-readable object. The command validates the envelope only; use
 `boxedai verify <session>` when the raw session evidence must also be independently
 re-derived and checked against the trust record.
