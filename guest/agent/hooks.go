@@ -191,6 +191,15 @@ func newHookEvent(completed bool, in hookInput, bxSessionID, primaryID string) e
 	if taskSubagentType != "" {
 		attrs[evidence.AttrHarnessTaskSubagentType] = truncateRunes(taskSubagentType, maxHookFieldChars)
 	}
+	// A completed spawn call names the agent it produced. Stamped beside the
+	// acting agent below, this is the one harness-declared parent→child edge in
+	// the record; the child's own registration cannot carry it.
+	if completed {
+		if spawned := spawnedAgentID(in.ToolName, in.ToolResponse); spawned != "" {
+			attrs[evidence.AttrAgentSpawnedNativeID] = spawned
+			attrs[evidence.AttrAgentSpawnedID] = evidence.ChildAgentID(bxSessionID, spawned)
+		}
+	}
 
 	ev := evidence.Event{
 		Name:     name,
@@ -356,6 +365,27 @@ func taskSpawn(toolName string, toolInput json.RawMessage) (description, subagen
 		return "", ""
 	}
 	return decoded.Description, decoded.SubagentType
+}
+
+// spawnedAgentID extracts the harness-native id of the agent a completed spawn
+// call created, from the PostToolUse tool_response Claude Code returns for the
+// Task/Agent tool ("agentId"). It is present on both synchronous completions and
+// backgrounded launches (tool_response.status "completed" and "async_launched"
+// respectively). The id is capped like every other harness string; any other
+// tool, a malformed tool_response, or an absent field yields "", which the caller
+// skips silently (hooks fail open, so a harness shape change drops the attribute
+// rather than the event).
+func spawnedAgentID(toolName string, toolResponse json.RawMessage) string {
+	if !isSpawnTool(toolName) || len(toolResponse) == 0 {
+		return ""
+	}
+	var decoded struct {
+		AgentID string `json:"agentId"`
+	}
+	if err := json.Unmarshal(toolResponse, &decoded); err != nil {
+		return ""
+	}
+	return truncateRunes(decoded.AgentID, maxHookFieldChars)
 }
 
 // isSpawnTool reports whether toolName is Claude Code's subagent-spawning tool.

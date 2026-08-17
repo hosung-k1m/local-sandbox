@@ -323,6 +323,78 @@ func TestRunHook_TaskSpawnSkipsUnusableInput(t *testing.T) {
 	}
 }
 
+// TestRunHook_SpawnEdgeNamesBothAgents asserts a completed spawn call records the
+// harness-declared parent→child edge: the acting (spawning) agent in agent.id and
+// the agent the harness says it produced in agent.spawned.*, with the child id
+// derived exactly as the SubagentStart registration derives it. Both spawn-tool
+// names and both tool_response.status values a live Claude Code returns
+// (synchronous "completed" and backgrounded "async_launched") carry agentId, so
+// all four combinations are pinned. A nested spawn — the acting agent is itself a
+// child — is the case the edge exists for, so it leads.
+func TestRunHook_SpawnEdgeNamesBothAgents(t *testing.T) {
+	for _, toolName := range []string{"Task", "Agent"} {
+		for _, status := range []string{"completed", "async_launched"} {
+			t.Run(toolName+"/"+status, func(t *testing.T) {
+				capture := hookEventServer(t)
+				t.Setenv(sessionIDEnv, "bx-spawnedge")
+				t.Setenv(agentIDEnv, "ag-primary000000")
+
+				fixture := `{"tool_name":"` + toolName + `","tool_input":` + taskToolInput +
+					`,"tool_response":{"status":"` + status + `","agentId":"grandchild-1"}` +
+					`,"tool_use_id":"spawn-1","agent_id":"orchestrator-1","agent_type":"general-purpose"}`
+				if got := runHook("righthook", strings.NewReader(fixture)); got != 0 {
+					t.Fatalf("runHook = %d, want 0", got)
+				}
+				ev := capture.req.Events[0]
+				for k, want := range map[string]any{
+					evidence.AttrAgentID:              evidence.ChildAgentID("bx-spawnedge", "orchestrator-1"),
+					evidence.AttrAgentSpawnedNativeID: "grandchild-1",
+					evidence.AttrAgentSpawnedID:       evidence.ChildAgentID("bx-spawnedge", "grandchild-1"),
+				} {
+					if got := ev.Attrs[k]; got != want {
+						t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestRunHook_SpawnEdgeSkippedWhenUnavailable asserts the edge is stamped only
+// where the harness actually declares it. A spawn request (PreToolUse) has no
+// response yet, a non-spawn tool never carries one, and a malformed or agentId-less
+// tool_response is a harness shape change the hook must survive: in every case the
+// attribute is absent and the event still ships (hooks fail open).
+func TestRunHook_SpawnEdgeSkippedWhenUnavailable(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		mode    string
+		fixture string
+	}{
+		{"spawn request carries no response", "lefthook", `{"tool_name":"Agent","tool_input":` + taskToolInput + `,"tool_use_id":"t"}`},
+		{"non-spawn tool", "righthook", `{"tool_name":"Bash","tool_input":` + lefthookToolInput + `,"tool_response":{"agentId":"x"},"tool_use_id":"t"}`},
+		{"tool_response is not an object", "righthook", `{"tool_name":"Agent","tool_response":"not-an-object","tool_use_id":"t"}`},
+		{"tool_response carries no agentId", "righthook", `{"tool_name":"Task","tool_response":{"status":"completed"},"tool_use_id":"t"}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			capture := hookEventServer(t)
+			t.Setenv(sessionIDEnv, "bx-spawnedge")
+
+			if got := runHook(tc.mode, strings.NewReader(tc.fixture)); got != 0 {
+				t.Fatalf("runHook = %d, want 0", got)
+			}
+			if len(capture.req.Events) != 1 {
+				t.Fatalf("events = %d, want 1 (hooks fail open, the event still ships)", len(capture.req.Events))
+			}
+			for _, k := range []string{evidence.AttrAgentSpawnedID, evidence.AttrAgentSpawnedNativeID} {
+				if _, ok := capture.req.Events[0].Attrs[k]; ok {
+					t.Errorf("Attrs[%q] present, want absent", k)
+				}
+			}
+		})
+	}
+}
+
 // TestRunAgentHook_SubagentStartRegistersChild asserts SubagentStart mints an
 // agent.started on the workload channel with the derived child id, the Primary as
 // parent, and the agent-lifecycle action chain.

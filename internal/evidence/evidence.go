@@ -236,6 +236,20 @@ const (
 	// (DESIGN.md "Harness hook capture").
 	AttrHarnessTaskDescription  = "harness.task.description"
 	AttrHarnessTaskSubagentType = "harness.task.subagent_type"
+
+	// The spawn↔child linkage the harness itself declares: Claude Code's spawn
+	// tool returns the id of the agent it created in the PostToolUse
+	// tool_response, so the completion event of a spawn call names both sides of
+	// the edge — the spawning agent in AttrAgentID and the agent it produced
+	// here. It is the only nested-parent signal Claude Code supplies: the
+	// SubagentStart hook that registers a child carries no parent field, so a
+	// child's own agent.parent.id cannot name its true parent (DESIGN.md
+	// ownership invariant 4). Self-reported like every hook narration, and
+	// deferred — a spawn completion can arrive either side of the child's
+	// registration (a backgrounded spawn returns before its child starts), so any
+	// consumer must join set-wise, never by sequence order (invariant 8).
+	AttrAgentSpawnedID       = "agent.spawned.id"
+	AttrAgentSpawnedNativeID = "agent.spawned.native_id"
 )
 
 // Attribution categories declared in the Primary Agent's capability block and
