@@ -66,6 +66,27 @@ type Facets struct {
 	TrustRecordAssurance string   `json:"trust_record_assurance,omitempty"`
 	TrustRecordSignature bool     `json:"trust_record_signature_valid"`
 	TrustRecordDerived   bool     `json:"trust_record_cross_derived"`
+	// Agent hierarchy (DESIGN "Agent hierarchy and attribution"). AgentTracking is
+	// "none" for legacy zero-agent sessions, "tracked" otherwise.
+	AgentTracking             string `json:"agent_tracking"`
+	AgentCount                int    `json:"agent_count"`
+	AgentHierarchyValid       bool   `json:"agent_hierarchy_valid"`
+	UnattributedWorkloadCount int    `json:"unattributed_workload_count"`
+	// AgentsWithoutWitnessedActivity counts registered children whose id witnessed
+	// no non-lifecycle event (the decoy shape); a plausibility facet, never gating.
+	AgentsWithoutWitnessedActivity int `json:"agents_without_witnessed_activity"`
+	// OpenChildAgents counts registered children with no agent.completed and gates
+	// hierarchy verification. UnregisteredAgentActivity counts workload events
+	// tagged with an agent.id no agent.started ever registered; that self-reported
+	// plausibility facet does not gate.
+	OpenChildAgents           int `json:"open_child_agents"`
+	UnregisteredAgentActivity int `json:"unregistered_agent_activity"`
+	// HookProcessesAnchored / HookProcessesUnanchored reconcile the Narration track
+	// against kernel observation: hook-reported pids the guest_supervisor sensor
+	// corroborates vs. never witnessed. Plausibility facets, never gating (process
+	// attribution is lineage-scoped, not strong).
+	HookProcessesAnchored   int `json:"hook_processes_anchored"`
+	HookProcessesUnanchored int `json:"hook_processes_unanchored"`
 }
 
 // Check is one named verification step and its outcome (DESIGN "Verifier"
@@ -213,6 +234,10 @@ func Verify(sessionDir string) (Report, error) {
 	trustResult := checkTrustRecord(sessionDir, g, publicKey, segs, manifests, records)
 	trustOK := !trustResult.tamper && !trustResult.incomplete
 
+	// (12) agent hierarchy reconstruction and ownership invariants. Anomalies are
+	// workload-forgeable, so they drive INCOMPLETE, never TAMPER.
+	agentsOK, agFacets, agentDetail := checkAgents(g.SessionID, records)
+
 	rep.Checks = []Check{
 		{stepSignatures, sigOK, join(sigDetail, fmt.Sprintf("%d COSE Sign1 manifest signature(s) verified with EdDSA (Ed25519); key %s", len(manifests), rep.Facets.RecorderFingerprint))},
 		{stepDigests, digestOK, join(digestDetail, "all SHA-256 segment digests match their manifests")},
@@ -225,6 +250,7 @@ func Verify(sessionDir string) (Report, error) {
 		{stepFlow, flowOK, flowDetail},
 		{stepOutput, outputOK, outputDetail},
 		{stepTrustRecord, trustOK, trustResult.detail},
+		{stepAgents, agentsOK, agentDetail},
 	}
 
 	rep.Facets.SignatureValid = sigOK
@@ -238,6 +264,15 @@ func Verify(sessionDir string) (Report, error) {
 	rep.Facets.TrustRecordAssurance = trustResult.assurance
 	rep.Facets.TrustRecordSignature = trustResult.signatureValid
 	rep.Facets.TrustRecordDerived = trustResult.crossDerived
+	rep.Facets.AgentTracking = agFacets.tracking
+	rep.Facets.AgentCount = agFacets.count
+	rep.Facets.AgentHierarchyValid = agFacets.hierarchyValid
+	rep.Facets.UnattributedWorkloadCount = agFacets.unattributed
+	rep.Facets.AgentsWithoutWitnessedActivity = agFacets.noActivity
+	rep.Facets.OpenChildAgents = agFacets.openChildren
+	rep.Facets.UnregisteredAgentActivity = agFacets.unregisteredActivity
+	rep.Facets.HookProcessesAnchored = agFacets.hookAnchored
+	rep.Facets.HookProcessesUnanchored = agFacets.hookUnanchored
 	for _, c := range rep.Checks {
 		status := "ok"
 		if !c.Passed {
@@ -255,7 +290,7 @@ func Verify(sessionDir string) (Report, error) {
 		rep.Verdict = VerdictTamperSuspected
 	case !flowOK:
 		rep.Verdict = VerdictBypassDetected
-	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete:
+	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete || !agentsOK:
 		rep.Verdict = VerdictIncomplete
 	default:
 		rep.Verdict = VerdictLocalOnly
@@ -346,6 +381,17 @@ func (r Report) String() string {
 		fmt.Fprintf(&b, "  trust signature:     %v\n", r.Facets.TrustRecordSignature)
 		fmt.Fprintf(&b, "  claims rederived:    %v\n", r.Facets.TrustRecordDerived)
 		fmt.Fprintf(&b, "  assurance:           %s\n", r.Facets.TrustRecordAssurance)
+	}
+	fmt.Fprintf(&b, "  agent tracking:      %s\n", r.Facets.AgentTracking)
+	if r.Facets.AgentTracking != "none" {
+		fmt.Fprintf(&b, "  agent count:         %d\n", r.Facets.AgentCount)
+		fmt.Fprintf(&b, "  hierarchy valid:     %v\n", r.Facets.AgentHierarchyValid)
+		fmt.Fprintf(&b, "  unattributed work:   %d\n", r.Facets.UnattributedWorkloadCount)
+		fmt.Fprintf(&b, "  agents w/o activity: %d\n", r.Facets.AgentsWithoutWitnessedActivity)
+		fmt.Fprintf(&b, "  open children:       %d\n", r.Facets.OpenChildAgents)
+		fmt.Fprintf(&b, "  unregistered work:   %d\n", r.Facets.UnregisteredAgentActivity)
+		fmt.Fprintf(&b, "  hook pids anchored:   %d\n", r.Facets.HookProcessesAnchored)
+		fmt.Fprintf(&b, "  hook pids unanchored: %d\n", r.Facets.HookProcessesUnanchored)
 	}
 	b.WriteString("\nChecks:\n")
 	for _, c := range r.Checks {

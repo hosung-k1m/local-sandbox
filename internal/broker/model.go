@@ -39,6 +39,15 @@ const (
 	// authenticating with a ChatGPT (ChatGPT Plus/Pro device login) credential
 	// rather than a platform API key.
 	chatgptAccountIDHeader = "chatgpt-account-id"
+	// Claude Code stamps the acting subagent's identity on subagent API requests
+	// (v2.1.139+). The broker records these as claimed provenance on
+	// model.requested and strips them before forwarding, so a workload-chosen
+	// label never reaches the provider.
+	claudeAgentIDHeader       = "X-Claude-Code-Agent-Id"
+	claudeParentAgentIDHeader = "X-Claude-Code-Parent-Agent-Id"
+	claudeSessionIDHeader     = "X-Claude-Code-Session-Id"
+	// maxClaimedHeaderChars bounds the workload-controlled header values stored.
+	maxClaimedHeaderChars = 256
 )
 
 // modelCallKey stashes the per-request modelCall in the request context so ModifyResponse
@@ -72,6 +81,12 @@ func (b *Broker) newModelProxy(provider string, up Upstream) (*httputil.ReverseP
 			pr.Out.Header.Del("Authorization")
 			pr.Out.Header.Del("X-Api-Key")
 			pr.Out.Header.Del(chatgptAccountIDHeader)
+			// The workload's self-reported agent-identity headers are recorded on
+			// model.requested as claimed provenance; they must never reach the
+			// provider (DESIGN.md "Agent hierarchy and attribution").
+			pr.Out.Header.Del(claudeAgentIDHeader)
+			pr.Out.Header.Del(claudeParentAgentIDHeader)
+			pr.Out.Header.Del(claudeSessionIDHeader)
 			// Strip the workload's Accept-Encoding: the guest HTTP client asks for
 			// codings the host cannot decode (undici requests br/zstd), which would
 			// leave ModifyResponse digesting and parsing opaque compressed bytes.
@@ -153,6 +168,7 @@ func (b *Broker) serveModel(provider string, proxy *httputil.ReverseProxy) func(
 		if model := extractModel(body); model != "" {
 			attrs[attrModelID] = model
 		}
+		addClaimedAgentAttrs(attrs, r.Header)
 		if err := b.emit(evidence.ChannelBroker, evidence.Event{
 			Name:     evidence.EventModelRequested,
 			Class:    evidence.ClassBrokerMediated,
@@ -249,6 +265,31 @@ func (b *Broker) modelErrorHandler(provider string) func(http.ResponseWriter, *h
 		})
 		writeErr(w, http.StatusBadGateway, "upstream request failed")
 	}
+}
+
+// addClaimedAgentAttrs records the workload's self-reported agent-identity headers
+// on a model event as claimed provenance (bounded). They are believed by nothing —
+// model attribution is session-level — and are stripped from the upstream request
+// in the proxy Rewrite; recording them keeps the claim forensically visible.
+func addClaimedAgentAttrs(attrs map[string]any, h http.Header) {
+	for header, key := range map[string]string{
+		claudeAgentIDHeader:       attrClaimedAgentID,
+		claudeParentAgentIDHeader: attrClaimedParentAgentID,
+		claudeSessionIDHeader:     attrClaimedSessionID,
+	} {
+		if v := h.Get(header); v != "" {
+			attrs[key] = capRunes(v, maxClaimedHeaderChars)
+		}
+	}
+}
+
+// capRunes bounds s to max runes without splitting a multi-byte sequence.
+func capRunes(s string, max int) string {
+	r := []rune(s)
+	if len(r) <= max {
+		return s
+	}
+	return string(r[:max])
 }
 
 // extractModel pulls the "model" field from a model request body, best-effort.

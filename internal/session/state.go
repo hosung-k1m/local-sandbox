@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // State is the coarse lifecycle marker persisted to sessions/<id>/session.state
@@ -71,12 +72,14 @@ func LoadState(id string) (State, error) {
 // disposition of one recorded session, read from its session.json grant and
 // session.state marker.
 type SessionInfo struct {
-	SessionID string `json:"session_id"`
-	Dir       string `json:"dir"`
-	State     State  `json:"state"`
-	Harness   string `json:"harness"`
-	Profile   string `json:"profile"`
-	CreatedAt string `json:"created_at"`
+	SessionID  string `json:"session_id"`
+	Dir        string `json:"dir"`
+	State      State  `json:"state"`
+	Harness    string `json:"harness"`
+	Profile    string `json:"profile"`
+	CreatedAt  string `json:"created_at"`
+	Repository string `json:"repository"`
+	Branch     string `json:"branch"`
 }
 
 // ListSessions enumerates ~/.boxedai/sessions in id order (which, because ids
@@ -102,6 +105,8 @@ func ListSessions() ([]SessionInfo, error) {
 			info.Harness = g.Harness
 			info.Profile = g.Profile
 			info.CreatedAt = g.CreatedAt
+			info.Repository = g.Repository
+			info.Branch = g.Branch
 		}
 		if st, err := LoadState(id); err == nil {
 			info.State = st
@@ -112,6 +117,38 @@ func ListSessions() ([]SessionInfo, error) {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].SessionID < out[j].SessionID })
 	return out, nil
+}
+
+// DeleteSession removes a session's entire on-disk directory
+// (~/.boxedai/sessions/<id>) and everything under it — evidence segments,
+// workspace snapshots, input/output manifests, the session.json grant, and the
+// session.state marker. Because every file BoxedAi writes for a session lives
+// under that one directory, this is a complete cleanup. It rejects any id that
+// is empty or contains a path separator so a crafted id can never escape the
+// sessions root, and refuses a session that is still running (its VM and
+// recorder are live; the caller must stop it first).
+func DeleteSession(id string) error {
+	if id == "" || strings.ContainsRune(id, '/') || strings.ContainsRune(id, os.PathSeparator) || id == "." || id == ".." {
+		return fmt.Errorf("session: invalid session id %q", id)
+	}
+	st, err := LoadState(id)
+	if err != nil {
+		return err
+	}
+	if st == StateRunning {
+		return fmt.Errorf("session: %s is still running; stop it before deleting", id)
+	}
+	dir := SessionDir(id)
+	if _, err := os.Stat(dir); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("session: %s does not exist", id)
+		}
+		return fmt.Errorf("session: stat %s: %w", id, err)
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return fmt.Errorf("session: delete %s: %w", id, err)
+	}
+	return nil
 }
 
 // readGrant loads and parses a session's session.json grant.

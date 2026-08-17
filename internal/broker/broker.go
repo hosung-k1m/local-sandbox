@@ -44,6 +44,12 @@ const (
 	attrUsageInput  = "llm.usage.input_tokens"
 	attrUsageOutput = "llm.usage.output_tokens"
 	attrUsageTotal  = "llm.usage.total_tokens"
+	// Claimed agent-identity headers recorded on model.requested as self-reported
+	// provenance, then stripped upstream (DESIGN.md: model attribution is
+	// session-level; the labels are believed by nothing).
+	attrClaimedAgentID       = "harness.claimed_agent_id"
+	attrClaimedParentAgentID = "harness.claimed_parent_agent_id"
+	attrClaimedSessionID     = "harness.claimed_session_id"
 )
 
 // Body size limits. Model bodies can carry long prompts; tool/effect arg objects are

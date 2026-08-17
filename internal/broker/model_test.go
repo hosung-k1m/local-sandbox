@@ -157,6 +157,65 @@ func TestModelProxyOpenAIChatGPTAccountID(t *testing.T) {
 	}
 }
 
+// TestModelProxyClaimedAgentHeaders covers the subagent-identity headers Claude Code
+// stamps on subagent API requests: the broker records them on model.requested as
+// harness.claimed_* provenance (believed by nothing — model attribution is
+// session-level) and strips all three before the request reaches the upstream.
+func TestModelProxyClaimedAgentHeaders(t *testing.T) {
+	var got http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1"}`))
+	}))
+	t.Cleanup(backend.Close)
+
+	fe := &fakeEmitter{}
+	b := mustBroker(t, Config{Emitter: fe, Anthropic: Upstream{BaseURL: backend.URL, Key: "real-key"}})
+	srv := testServer(t, b)
+
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/model/anthropic/v1/messages",
+		bytes.NewReader([]byte(`{"model":"claude-test","messages":[]}`)))
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.WorkloadToken())
+	req.Header.Set(claudeAgentIDHeader, "sub-agent-42")
+	req.Header.Set(claudeParentAgentIDHeader, "primary-agent")
+	req.Header.Set(claudeSessionIDHeader, "cc-session-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("model request: %v", err)
+	}
+	drain(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("model status = %d, want 200", resp.StatusCode)
+	}
+
+	// Stripped from the upstream request: a workload-chosen label never reaches the provider.
+	for _, h := range []string{claudeAgentIDHeader, claudeParentAgentIDHeader, claudeSessionIDHeader} {
+		if v := got.Get(h); v != "" {
+			t.Errorf("upstream saw %s = %q, want stripped", h, v)
+		}
+	}
+
+	// Recorded on model.requested as claimed provenance.
+	reqEv := fe.byName(evidence.EventModelRequested)
+	if len(reqEv) != 1 {
+		t.Fatalf("model.requested count = %d, want 1", len(reqEv))
+	}
+	attrs := reqEv[0].ev.Attrs
+	for k, want := range map[string]any{
+		attrClaimedAgentID:       "sub-agent-42",
+		attrClaimedParentAgentID: "primary-agent",
+		attrClaimedSessionID:     "cc-session-1",
+	} {
+		if got := attrs[k]; got != want {
+			t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+		}
+	}
+}
+
 // TestParseUsageAnthropicSSEStream covers real Claude Code traffic: Anthropic always
 // streams SSE, so input_tokens must come from message_start and the recorded
 // output_tokens must be the LAST message_delta's cumulative count, not an earlier one.

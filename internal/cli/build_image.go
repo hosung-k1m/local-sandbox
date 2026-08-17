@@ -26,6 +26,7 @@ func newBuildImageCmd() *cobra.Command {
 		Long: "Boot a one-off bake VM that installs Node, the claude and codex CLIs, and " +
 			"Tetragon, then export its disk as the golden image every session boots from. " +
 			"Run this once, and again after upgrading, before `boxedai run` will work.",
+		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, args []string) error {
 			if err := validateArch(arch); err != nil {
 				return err

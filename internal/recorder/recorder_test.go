@@ -31,6 +31,10 @@ type readRecord struct {
 	sequence int64
 	class    string
 	producer string
+	// attrs holds every string-valued attribute on the record, so tests can
+	// assert recorder-assigned fields (e.g. agent.attribution.*) without adding a
+	// typed field per attribute.
+	attrs map[string]string
 }
 
 // TestRecorderRoundTrip emits events across a forced seal and Close, then re-reads the
@@ -256,6 +260,81 @@ func TestEmitAfterCloseFails(t *testing.T) {
 	}
 }
 
+// TestAgentAttributionIsChannelDerived proves the recorder assigns
+// agent.attribution.method/strength from the authenticated channel and clobbers
+// any payload value, so a workload can never register an agent that presents as
+// controller/strong (DESIGN.md "Agent hierarchy and attribution"). The role/id it
+// claims survive as attributes — the reconstruction check rejects a forged role —
+// but the *strength* is host-assigned and unforgeable.
+func TestAgentAttributionIsChannelDerived(t *testing.T) {
+	root := t.TempDir()
+	key, err := LoadOrGenerateKey(filepath.Join(root, "keys"))
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey: %v", err)
+	}
+	evDir := filepath.Join(root, "evidence")
+	rec, err := NewRecorder(evDir, key, SessionMeta{SessionID: "bx-agent-attr"})
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+
+	// The controller opens the Primary Agent: earns controller/strong.
+	if err := rec.Emit(evidence.ChannelController, evidence.Event{
+		Name: evidence.EventAgentStarted, Class: evidence.ClassIntegrity, Outcome: evidence.OutcomeSuccess,
+		Attrs: map[string]any{evidence.AttrAgentID: "ag-primary", evidence.AttrAgentRole: "primary"},
+	}); err != nil {
+		t.Fatalf("emit controller agent.started: %v", err)
+	}
+	// A workload lies: it requests controller/strong in the payload. The recorder
+	// must overwrite both with native_harness/self_reported.
+	if err := rec.Emit(evidence.ChannelWorkload, evidence.Event{
+		Name: evidence.EventAgentStarted, Class: evidence.ClassHarnessObserved, Outcome: evidence.OutcomeSuccess,
+		Attrs: map[string]any{
+			evidence.AttrAgentID:                  "ag-child",
+			evidence.AttrAgentAttributionMethod:   string(evidence.MethodController),
+			evidence.AttrAgentAttributionStrength: string(evidence.StrengthStrong),
+		},
+	}); err != nil {
+		t.Fatalf("emit workload agent.started: %v", err)
+	}
+	// A workload agent.completed is stamped the same way.
+	if err := rec.Emit(evidence.ChannelWorkload, evidence.Event{
+		Name: evidence.EventAgentCompleted, Class: evidence.ClassHarnessObserved, Outcome: evidence.OutcomeSuccess,
+		Attrs: map[string]any{evidence.AttrAgentID: "ag-child"},
+	}); err != nil {
+		t.Fatalf("emit workload agent.completed: %v", err)
+	}
+	if _, err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+
+	segFiles, err := filepath.Glob(filepath.Join(evDir, "segments", "segment-*.otlp"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	sort.Strings(segFiles)
+	var records []readRecord
+	for i, seg := range segFiles {
+		records = append(records, readSegment(t, seg, i+1)...)
+	}
+
+	for _, r := range records {
+		if r.name != evidence.EventAgentStarted && r.name != evidence.EventAgentCompleted {
+			continue
+		}
+		wantMethod, wantStrength := string(evidence.MethodNativeHarness), string(evidence.StrengthSelfReported)
+		if r.producer == string(evidence.ChannelController) {
+			wantMethod, wantStrength = string(evidence.MethodController), string(evidence.StrengthStrong)
+		}
+		if got := r.attrs[evidence.AttrAgentAttributionMethod]; got != wantMethod {
+			t.Errorf("%s (%s) attribution method = %q, want %q", r.name, r.producer, got, wantMethod)
+		}
+		if got := r.attrs[evidence.AttrAgentAttributionStrength]; got != wantStrength {
+			t.Errorf("%s (%s) attribution strength = %q, want %q", r.name, r.producer, got, wantStrength)
+		}
+	}
+}
+
 // newTestRecorder builds a recorder in a fresh temp dir, for tests that only care
 // about the write path.
 func newTestRecorder(t *testing.T) Recorder {
@@ -419,12 +498,17 @@ func readSegment(t *testing.T, path string, segNum int) []readRecord {
 		for _, rl := range ld.ResourceLogs {
 			for _, sl := range rl.ScopeLogs {
 				for _, lr := range sl.LogRecords {
+					am := make(map[string]string, len(lr.Attributes))
+					for _, kv := range lr.Attributes {
+						am[kv.Key] = kv.Value.GetStringValue()
+					}
 					out = append(out, readRecord{
 						segment:  segNum,
 						name:     lr.EventName,
 						sequence: attrInt(lr.Attributes, evidence.AttrSequence),
 						class:    attrStr(lr.Attributes, evidence.AttrEvidenceClass),
 						producer: attrStr(lr.Attributes, evidence.AttrProducer),
+						attrs:    am,
 					})
 				}
 			}

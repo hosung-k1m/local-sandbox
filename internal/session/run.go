@@ -3,6 +3,7 @@ package session
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -225,6 +226,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err != nil {
 		return Result{}, err
 	}
+	// The controller-owned Primary Agent's deterministic id anchors the whole
+	// hierarchy; the verifier recomputes it independently from the session id.
+	primaryAgentID := evidence.PrimaryAgentID(sessionID)
 	sessionDir := SessionDir(sessionID)
 	if err := mkdirAll(sessionDir); err != nil {
 		return Result{}, err
@@ -269,6 +273,8 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		br             *broker.Broker
 		vmc            vmController
 		sessionStarted bool
+		harnessExited  bool
+		harnessExit    int
 	)
 
 	// Deferred teardown: always runs once the recorder exists. Best-effort and
@@ -321,6 +327,14 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		// Closing artifacts + lifecycle events only if the workload started.
 		if sessionStarted {
 			if e := finishWorkspace(sessionDir, origWorkspace, workspace, emit, &result); e != nil {
+				failTeardown(e)
+			}
+			// Close the Primary Agent before the session lifecycle events so the
+			// hierarchy's root has an explicit closure in the final segment
+			// (ownership invariant 11: missing Primary closure is INCOMPLETE). Its
+			// outcome distinguishes harness failure from controller interruption.
+			agentOutcome := primaryAgentCompletionOutcome(runErr, harnessExited, harnessExit)
+			if e := emit(agentCompletedEvent(primaryAgentID, agentOutcome)); e != nil {
 				failTeardown(e)
 			}
 			if e := emit(sessionEvent(evidence.EventSessionStopped, "session stopped")); e != nil {
@@ -565,6 +579,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	// --- 5/6. Create + boot the VM, then gate on guest-agent health. ---
 	vmc = r.factory()(vm.Config{
 		SessionID:        sessionID,
+		AgentID:          primaryAgentID,
 		SessionDir:       sessionDir,
 		WorkspacePath:    workspace,
 		HarnessHomePath:  harnessHome,
@@ -598,6 +613,12 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err := emit(sessionEvent(evidence.EventSessionStarted, "session started")); err != nil {
 		return result, err
 	}
+	// Open the controller-owned Primary Agent immediately after the session, on
+	// the controller channel so the recorder stamps controller/strong. Its
+	// capability declaration and staged-hook-settings digest ride here.
+	if err := emit(primaryAgentStartedEvent(primaryAgentID, opts.Harness, harnessSettingsDigest(opts.Harness))); err != nil {
+		return result, err
+	}
 	sessionStarted = true
 	if err := writeState(sessionDir, StateRunning); err != nil {
 		return result, fmt.Errorf("session: write running state: %w", err)
@@ -607,10 +628,25 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err != nil {
 		return result, fmt.Errorf("session: launch harness: %w", err)
 	}
+	harnessExited = true
+	harnessExit = exit
 	result.ExitCode = exit
 
 	// --- 8. Teardown (revoke, stop, output manifest+diff, seal) runs deferred. ---
 	return result, nil
+}
+
+func primaryAgentCompletionOutcome(runErr error, harnessExited bool, harnessExit int) evidence.Outcome {
+	switch {
+	case errors.Is(runErr, context.Canceled), errors.Is(runErr, context.DeadlineExceeded):
+		return evidence.OutcomeInterrupted
+	case runErr != nil:
+		return evidence.OutcomeFailure
+	case harnessExited && harnessExit != 0:
+		return evidence.OutcomeFailure
+	default:
+		return evidence.OutcomeSuccess
+	}
 }
 
 func claudeTelemetryDir(sessionDir, harness string) string {

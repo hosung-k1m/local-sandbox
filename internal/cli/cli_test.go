@@ -64,6 +64,26 @@ func TestRootWebFlagServesDashboard(t *testing.T) {
 	}
 }
 
+// Supplying --addr without --web must fail before the dashboard is started.
+func TestRootAddrRequiresWeb(t *testing.T) {
+	var called bool
+	restore := serveDashboard
+	serveDashboard = func(string) error {
+		called = true
+		return nil
+	}
+	t.Cleanup(func() { serveDashboard = restore })
+
+	root := newRootCmd()
+	root.SetArgs([]string{"--addr", "127.0.0.1:9999"})
+	if err := root.Execute(); err == nil || err.Error() != "cli: --addr requires --web" {
+		t.Fatalf("execute --addr: %v", err)
+	}
+	if called {
+		t.Fatal("serveDashboard must not be invoked when --web is absent")
+	}
+}
+
 // Flag parsing for `run` must map through cobra to the RunOptions the session
 // layer expects. runSession is stubbed so no VM is ever launched.
 func TestRunFlagsMapToRunOptions(t *testing.T) {
@@ -291,6 +311,27 @@ func TestBuildImageRejectsUnknownArch(t *testing.T) {
 	}
 }
 
+// build-image has no positional inputs, so it must reject one before invoking
+// the image builder.
+func TestBuildImageRejectsPositionalArgs(t *testing.T) {
+	var called bool
+	restore := buildImage
+	buildImage = func(_ context.Context, _, _, _ string) (image.Manifest, error) {
+		called = true
+		return image.Manifest{}, nil
+	}
+	t.Cleanup(func() { buildImage = restore })
+
+	root := newRootCmd()
+	root.SetArgs([]string{"build-image", "unexpected"})
+	if err := root.Execute(); err == nil {
+		t.Fatal("expected error for build-image positional argument")
+	}
+	if called {
+		t.Error("buildImage must not be invoked when positional argument validation fails")
+	}
+}
+
 // Flag parsing for `view` must build the right view.Filter, defaulting to
 // hiding process.created noise; viewTimeline is stubbed so no session
 // directory is ever read.
@@ -375,5 +416,31 @@ func TestViewAllAndAgentActivityMutuallyExclusive(t *testing.T) {
 	}
 	if called {
 		t.Error("viewTimeline must not be invoked when validation fails")
+	}
+}
+
+// Web viewing does not render a timeline, so its address is the only
+// timeline-related flag allowed with --web.
+func TestViewWebRejectsTimelineFlags(t *testing.T) {
+	for _, flag := range []string{"--name", "--class", "--since", "--all", "--agent-activity"} {
+		t.Run(flag, func(t *testing.T) {
+			args := []string{"view", "bx-test", "--web", flag}
+			if flag == "--name" || flag == "--class" || flag == "--since" {
+				args = append(args, "value")
+			}
+			root := newRootCmd()
+			root.SetArgs(args)
+			if err := root.Execute(); err == nil || err.Error() != "cli: "+flag+" cannot be used with --web" {
+				t.Fatalf("execute %v: %v", args, err)
+			}
+		})
+	}
+}
+
+func TestViewAddrRequiresWeb(t *testing.T) {
+	root := newRootCmd()
+	root.SetArgs([]string{"view", "bx-test", "--addr", "127.0.0.1:9999"})
+	if err := root.Execute(); err == nil || err.Error() != "cli: --addr requires --web" {
+		t.Fatalf("execute view --addr: %v", err)
 	}
 }

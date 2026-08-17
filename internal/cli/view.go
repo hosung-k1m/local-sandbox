@@ -34,7 +34,15 @@ func newViewCmd() *cobra.Command {
 		RunE: func(c *cobra.Command, args []string) error {
 			dir := session.SessionDir(args[0])
 			if web {
+				for _, name := range []string{"name", "class", "since", "all", "agent-activity"} {
+					if c.Flags().Changed(name) {
+						return fmt.Errorf("cli: --%s cannot be used with --web", name)
+					}
+				}
 				return view.ServeWeb(dir, addr)
+			}
+			if c.Flags().Changed("addr") {
+				return fmt.Errorf("cli: --addr requires --web")
 			}
 			if all && agentActivity {
 				return fmt.Errorf("cli: --all and --agent-activity are mutually exclusive")

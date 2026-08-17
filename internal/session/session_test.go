@@ -1,6 +1,7 @@
 package session
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -21,6 +22,9 @@ import (
 	"boxedai/internal/trustrecord"
 	"boxedai/internal/verify"
 	"boxedai/internal/vm"
+
+	logspb "go.opentelemetry.io/proto/otlp/logs/v1"
+	"google.golang.org/protobuf/encoding/protodelim"
 )
 
 // fakeManifest is the golden-image manifest withResolveImage's default fake
@@ -56,6 +60,7 @@ type fakeVM struct {
 	cfg                  vm.Config
 	launchCancel         context.CancelFunc
 	launchErr            error
+	exitCode             int
 	stopErr              error
 	deleteErr            error
 	stopContextErr       error
@@ -103,7 +108,7 @@ func (f *fakeVM) LaunchHarness(ctx context.Context) (int, error) {
 	if f.launchCancel != nil {
 		f.launchCancel()
 	}
-	return 0, f.launchErr
+	return f.exitCode, f.launchErr
 }
 
 func (f *fakeVM) emitProcessLifecycle(ctx context.Context) error {
@@ -202,6 +207,51 @@ func (f *fakeVM) Delete(ctx context.Context) error {
 	f.deleteContextErr = ctx.Err()
 	_, f.deleteContextBounded = ctx.Deadline()
 	return f.deleteErr
+}
+
+func primaryCompletionOutcome(t *testing.T, sessionDir string) evidence.Outcome {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(sessionDir, evidenceDirName, "segments", "segment-*.otlp"))
+	if err != nil {
+		t.Fatalf("glob evidence segments: %v", err)
+	}
+	for _, path := range paths {
+		f, err := os.Open(path)
+		if err != nil {
+			t.Fatalf("open evidence segment: %v", err)
+		}
+		reader := bufio.NewReader(f)
+		for {
+			var logs logspb.LogsData
+			if err := protodelim.UnmarshalFrom(reader, &logs); err != nil {
+				if errors.Is(err, io.EOF) {
+					break
+				}
+				f.Close()
+				t.Fatalf("decode evidence segment: %v", err)
+			}
+			for _, resourceLogs := range logs.ResourceLogs {
+				for _, scopeLogs := range resourceLogs.ScopeLogs {
+					for _, record := range scopeLogs.LogRecords {
+						if record.EventName != evidence.EventAgentCompleted {
+							continue
+						}
+						for _, attr := range record.Attributes {
+							if attr.Key == evidence.AttrAgentOutcome {
+								f.Close()
+								return evidence.Outcome(attr.Value.GetStringValue())
+							}
+						}
+					}
+				}
+			}
+		}
+		if err := f.Close(); err != nil {
+			t.Fatalf("close evidence segment: %v", err)
+		}
+	}
+	t.Fatal("primary agent.completed outcome not found")
+	return ""
 }
 
 // TestRunOrchestration exercises the full session wiring with an injected fake VM:
@@ -315,6 +365,9 @@ func TestRunOrchestration(t *testing.T) {
 	if res.Verdict != string(verify.VerdictLocalOnly) {
 		t.Errorf("Result.Verdict hint = %q, want %q", res.Verdict, verify.VerdictLocalOnly)
 	}
+	if got := primaryCompletionOutcome(t, res.SessionDir); got != evidence.OutcomeSuccess {
+		t.Errorf("Primary completion outcome = %q, want %q", got, evidence.OutcomeSuccess)
+	}
 
 	// ListSessions surfaces the session with its grant metadata and state.
 	sessions, err := ListSessions()
@@ -378,6 +431,48 @@ func TestRunCancellationStillCleansUpVM(t *testing.T) {
 	}
 	if !fake.stopContextBounded || !fake.deleteContextBounded {
 		t.Errorf("cleanup contexts bounded = Stop:%t Delete:%t, want both true", fake.stopContextBounded, fake.deleteContextBounded)
+	}
+	if got := primaryCompletionOutcome(t, res.SessionDir); got != evidence.OutcomeInterrupted {
+		t.Errorf("Primary completion outcome = %q, want %q", got, evidence.OutcomeInterrupted)
+	}
+}
+
+func TestRunPrimaryCompletionFailureOutcomes(t *testing.T) {
+	tests := []struct {
+		name      string
+		exitCode  int
+		launchErr error
+	}{
+		{name: "nonzero harness exit", exitCode: 17},
+		{name: "launch failure", launchErr: errors.New("launch failed")},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("BOXEDAI_HOME", home)
+			t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
+			t.Setenv("OPENAI_API_KEY", "test-openai-key")
+			withResolveImage(t, func(arch string) (image.Manifest, error) { return fakeManifest, nil })
+
+			repo := t.TempDir()
+			writeFile(t, filepath.Join(repo, "README.md"), "# fixture repo\n")
+			r := &Runner{newVM: func(cfg vm.Config) vmController {
+				return &fakeVM{cfg: cfg, exitCode: tt.exitCode, launchErr: tt.launchErr}
+			}}
+
+			res, err := r.Run(context.Background(), RunOptions{
+				Harness: "exec", RepoPath: repo, Profile: policy.ProfileDevelop, Cmd: "true",
+			})
+			if tt.launchErr != nil && !errors.Is(err, tt.launchErr) {
+				t.Fatalf("Run error = %v, want %v", err, tt.launchErr)
+			}
+			if tt.launchErr == nil && err != nil {
+				t.Fatalf("Run: %v", err)
+			}
+			if got := primaryCompletionOutcome(t, res.SessionDir); got != evidence.OutcomeFailure {
+				t.Errorf("Primary completion outcome = %q, want %q", got, evidence.OutcomeFailure)
+			}
+		})
 	}
 }
 
@@ -658,8 +753,58 @@ func TestClaudeTelemetryDirIsHostOnlySibling(t *testing.T) {
 	}
 }
 
+func TestDeleteSessionRemovesEntireDirectory(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(homeEnv, home)
+	id := "bx-20260810-000000-abcd1234"
+	dir := SessionDir(id)
+	if err := os.MkdirAll(filepath.Join(dir, "evidence", "segments"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(dir, stateFileName), string(StateSealed))
+	writeFile(t, filepath.Join(dir, "evidence", "segments", "segment-000001.otlp"), "otlp")
+	writeFile(t, filepath.Join(dir, "workspace.orig", "file.txt"), "content")
+
+	if err := DeleteSession(id); err != nil {
+		t.Fatalf("DeleteSession: %v", err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("session dir still present after delete: stat err = %v", err)
+	}
+}
+
+func TestDeleteSessionRefusesRunningSession(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv(homeEnv, home)
+	id := "bx-20260810-000000-abcd5678"
+	dir := SessionDir(id)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	writeFile(t, filepath.Join(dir, stateFileName), string(StateRunning))
+
+	if err := DeleteSession(id); err == nil {
+		t.Fatal("DeleteSession on running session = nil, want refusal")
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("running session dir was removed: %v", err)
+	}
+}
+
+func TestDeleteSessionRejectsTraversalIDs(t *testing.T) {
+	t.Setenv(homeEnv, t.TempDir())
+	for _, id := range []string{"", ".", "..", "../escape", "a/b"} {
+		if err := DeleteSession(id); err == nil {
+			t.Errorf("DeleteSession(%q) = nil, want rejection", id)
+		}
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatalf("mkdir %s: %v", filepath.Dir(path), err)
+	}
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}

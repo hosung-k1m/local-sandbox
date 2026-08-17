@@ -45,6 +45,14 @@ func (r *recorder) buildLogsData(seq int64, eventID string, rr resolvedRecord) *
 	if r.meta.VMBootID != "" {
 		attrs[evidence.AttrVMBootID] = r.meta.VMBootID
 	}
+	// agent.* lifecycle: derive attribution method/strength from the authenticated
+	// channel and clobber any payload value, so a workload registration can never
+	// present as controller/strong (DESIGN "Agent hierarchy and attribution").
+	if rr.name == evidence.EventAgentStarted || rr.name == evidence.EventAgentCompleted {
+		method, strength := evidence.AgentAttributionFor(rr.producer)
+		attrs[evidence.AttrAgentAttributionMethod] = string(method)
+		attrs[evidence.AttrAgentAttributionStrength] = string(strength)
+	}
 
 	rec := &logspb.LogRecord{
 		TimeUnixNano:         uint64(rr.wall.UnixNano()),

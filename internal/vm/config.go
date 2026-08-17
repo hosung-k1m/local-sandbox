@@ -12,6 +12,9 @@ import "boxedai/internal/policy"
 type Config struct {
 	// SessionID is also the Lima instance name.
 	SessionID string
+	// AgentID is the controller-minted Primary Agent id, exposed to the Claude
+	// hook (as BOXEDAI_AGENT_ID) so registered subagents can name it as parent.
+	AgentID string
 	// SessionDir is the host session directory, e.g. ~/.boxedai/sessions/<id>.
 	SessionDir string
 	// WorkspacePath is the host path mounted into the guest at /workspace.

@@ -1106,6 +1106,62 @@ func TestHarnessArgv_NonInteractive(t *testing.T) {
 	}
 }
 
+func TestLaunchHarnessPreservesCancellationAfterProcessStarts(t *testing.T) {
+	startedPath := filepath.Join(t.TempDir(), "started")
+	t.Setenv("BOXEDAI_TEST_STARTED", startedPath)
+	binaryPath := filepath.Join(t.TempDir(), "fake-limactl")
+	if err := os.WriteFile(binaryPath, []byte("#!/bin/sh\n: > \"$BOXEDAI_TEST_STARTED\"\nexec /bin/sleep 30\n"), 0o755); err != nil {
+		t.Fatalf("write fake limactl: %v", err)
+	}
+
+	cfg := testConfig(t, true)
+	cfg.Harness = "exec"
+	cfg.Cmd = "true"
+	vm := &VM{Cfg: cfg, Binary: binaryPath}
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan struct {
+		exit int
+		err  error
+	}, 1)
+	go func() {
+		exit, err := vm.LaunchHarness(ctx)
+		result <- struct {
+			exit int
+			err  error
+		}{exit: exit, err: err}
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if _, err := os.Stat(startedPath); err == nil {
+			break
+		} else if !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("stat child start marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("child process did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+
+	var got struct {
+		exit int
+		err  error
+	}
+	select {
+	case got = <-result:
+	case <-time.After(5 * time.Second):
+		t.Fatal("LaunchHarness did not return after cancellation")
+	}
+	if got.exit != -1 {
+		t.Errorf("exit = %d, want -1 for controller cancellation", got.exit)
+	}
+	if !errors.Is(got.err, context.Canceled) {
+		t.Fatalf("LaunchHarness error = %v, want wrapped context cancellation", got.err)
+	}
+}
+
 func TestHarnessArgv_Exec(t *testing.T) {
 	cfg := testConfig(t, true)
 	cfg.Harness = "exec"

@@ -65,6 +65,9 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 		Args:          cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
+			if !web && c.Flags().Changed("addr") {
+				return fmt.Errorf("cli: --addr requires --web")
+			}
 			if !web {
 				return c.Help()
 			}

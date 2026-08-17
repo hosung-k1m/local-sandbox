@@ -38,6 +38,9 @@ type eventSpec struct {
 	actionID      string
 	contentDigest string
 	producer      string
+	// attrs carries any additional record attributes (string or int64 values) —
+	// used for agent.* hierarchy fixtures and process.pid lineage anchors.
+	attrs map[string]any
 }
 
 // fixture holds the trust material and paths for one synthesized session.
@@ -178,6 +181,19 @@ func (f *fixture) writeSegment(events []eventSpec) {
 		if ev.name == evidence.EventProcessCreated || ev.name == evidence.EventProcessExecuted || ev.name == evidence.EventProcessExited {
 			recAttrs = append(recAttrs, kvStr("observer", "tetragon"))
 		}
+		// Extra attributes (agent.* hierarchy fields, process.pid lineage anchors).
+		// Map order is irrelevant: the verifier reads attrs into a map and the segment
+		// digest is self-consistent within the run.
+		for k, v := range ev.attrs {
+			switch val := v.(type) {
+			case string:
+				recAttrs = append(recAttrs, kvStr(k, val))
+			case int64:
+				recAttrs = append(recAttrs, kvInt(k, val))
+			default:
+				f.t.Fatalf("eventSpec attr %q has unsupported type %T", k, v)
+			}
+		}
 		ld := &logsv1.LogsData{ResourceLogs: []*logsv1.ResourceLogs{{
 			Resource: &resourcev1.Resource{Attributes: resAttrs},
 			ScopeLogs: []*logsv1.ScopeLogs{{LogRecords: []*logsv1.LogRecord{{
@@ -301,6 +317,118 @@ func happyEvents(outDigest string) []eventSpec {
 		{name: evidence.EventWorkspaceManifested, contentDigest: outDigest},
 		{name: evidence.EventSessionStopped},
 		{name: evidence.EventSessionSealed},
+	}
+}
+
+// TestVerify_Incomplete_ForgedAgentHierarchyDoesNotEscalateToTamper is the capstone
+// adversarial fixture: a fully-signed, otherwise-valid session into which a
+// workload-forged agent.started claiming role=primary has been spliced. Because the
+// forgery lives in the distrusted Narration track — signatures, digests and chain
+// are all intact — the verdict must be INCOMPLETE, never TAMPER_SUSPECTED, and the
+// agent-hierarchy check must be the one that fails (DESIGN.md: hierarchy anomalies
+// map to INCOMPLETE, never TAMPER).
+func TestVerify_Incomplete_ForgedAgentHierarchyDoesNotEscalateToTamper(t *testing.T) {
+	f := newFixture(t)
+	primaryID := evidence.PrimaryAgentID(testSessionID)
+	// A legitimate controller-owned Primary and its closure, plus a workload
+	// agent.started forging role=primary — the repudiation attack.
+	agentEvents := []eventSpec{
+		{name: evidence.EventAgentStarted, producer: string(evidence.ChannelController), attrs: map[string]any{
+			evidence.AttrAgentID:   primaryID,
+			evidence.AttrAgentRole: string(evidence.AgentRolePrimary),
+		}},
+		{name: evidence.EventAgentStarted, producer: string(evidence.ChannelWorkload), attrs: map[string]any{
+			evidence.AttrAgentID:       evidence.ChildAgentID(testSessionID, "imposter"),
+			evidence.AttrAgentNativeID: "imposter",
+			evidence.AttrAgentRole:     string(evidence.AgentRolePrimary), // forged
+		}},
+		{name: evidence.EventAgentCompleted, producer: string(evidence.ChannelController), attrs: map[string]any{
+			evidence.AttrAgentID: primaryID,
+		}},
+	}
+	// Splice the agent events in before the trailing session.stopped/session.sealed,
+	// where a real session's agents complete (ahead of teardown).
+	base := happyEvents(f.outDigest)
+	stopIdx := len(base) - 2
+	events := make([]eventSpec, 0, len(base)+len(agentEvents))
+	events = append(events, base[:stopIdx]...)
+	events = append(events, agentEvents...)
+	events = append(events, base[stopIdx:]...)
+	f.writeSegment(events)
+
+	rep, err := Verify(f.dir)
+	if err != nil {
+		t.Fatalf("Verify: %v", err)
+	}
+	if rep.Verdict != VerdictIncomplete {
+		t.Errorf("verdict = %s, want INCOMPLETE (forged narration must not escalate to TAMPER)", rep.Verdict)
+	}
+	var agentCheck *Check
+	for i := range rep.Checks {
+		if rep.Checks[i].Name == stepAgents {
+			agentCheck = &rep.Checks[i]
+		}
+	}
+	if agentCheck == nil || agentCheck.Passed {
+		t.Errorf("agent-hierarchy check should have failed on the forged role=primary; got %+v", agentCheck)
+	}
+	// The crypto floor stays intact — this is the guarantee that keeps a forged
+	// label from masquerading as tampering (and vice-versa).
+	if !rep.Facets.SignatureValid || !rep.Facets.ChainValid {
+		t.Error("signature/chain must remain valid; the forgery is in narration, not the seal")
+	}
+}
+
+func TestVerify_Incomplete_InvalidChildRegistrationRemainsNarrationFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		role     string
+		parentID func(string) string
+	}{
+		{name: "empty role", parentID: func(primaryID string) string { return primaryID }},
+		{name: "invalid role", role: "worker", parentID: func(primaryID string) string { return primaryID }},
+		{name: "empty parent", role: string(evidence.AgentRoleChild), parentID: func(string) string { return "" }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newFixture(t)
+			primaryID := evidence.PrimaryAgentID(testSessionID)
+			childID := evidence.ChildAgentID(testSessionID, "child")
+			agentEvents := []eventSpec{
+				{name: evidence.EventAgentStarted, producer: string(evidence.ChannelController), attrs: map[string]any{
+					evidence.AttrAgentID: primaryID, evidence.AttrAgentRole: string(evidence.AgentRolePrimary),
+				}},
+				{name: evidence.EventAgentStarted, producer: string(evidence.ChannelWorkload), attrs: map[string]any{
+					evidence.AttrAgentID:       childID,
+					evidence.AttrAgentNativeID: "child",
+					evidence.AttrAgentRole:     tt.role,
+					evidence.AttrAgentParentID: tt.parentID(primaryID),
+				}},
+				{name: evidence.EventAgentCompleted, producer: string(evidence.ChannelWorkload), attrs: map[string]any{
+					evidence.AttrAgentID: childID,
+				}},
+				{name: evidence.EventAgentCompleted, producer: string(evidence.ChannelController), attrs: map[string]any{
+					evidence.AttrAgentID: primaryID,
+				}},
+			}
+			base := happyEvents(f.outDigest)
+			stopIdx := len(base) - 2
+			events := append([]eventSpec{}, base[:stopIdx]...)
+			events = append(events, agentEvents...)
+			events = append(events, base[stopIdx:]...)
+			f.writeSegment(events)
+
+			rep, err := Verify(f.dir)
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if rep.Verdict != VerdictIncomplete {
+				t.Fatalf("verdict = %s, want INCOMPLETE", rep.Verdict)
+			}
+			if rep.Verdict == VerdictTamperSuspected || !rep.Facets.SignatureValid || !rep.Facets.ChainValid {
+				t.Fatalf("workload-forgeable hierarchy violation escalated to tamper: %+v", rep)
+			}
+		})
 	}
 }
 

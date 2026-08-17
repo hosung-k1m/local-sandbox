@@ -30,6 +30,9 @@ func (vm *VM) LaunchHarness(ctx context.Context) (int, error) {
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	err = cmd.Run()
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return -1, fmt.Errorf("vm: launch harness: %w", ctxErr)
+	}
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:
@@ -155,6 +158,12 @@ func harnessEnv(cfg Config) ([]string, error) {
 			// git bridge reads the same pair.
 			"BOXEDAI_BROKER_URL=" + base,
 			"BOXEDAI_WORKLOAD_TOKEN=" + cfg.WorkloadToken,
+			// Agent hierarchy (DESIGN.md "Agent hierarchy and attribution"): the
+			// subagent hook derives child ids from BOXEDAI_SESSION_ID and names the
+			// controller-minted Primary as parent via BOXEDAI_AGENT_ID. Neither is
+			// a secret; both are already public session identifiers.
+			"BOXEDAI_SESSION_ID=" + cfg.SessionID,
+			"BOXEDAI_AGENT_ID=" + cfg.AgentID,
 		}
 		githubEnv, err := githubHarnessEnv(cfg)
 		if err != nil {

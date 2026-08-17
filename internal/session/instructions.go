@@ -5,6 +5,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+
+	"boxedai/internal/evidence"
 )
 
 const (
@@ -17,8 +19,10 @@ const (
 // staged into the session harness home, never the host's own settings (see
 // the exclusion in stageHarnessInstructions below). It wires PreToolUse/
 // PostToolUse to the guest agent's lefthook/righthook subcommands so every
-// tool invocation is recorded as tool.requested/tool.completed evidence
-// (DESIGN.md "Harness hook capture — lefthook / righthook").
+// tool invocation is recorded as tool.requested/tool.completed evidence, and
+// SubagentStart/SubagentStop (no matcher — they match on agent type) to the
+// agenthook subcommand so every subagent is registered as agent.started/
+// agent.completed (DESIGN.md "Harness hook capture", "Agent hierarchy").
 const claudeHooksSettingsJSON = `{
   "hooks": {
     "PreToolUse": [
@@ -26,10 +30,28 @@ const claudeHooksSettingsJSON = `{
     ],
     "PostToolUse": [
       {"matcher": "*", "hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent righthook", "timeout": 15}]}
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent agenthook", "timeout": 15}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent agenthook", "timeout": 15}]}
     ]
   }
 }
 `
+
+// harnessSettingsDigest is the SHA-256 of the exact staged hook settings.json
+// bytes, or "" for harnesses that stage no hooks. stageHarnessInstructions
+// writes []byte(claudeHooksSettingsJSON) verbatim, so digesting the constant
+// matches the on-disk file; the controller stamps this on the Primary Agent's
+// agent.started as attestable hook-wiring provenance.
+func harnessSettingsDigest(harness string) string {
+	if harness != "claude" {
+		return ""
+	}
+	return evidence.SHA256Hex([]byte(claudeHooksSettingsJSON))
+}
 
 var hostUserHomeDir = os.UserHomeDir
 
