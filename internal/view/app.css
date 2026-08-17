@@ -413,9 +413,6 @@ input[type="checkbox"] {
   max-width: 1px; /* forces the ellipsis column to actually shrink */
   width: 100%;
 }
-.table-wrap .kv {
-  color: var(--ink-3);
-}
 .table-more {
   padding: 8px 16px;
   border-bottom: 1px solid var(--border);
@@ -490,6 +487,31 @@ tr.detail-row td {
 }
 .action-group-members {
   padding-left: 0;
+}
+
+/* ---- agents tab: hierarchy + concise activity log ---- */
+/* Reuses .action-group/.action-group-hdr/.action-group-members/.caret/
+   .chip/.meta/.empty/.table-wrap/.ellipsis as-is (see actions tab section
+   above); only the concise activity line and its dim tool-name label are
+   new here. */
+.agent-block-child {
+  border-left: 2px solid var(--grid); /* tree-indent affordance for nested (child) agents */
+}
+.agent-line-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+}
+.agent-tool-label {
+  flex: 0 0 auto;
+  color: var(--ink-3);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+.agent-line-text {
+  flex: 1 1 auto;
+  min-width: 0; /* lets the flex child actually shrink so .ellipsis can engage */
 }
 
 /* ---- proof tab ---- */
@@ -637,6 +659,107 @@ body[data-page="dashboard"] #app {
   display: flex;
   gap: 6px;
   flex-wrap: wrap;
+}
+.session-card .row-repo {
+  color: var(--ink-2, var(--ink-3));
+  font-size: 11.5px;
+  margin-top: 2px;
+  word-break: break-all;
+}
+
+/* ---- sidebar header controls + bulk delete ---- */
+.dash-sidebar-hdr .hdr-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.dash-sidebar-hdr .delete-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 6px;
+}
+.btn.danger {
+  border-color: var(--s-crit);
+  color: var(--s-crit);
+}
+.btn.danger:disabled {
+  opacity: 0.5;
+  cursor: default;
+  border-color: var(--border);
+  color: var(--ink-3);
+}
+
+/* ---- session grouping (repo › branch) ---- */
+.group-hdr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 12px;
+  font-size: 11.5px;
+}
+.group-hdr .group-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.group-hdr .group-count {
+  margin-left: auto;
+  color: var(--ink-3);
+}
+.section-hdr, .running-hdr {
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--ink-3);
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--grid);
+  background: var(--surface);
+}
+.running-hdr {
+  border-top: none;
+}
+.repo-hdr {
+  cursor: pointer;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--grid);
+}
+.repo-hdr .caret {
+  color: var(--ink-3);
+  width: 0.9em;
+  display: inline-block;
+}
+.branch-hdr {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 12px 3px 26px;
+  font-size: 11px;
+  color: var(--ink-3);
+}
+.branch-hdr .branch-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.branch-hdr .group-count {
+  margin-left: auto;
+}
+.session-row {
+  display: flex;
+  align-items: flex-start;
+}
+.session-row.checked {
+  background: var(--surface-2);
+}
+.session-row .session-check {
+  margin: 10px 0 0 12px;
+  flex: 0 0 auto;
+}
+.session-row .session-card {
+  flex: 1 1 auto;
+  min-width: 0;
 }
 .dash-main {
   flex: 1 1 auto;

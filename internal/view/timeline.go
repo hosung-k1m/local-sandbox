@@ -13,19 +13,19 @@ import (
 // hiddenTimelineAttrs are attrs already shown as their own column (or pure
 // bookkeeping) and so are omitted from the "key-attrs" tail of a timeline line.
 var hiddenTimelineAttrs = map[string]bool{
-	evidence.AttrSchemaVersion:  true,
-	evidence.AttrEventID:        true,
-	evidence.AttrSequence:       true,
-	evidence.AttrSessionID:      true,
-	evidence.AttrEvidenceClass:  true,
-	evidence.AttrProducer:       true,
-	evidence.AttrMonotonicNS:    true,
-	evidence.AttrPolicyDigest:   true,
-	evidence.AttrOutcome:        true,
-	evidence.AttrActionID:       true,
-	evidence.AttrParentActionID: true,
-	evidence.AttrVMID:           true, // constant per VM; no signal in a session-scoped timeline
-	"process.parent_exec_id":    true, // ~90 chars of base64/line; guest/agent-owned key, no exported evidence.Attr* constant
+	evidence.AttrSchemaVersion:       true,
+	evidence.AttrEventID:             true,
+	evidence.AttrSequence:            true,
+	evidence.AttrSessionID:           true,
+	evidence.AttrEvidenceClass:       true,
+	evidence.AttrProducer:            true,
+	evidence.AttrMonotonicNS:         true,
+	evidence.AttrPolicyDigest:        true,
+	evidence.AttrOutcome:             true,
+	evidence.AttrActionID:            true,
+	evidence.AttrParentActionID:      true,
+	evidence.AttrVMID:                true, // constant per VM; no signal in a session-scoped timeline
+	evidence.AttrProcessParentExecID: true, // ~90 chars of base64/line; no signal in a compact timeline
 }
 
 // maxToolInputDisplay caps how much of harness.tool.input is shown per

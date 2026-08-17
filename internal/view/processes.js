@@ -143,8 +143,9 @@ function copyText(text, el) {
 // *incarnation* (pid + ":" + firstSeq) so pid reuse produces two distinct
 // nodes rather than one node with contradictory history: `live` tracks the
 // currently-open incarnation per pid string and is deleted on
-// process.exited, so the next created/executed for that pid naturally
-// starts a fresh incarnation instead of appending to the closed one.
+// process.exited. A changed nonempty exec id also starts a fresh node even
+// without an observed exit, so PID reuse cannot overwrite a live node's
+// identity or redirect the eventual exit to the older incarnation.
 
 function makeNode(pid, seq, ts) {
   return {
@@ -157,6 +158,8 @@ function makeNode(pid, seq, ts) {
     parentExecId: "",
     cgroupId: "",
     observer: "",
+    producer: "", // audit.producer of the process evidence (last non-empty wins)
+    forged: false, // any contributing event came from a channel other than guest_supervisor
     firstSeq: seq,
     firstTs: ts,
     exitSeq: null,
@@ -184,6 +187,15 @@ function applyCommonFields(node, ev) {
   if (hasVal(uid)) node.uid = uid;
   var observer = readAttr(ev, ATTR_OBSERVER);
   if (hasVal(observer)) node.observer = String(observer);
+  // Trust provenance: legitimate process evidence is stamped guest_supervisor by
+  // the recorder (kernel sensor, authenticated supervisor channel). A process.*
+  // event on any other channel is workload-forgeable — the process tree used to
+  // render it as an indistinguishable real node. Flag it (sticky) so the row can
+  // badge it as not kernel-verified. See DESIGN.md channel-derived producer.
+  if (hasVal(ev.producer)) {
+    node.producer = String(ev.producer);
+    if (ev.producer !== "guest_supervisor") node.forged = true;
+  }
   var execId = readAttr(ev, ATTR_EXEC_ID);
   if (hasVal(execId)) node.execId = String(execId);
   var parentExecId = readAttr(ev, ATTR_PARENT_EXEC_ID);
@@ -352,6 +364,13 @@ function buildModel(events) {
     }
 
     var node = live.get(pid);
+    if (node && ev.name === EVENT_EXECUTED) {
+      var nextExecId = readAttr(ev, ATTR_EXEC_ID);
+      if (hasVal(nextExecId) && node.execId && String(nextExecId) !== node.execId) {
+        node = null;
+        live.delete(pid);
+      }
+    }
     if (!node) {
       node = makeNode(pid, ev.seq, ev.ts);
       nodes.push(node);
@@ -552,10 +571,16 @@ function treeNodeRowHtml(api, ui, row) {
     metaBits.push(chipLocal(api, "+" + node.taskChildKeys.length + " tasks", "var(--ink-3)"));
   }
   var classes = "proc-row" + (row.isMatch ? " proc-row-match" : "") + (ui.selectedKey === node.key ? " proc-row-selected" : "");
+  var forgedHtml = node.forged
+    ? '<span class="chip" style="--chip-color:' + api.statusColor("crit") +
+      '" title="reported on the ' + api.esc(node.producer || "unknown") +
+      ' channel, not the trusted guest_supervisor kernel sensor — this process is NOT kernel-verified and may be workload-forged">unverified</span>'
+    : "";
   return (
     '<div class="' + classes + '" data-key="' + api.esc(node.key) + '" style="--depth:' + depth + '">' +
       caretHtml +
       statusBadgeHtml(api, node.status) +
+      forgedHtml +
       '<span class="mono-num proc-pid">' + api.esc(node.pid) + "</span>" +
       binaryHtml + argvHtml +
       '<span class="proc-meta">' + metaBits.join("") + "</span>" +

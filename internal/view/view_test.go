@@ -378,6 +378,181 @@ func TestProcessTree(t *testing.T) {
 	}
 }
 
+// TestProcessTreeFlagsForgedProducer is the regression test for the forgery-
+// display hole: a process.executed reported on any channel but the trusted
+// guest_supervisor kernel sensor is workload-forgeable and must be rendered as
+// unverified, never as an indistinguishable real process. A genuine kernel node
+// stays unannotated.
+func TestProcessTreeFlagsForgedProducer(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{
+			seq: 1, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "bash -lc 'real'",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(100), evidence.AttrProcessPPID: int64(1)},
+		},
+		{
+			// Workload-forged: a process.executed submitted on the workload channel.
+			seq: 2, name: evidence.EventProcessExecuted, class: evidence.ClassHarnessObserved,
+			producer: evidence.ChannelWorkload, outcome: evidence.OutcomeSuccess, body: "sneaky",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(200), evidence.AttrProcessPPID: int64(1)},
+		},
+	})
+
+	tree, err := ProcessTree(sessionDir)
+	if err != nil {
+		t.Fatalf("ProcessTree: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(tree, "\n"), "\n")
+
+	var real, forged string
+	for _, l := range lines {
+		if strings.Contains(l, "pid 100") {
+			real = l
+		}
+		if strings.Contains(l, "pid 200") {
+			forged = l
+		}
+	}
+	if real == "" || forged == "" {
+		t.Fatalf("tree = %q, want both pid 100 and pid 200 lines", tree)
+	}
+	if strings.Contains(real, "unverified") {
+		t.Errorf("kernel-observed node was flagged unverified: %q", real)
+	}
+	if !strings.Contains(forged, "unverified producer: workload") {
+		t.Errorf("forged node = %q, want an [unverified producer: workload] annotation", forged)
+	}
+}
+
+func TestProcessTreeKeepsReusedPIDIncarnations(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{
+			seq: 1, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "first",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(42), evidence.AttrProcessPPID: int64(1)},
+		},
+		{
+			seq: 2, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "second",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(42), evidence.AttrProcessPPID: int64(1)},
+		},
+	})
+
+	tree, err := ProcessTree(sessionDir)
+	if err != nil {
+		t.Fatalf("ProcessTree: %v", err)
+	}
+	if tree != "pid 42: first\npid 42: second\n" {
+		t.Fatalf("tree = %q, want both pid incarnations", tree)
+	}
+}
+
+func TestProcessTreePrefersExecIDLineageAcrossPIDReuse(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{
+			seq: 1, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "old parent",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(100), evidence.AttrProcessPPID: int64(1), evidence.AttrProcessExecID: "old"},
+		},
+		{
+			seq: 2, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "new parent",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(100), evidence.AttrProcessPPID: int64(1), evidence.AttrProcessExecID: "new"},
+		},
+		{
+			seq: 3, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "child of old",
+			attrs: map[string]any{
+				evidence.AttrProcessPID:          int64(200),
+				evidence.AttrProcessPPID:         int64(100),
+				evidence.AttrProcessExecID:       "child",
+				evidence.AttrProcessParentExecID: "old",
+			},
+		},
+	})
+
+	tree, err := ProcessTree(sessionDir)
+	if err != nil {
+		t.Fatalf("ProcessTree: %v", err)
+	}
+	want := "pid 100: old parent\n  pid 200: child of old\npid 100: new parent\n"
+	if tree != want {
+		t.Fatalf("tree = %q, want %q", tree, want)
+	}
+}
+
+func TestProcessTreeFallsBackToLatestPriorParentPID(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{
+			seq: 1, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "old parent",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(100), evidence.AttrProcessPPID: int64(1)},
+		},
+		{
+			seq: 2, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "old child",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(200), evidence.AttrProcessPPID: int64(100)},
+		},
+		{
+			seq: 3, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "new parent",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(100), evidence.AttrProcessPPID: int64(1)},
+		},
+		{
+			seq: 4, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "new child",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(201), evidence.AttrProcessPPID: int64(100)},
+		},
+	})
+
+	tree, err := ProcessTree(sessionDir)
+	if err != nil {
+		t.Fatalf("ProcessTree: %v", err)
+	}
+	want := "pid 100: old parent\n  pid 200: old child\npid 100: new parent\n  pid 201: new child\n"
+	if tree != want {
+		t.Fatalf("tree = %q, want %q", tree, want)
+	}
+}
+
+func TestProcessTreeRenderingIsDeterministic(t *testing.T) {
+	sessionDir := t.TempDir()
+	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
+		{
+			seq: 1, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "root",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(100), evidence.AttrProcessPPID: int64(1)},
+		},
+		{
+			seq: 2, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "larger child",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(20), evidence.AttrProcessPPID: int64(100)},
+		},
+		{
+			seq: 3, name: evidence.EventProcessExecuted, class: evidence.ClassKernelObserved,
+			producer: evidence.ChannelGuestSupervisor, outcome: evidence.OutcomeSuccess, body: "smaller child",
+			attrs: map[string]any{evidence.AttrProcessPID: int64(3), evidence.AttrProcessPPID: int64(100)},
+		},
+	})
+
+	first, err := ProcessTree(sessionDir)
+	if err != nil {
+		t.Fatalf("ProcessTree: %v", err)
+	}
+	second, err := ProcessTree(sessionDir)
+	if err != nil {
+		t.Fatalf("ProcessTree second render: %v", err)
+	}
+	want := "pid 100: root\n  pid 3: smaller child\n  pid 20: larger child\n"
+	if first != want || second != want {
+		t.Fatalf("renders = %q and %q, want %q", first, second, want)
+	}
+}
+
 func TestBuildWebPayloadIncludesProofAndActionTimeline(t *testing.T) {
 	sessionDir := t.TempDir()
 	writeSegment(t, sessionDir, "segment-000001.otlp", "bx-test-session", "sha256:policydigest", []testEvent{
@@ -716,6 +891,59 @@ func TestDashboardAPIRejectsUnknownSessionWithoutCreatingIt(t *testing.T) {
 	}
 }
 
+func TestDashboardDeleteEndpointRemovesFinishedSessions(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("BOXEDAI_HOME", home)
+	sealed := "bx-20260810-000000-aaaa1111"
+	running := "bx-20260811-000000-bbbb2222"
+	sealedDir := filepath.Join(home, "sessions", sealed)
+	runningDir := filepath.Join(home, "sessions", running)
+	if err := os.MkdirAll(filepath.Join(sealedDir, "evidence", "segments"), 0o755); err != nil {
+		t.Fatalf("mkdir sealed: %v", err)
+	}
+	if err := os.MkdirAll(runningDir, 0o755); err != nil {
+		t.Fatalf("mkdir running: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(sealedDir, "session.state"), []byte(session.StateSealed), 0o644); err != nil {
+		t.Fatalf("write sealed state: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(runningDir, "session.state"), []byte(session.StateRunning), 0o644); err != nil {
+		t.Fatalf("write running state: %v", err)
+	}
+
+	body := `{"ids":["` + sealed + `","` + running + `","bad/id"]}`
+	rec := httptest.NewRecorder()
+	newDashboardMux().ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/sessions/delete", strings.NewReader(body)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var resp deleteSessionsResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(resp.Deleted) != 1 || resp.Deleted[0] != sealed {
+		t.Fatalf("deleted = %v, want [%s]", resp.Deleted, sealed)
+	}
+	if resp.Errors[running] == "" || resp.Errors["bad/id"] == "" {
+		t.Fatalf("errors = %v, want running + bad/id refused", resp.Errors)
+	}
+	if _, err := os.Stat(sealedDir); !os.IsNotExist(err) {
+		t.Fatalf("sealed session dir still present: %v", err)
+	}
+	if _, err := os.Stat(runningDir); err != nil {
+		t.Fatalf("running session dir was removed: %v", err)
+	}
+}
+
+func TestDashboardDeleteEndpointRejectsGET(t *testing.T) {
+	t.Setenv("BOXEDAI_HOME", t.TempDir())
+	rec := httptest.NewRecorder()
+	newDashboardMux().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/sessions/delete", nil))
+	if rec.Code != http.StatusMethodNotAllowed {
+		t.Fatalf("status = %d, want 405", rec.Code)
+	}
+}
+
 // TestAssetsServedByBothMuxes verifies the shared vanilla-JS/CSS client
 // (registerAssets) is wired into both the single-session viewer mux and the
 // dashboard mux with the right content types, and that each mux's thin HTML
@@ -778,6 +1006,57 @@ func TestAssetsServedByBothMuxes(t *testing.T) {
 				t.Errorf("/ body missing reference to /assets/processes.js: %s", indexRec.Body.String())
 			}
 		})
+	}
+}
+
+func TestEmbeddedProcessesSplitChangedLiveExecID(t *testing.T) {
+	source := string(processesJS)
+	for _, want := range []string{
+		"if (node && ev.name === EVENT_EXECUTED)",
+		"hasVal(nextExecId) && node.execId && String(nextExecId) !== node.execId",
+		"live.delete(pid)",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("processes.js missing changed-exec incarnation guard %q", want)
+		}
+	}
+	guard := strings.Index(source, "if (node && ev.name === EVENT_EXECUTED)")
+	create := strings.Index(source[guard:], "if (!node)")
+	if guard < 0 || create < 0 {
+		t.Fatal("processes.js must split a changed exec id before selecting the live node")
+	}
+}
+
+func TestEmbeddedAgentsRenderUnattributedActivityWithoutRegistrations(t *testing.T) {
+	source := string(appJS)
+	for _, want := range []string{
+		"if (indices.length === 0)",
+		"if (info.agentCount === 0)",
+		"agent decomposition unavailable: no lifecycle registrations recorded",
+		"members: indices",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("app.js missing zero-registration activity behavior %q", want)
+		}
+	}
+	if strings.Contains(source, "indices.length === 0 || info.agentCount === 0") {
+		t.Fatal("app.js still hides tool activity when lifecycle registrations are absent")
+	}
+}
+
+func TestEmbeddedAgentGroupsKeepOrphansAndRootlessComponentsVisible(t *testing.T) {
+	source := string(appJS)
+	for _, want := range []string{
+		"if (parent && groups.has(parent))",
+		"renderedKeys.push(key)",
+		"if (!seen.has(key)) visit(key, 0)",
+	} {
+		if !strings.Contains(source, want) {
+			t.Fatalf("app.js missing adversarial agent-group traversal behavior %q", want)
+		}
+	}
+	if strings.Contains(source, "if (parent && meta.has(parent))") {
+		t.Fatal("app.js still attaches visible groups beneath filtered-out metadata-only parents")
 	}
 }
 

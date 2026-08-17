@@ -218,7 +218,18 @@ var ACTIONS_DOMAIN = new Set([
   "effect.requested", "effect.approved", "effect.denied", "effect.dispatched", "effect.completed", "effect.failed",
   "credential.issued", "credential.revoked",
   "model.requested", "model.completed",
+  // Agent lifecycle: including these lets the "by action chain" mode nest a
+  // subagent's tools under its agent.started (ParentActionID chain), and the
+  // "by agent" mode group them by responsible agent (see computeAgentGroups).
+  "agent.started", "agent.completed",
 ]);
+
+// INFRASTRUCTURE_PRODUCERS are the authenticated non-workload channels. A
+// workload-channel event with no positively-identified agent.id is Unattributed
+// Workload; anything on these channels is BoxedAi's own infrastructure. Used by
+// the "by agent" grouping to keep those two mandatory buckets honest and
+// distinct — self-reported workload labels never leak into the infra bucket.
+var INFRASTRUCTURE_PRODUCERS = new Set(["controller", "broker", "guest_supervisor", "recorder"]);
 
 var NAME_GROUP_PREFIXES = ["process.", "file.", "network.", "internal_tool.", "effect.", "session.", "sensor."];
 function nameGroup(name) {
@@ -262,7 +273,7 @@ var CHUNK_ALL_THRESHOLD = 5000;
 function defaultState() {
   return {
     tab: "timeline",
-    sort: "asc", // "asc" (oldest first, default) | "desc"
+    sort: "desc", // "desc" (newest first, default) | "asc"
     search: "",
     classes: [], // selected badge strings; [] = unconstrained
     names: [], // selected event names; [] = unconstrained
@@ -270,7 +281,7 @@ function defaultState() {
     producers: [], // selected producer strings; [] = unconstrained
     pid: "",
     hideNoise: true, // "Hide process noise" preset, default ON
-    agentActivity: false, // "Agent activity" preset, opt-in; implies hideNoise (see computeTimelineFilter)
+    agentActivity: true, // "Agent activity" preset, default ON; implies hideNoise (see computeTimelineFilter)
     errorsOnly: false,
     filesMode: "latest", // "all" | "latest"
     actionsMode: "chain", // "flat" | "chain"
@@ -371,7 +382,7 @@ function clearFilters(state) {
   state.producers = [];
   state.pid = "";
   state.hideNoise = true;
-  state.agentActivity = false;
+  state.agentActivity = true; // resets to the default preset (see defaultState); the results-line "show everything" link is the escape hatch to the full stream
   state.errorsOnly = false;
 }
 
@@ -403,25 +414,24 @@ function corpusOf(ev, kvStr) {
     (ev.action_id || "") + " " + (ev.parent_action_id || "")).toLowerCase();
 }
 
-// buildModel precomputes, once per payload load, everything the filter
-// engine and renderers need per event so no render pass re-derives them:
-// a lowercased search corpus, the non-bookkeeping "k=v" summary tail, and a
-// formatted clock label. All are parallel arrays indexed like payload.events.
+// buildModel precomputes, once per payload load, the per-event data the filter
+// engine and renderers need so no render pass re-derives it: a lowercased
+// search corpus and a formatted clock label, as parallel arrays indexed like
+// payload.events. The non-bookkeeping "k=v" attrs are still folded into the
+// search corpus (so a search over an attr value still matches) but are no
+// longer displayed, so they aren't retained per row.
 function buildModel(events) {
   var n = events.length;
   var corpus = new Array(n);
-  var kv = new Array(n);
   var tsLabel = new Array(n);
   var bySeq = new Map();
   for (var i = 0; i < n; i++) {
     var ev = events[i];
-    var kvStr = summarizeAttrs(ev.attrs);
-    kv[i] = kvStr;
-    corpus[i] = corpusOf(ev, kvStr);
+    corpus[i] = corpusOf(ev, summarizeAttrs(ev.attrs));
     tsLabel[i] = fmtClock(ev.ts);
     bySeq.set(ev.seq, i);
   }
-  return { events: events, corpus: corpus, kv: kv, tsLabel: tsLabel, bySeq: bySeq };
+  return { events: events, corpus: corpus, tsLabel: tsLabel, bySeq: bySeq };
 }
 
 // extendModel appends derived fields for newly-arrived tail events onto an
@@ -430,9 +440,7 @@ function buildModel(events) {
 function extendModel(model, events) {
   for (var i = model.events.length; i < events.length; i++) {
     var ev = events[i];
-    var kvStr = summarizeAttrs(ev.attrs);
-    model.kv.push(kvStr);
-    model.corpus.push(corpusOf(ev, kvStr));
+    model.corpus.push(corpusOf(ev, summarizeAttrs(ev.attrs)));
     model.tsLabel.push(fmtClock(ev.ts));
     model.bySeq.set(ev.seq, i);
   }
@@ -444,13 +452,14 @@ function extendModel(model, events) {
 // spec — these are payload-derived totals, not filtered-view counts.
 function tabCounts(payload) {
   var events = payload.events || [];
-  var processes = 0, files = 0, network = 0, actions = 0;
+  var processes = 0, files = 0, network = 0, actions = 0, agents = 0;
   for (var i = 0; i < events.length; i++) {
     var name = events[i].name;
     if (name.indexOf("process.") === 0) processes++;
     if (FILES_DOMAIN.has(name)) files++;
     if (NETWORK_DOMAIN.has(name)) network++;
     if (ACTIONS_DOMAIN.has(name)) actions++;
+    if (name === "tool.requested") agents++;
   }
   return {
     timeline: events.length,
@@ -458,6 +467,7 @@ function tabCounts(payload) {
     files: files,
     network: network,
     actions: actions,
+    agents: agents,
     proof: (payload.proof && payload.proof.segments ? payload.proof.segments.length : 0),
   };
 }
@@ -693,6 +703,7 @@ function timelineFilterBarHtml(ctx, filtered) {
     '<button type="button" class="btn small" data-act="clear-filters">clear filters</button>' +
     '<span class="spacer"></span>' +
     '<button type="button" class="btn small" data-act="tl-sort">' + (s.sort === "asc" ? "oldest first" : "newest first") + "</button>" +
+    '<button type="button" class="btn small" data-act="tl-collapse-all" title="collapse every expanded row">collapse all</button>' +
     '<div class="facet-row">' +
       '<span class="facet-label">class</span>' + classChips +
       '<span class="facet-label">outcome</span>' + outcomeChips +
@@ -752,12 +763,82 @@ function timelineMoreHtml(shown, total) {
   return html;
 }
 
+// ---- readable summary enrichment ----
+//
+// The summary column is a single ellipsis-truncated line of plain white text
+// meant to tell each event's story at a glance. It deliberately does NOT show
+// the raw "k=v" attr soup (audit.content.digest=…, harness.claimed_session_id=…,
+// credential.kind=… and friends): that noise is one expand-click away on the
+// detail row. A few high-traffic event types carry their most useful detail
+// only in the attrs, so enrichedSummaryText promotes just that — a process's
+// argv, a tool's command + description, a model id, a completion's token counts
+// — inline after the event body. Every value is workload-controlled; the caller
+// esc()s the whole line before it reaches the DOM.
+
+var SUMMARY_SEP = " · ";
+
+// joinSummary drops empty/absent segments and joins the rest with the middot
+// separator, returning a raw (un-escaped) string for summaryCellHtml to esc().
+function joinSummary(parts) {
+  return parts.filter(function (p) { return p !== "" && p != null; }).join(SUMMARY_SEP);
+}
+
+// enrichedSummaryText returns the promoted plain-text summary for the event
+// types we special-case, or "" for everything else (caller falls back to the
+// event body). The result is raw text; summaryCellHtml esc()s it.
+function enrichedSummaryText(ev) {
+  switch (ev.name) {
+    case "process.executed": {
+      // Body already reads "exec <binary>"; append the full argv the attrs bury.
+      var argv = attrRaw(ev, "process.argv");
+      if (typeof argv !== "string" || argv === "") return "";
+      return joinSummary([ev.body || "", argv]);
+    }
+    case "tool.requested":
+    case "tool.completed": {
+      // Tool name + the salient argument + the human description, all lifted out
+      // of the harness.tool.input JSON (a Bash call carries both a command and a
+      // description).
+      var s = toolActivitySummary(ev);
+      return joinSummary([s.tool, s.text, s.desc]);
+    }
+    case "model.requested": {
+      // Body already reads "model request to <provider>"; append the model id.
+      var modelID = attrRaw(ev, "model.id");
+      if (modelID === undefined || modelID === null || modelID === "") return "";
+      return joinSummary([ev.body || "", String(modelID)]);
+    }
+    case "model.completed": {
+      // Body already reads "model response from <provider>"; append the token
+      // counts (either may be absent on a failed/partial completion).
+      var inTok = attrRaw(ev, "llm.usage.input_tokens");
+      var outTok = attrRaw(ev, "llm.usage.output_tokens");
+      var hasIn = inTok !== undefined && inTok !== null && inTok !== "";
+      var hasOut = outTok !== undefined && outTok !== null && outTok !== "";
+      if (!hasIn && !hasOut) return "";
+      return joinSummary([
+        ev.body || "",
+        hasIn ? "in " + numFmt(inTok) : "",
+        hasOut ? "out " + numFmt(outTok) : "",
+      ]);
+    }
+    default:
+      return "";
+  }
+}
+
+// summaryCellHtml is the summary-column renderer shared by the Timeline and
+// Actions rows: the promoted readable summary when the event type has one, else
+// the plain event body — a single tier of white text, no dim attr tail.
+function summaryCellHtml(ev) {
+  return esc(enrichedSummaryText(ev) || ev.body || "");
+}
+
 function timelineRowHtml(ctx, i) {
   var model = ctx.model, ev = model.events[i];
   var expanded = ctx.state.expandedSeqs.has(ev.seq);
   var outcome = ev.outcome || "";
-  var kvStr = model.kv[i];
-  var summary = esc(ev.body || "") + (kvStr ? ' <span class="kv">' + esc(kvStr) + "</span>" : "");
+  var summary = summaryCellHtml(ev);
   var html =
     '<tr class="clickable tl-row" data-seq="' + ev.seq + '">' +
       '<td class="mono-num">' + ev.seq + "</td>" +
@@ -942,6 +1023,16 @@ function bindTimelineEvents(ctx, container) {
       if (act === "toggle-name-popover") { ctx.state.namePopoverOpen = !ctx.state.namePopoverOpen; renderTimelineFilterbarOnly(ctx); return; }
       if (act === "clear-filters") { clearFilters(ctx.state); resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
       if (act === "tl-sort") { ctx.state.sort = ctx.state.sort === "asc" ? "desc" : "asc"; resetTimelineChunk(ctx.state); updateTimelineTab(ctx); return; }
+      if (act === "tl-collapse-all") {
+        // Collapse every expanded row without touching filters: only the
+        // rendered rows change, so re-render them in place rather than running
+        // the O(n) filter/facet pass updateTimelineTab would.
+        if (ctx.state.expandedSeqs.size) {
+          ctx.state.expandedSeqs.clear();
+          renderTimelineRowsFull(ctx, timelineDisplayIndices(ctx.timelineFiltered, ctx.state));
+        }
+        return;
+      }
       if (act === "show-noise") { ctx.state.hideNoise = false; ctx.state.agentActivity = false; resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
       if (act === "clear-chip") { clearActiveFilter(ctx.state, btn.dataset.kind, btn.dataset.value); resetTimelineChunk(ctx.state); ctx.refreshAll(); return; }
       if (act === "tl-more") {
@@ -1225,8 +1316,7 @@ function updateNetworkTab(ctx) {
 function actionRowHtml(ctx, i) {
   var model = ctx.model, ev = model.events[i];
   var outcome = ev.outcome || "";
-  var kvStr = model.kv[i];
-  var summary = esc(ev.body || "") + (kvStr ? ' <span class="kv">' + esc(kvStr) + "</span>" : "");
+  var summary = summaryCellHtml(ev);
   return "<tr>" +
     '<td class="mono-num">' + ev.seq + "</td>" +
     "<td>" + esc(model.tsLabel[i]) + "</td>" +
@@ -1327,6 +1417,265 @@ function actionsFlatHtml(ctx, indices) {
     (rows || '<tr><td colspan="6" class="empty">no matching events</td></tr>') + "</tbody></table>";
 }
 
+// ---- per-agent grouping (honest presentation) ----
+//
+// The agent hierarchy is narrated by the DISTRUSTED harness (DESIGN.md "Agent
+// hierarchy and attribution"): grouping events under an agent is self-reported
+// and must never be shown as authenticated fact. So every agent group carries a
+// strength badge (controller/strong for the host-minted Primary, self_reported
+// for hook-registered children), and two buckets are ALWAYS rendered even when
+// empty: "Unattributed Workload" (workload events with no agent.id — never
+// defaulted to any agent) and "BoxedAi Infrastructure" (authenticated
+// non-workload channels). Zero agent.started events renders "no agent
+// decomposition reported" — never "single agent", which would assert a hierarchy
+// the harness never narrated.
+
+var UNATTRIBUTED_KEY = "__unattributed__";
+var INFRASTRUCTURE_KEY = "__infrastructure__";
+
+// agentStrengthChip renders the honesty badge for one agent's attribution
+// strength: self_reported is painted warn (the harness's word, unverified),
+// strong is the host-attested Primary, and an id carrying activity with no
+// agent.started registration is called out as unregistered.
+function agentStrengthChip(meta) {
+  if (!meta) return chipHtml("unregistered", statusColor("crit"), null,
+    "activity is attributed to an agent id that has no agent.started registration");
+  if (meta.strength === "strong") return chipHtml("controller · strong", statusColor("good"), null,
+    "host-minted and controller-attested; not workload-forgeable");
+  if (meta.strength === "self_reported") return chipHtml("self-reported", statusColor("warn"), null,
+    "the harness claims this grouping; not independently verified");
+  return chipHtml(meta.strength || "unattributed", statusColor("muted"), null, null);
+}
+
+// computeAgentGroups buckets the visible events by the agent responsible for
+// them. Agent metadata (role/strength/native id/type) is read from ALL
+// agent.started events in the model, and closure state from ALL agent.completed
+// events, so a group still labels correctly when a filter hides the registration
+// itself. Ordering: Primary first, then agents by registration seq.
+function computeAgentGroups(ctx, indices, seedAllAgents) {
+  var model = ctx.model;
+  var meta = new Map(); // agent.id -> {role, strength, nativeID, parentID, type, seq, completed, outcome, num}
+  var completions = new Map(); // agent.id -> agent.outcome, applied after the scan
+  var sessionEnded = false;
+  for (var i = 0; i < model.events.length; i++) {
+    var ev = model.events[i];
+    if (ev.name === "session.stopped" || ev.name === "session.sealed") { sessionEnded = true; continue; }
+    if (ev.name === "agent.completed") {
+      var doneID = attrRaw(ev, "agent.id");
+      if (doneID && !completions.has(doneID)) completions.set(doneID, attrRaw(ev, "agent.outcome") || "");
+      continue;
+    }
+    if (ev.name !== "agent.started") continue;
+    var id = attrRaw(ev, "agent.id");
+    if (!id || meta.has(id)) continue;
+    meta.set(id, {
+      role: attrRaw(ev, "agent.role") || "",
+      strength: attrRaw(ev, "agent.attribution.strength") || "",
+      nativeID: attrRaw(ev, "agent.native_id") || "",
+      parentID: attrRaw(ev, "agent.parent.id") || "",
+      type: attrRaw(ev, "agent.type") || "",
+      seq: ev.seq,
+      completed: false,
+      outcome: "",
+      num: 0, // 1-based child ordinal, assigned below
+    });
+  }
+  // Closure is applied after the scan because audit.sequence is arrival order: a
+  // hook-submitted agent.completed can be sequenced before the agent.started it
+  // closes (DESIGN.md ownership invariant 8). A completion naming an id that was
+  // never registered is the verifier's business (unregistered activity), not the
+  // viewer's, and is dropped here rather than inventing an agent.
+  completions.forEach(function (outcome, doneID) {
+    var m = meta.get(doneID);
+    if (!m) return;
+    m.completed = true;
+    m.outcome = outcome;
+  });
+  // Number the registered children 1..N in agent.started order so the UI can name
+  // them stably. Registration order — not arrival order of their activity — because
+  // that is the only ordering the harness itself narrated, and it stays fixed as
+  // filters change. Sorting is explicit: agent.started can be sequenced after a
+  // sibling's (invariant 8), so Map insertion order is not registration order.
+  var childMetas = [];
+  meta.forEach(function (m) { if (m.role === "child") childMetas.push(m); });
+  childMetas.sort(function (a, b) { return a.seq - b.seq; });
+  childMetas.forEach(function (m, i) { m.num = i + 1; });
+
+  var groups = new Map();
+  function bucket(key) {
+    var g = groups.get(key);
+    if (!g) { g = { key: key, members: [] }; groups.set(key, g); }
+    return g;
+  }
+  indices.forEach(function (i) { bucket(ownerAgentOf(model.events[i])).members.push(i); });
+
+  // The Agents tab filters to a single event kind (tool.requested), so an agent
+  // that owns none of the filtered events — a child that was registered but never
+  // witnessed acting, or a Primary in a recording made before its own direct calls
+  // carried its id — would be absent from `groups` and its children would orphan
+  // in the forest walk below. Seeding an empty group for every registered
+  // agent keeps the full hierarchy walkable; members stay [] so nothing renders
+  // as activity for it.
+  if (seedAllAgents) {
+    meta.forEach(function (m, id) {
+      if (!groups.has(id)) groups.set(id, { key: id, members: [] });
+    });
+  }
+
+  // Order the rendered agent groups as a pre-order walk: Primary root first,
+  // each rendered agent immediately followed by its rendered children. Metadata
+  // for a filtered-out parent must not orphan a visible child. Malformed cycles
+  // and self-parents have no ordinary root, so a final unseen-component pass
+  // below keeps every workload-forgeable group visible exactly once.
+  function seqOfKey(k) {
+    var m = meta.get(k);
+    return m ? m.seq : model.events[groups.get(k).members[0]].seq;
+  }
+  var childrenOf = new Map(); // parentID -> [childID...]
+  var roots = [];
+  var renderedKeys = [];
+  groups.forEach(function (g, key) {
+    if (key === UNATTRIBUTED_KEY || key === INFRASTRUCTURE_KEY) return;
+    renderedKeys.push(key);
+    var m = meta.get(key);
+    var parent = m ? m.parentID : "";
+    if (parent && groups.has(parent)) {
+      if (!childrenOf.has(parent)) childrenOf.set(parent, []);
+      childrenOf.get(parent).push(key);
+    } else {
+      roots.push(key);
+    }
+  });
+  roots.sort(function (a, b) {
+    var ma = meta.get(a), mb = meta.get(b);
+    var pa = ma && ma.role === "primary" ? 0 : 1;
+    var pb = mb && mb.role === "primary" ? 0 : 1;
+    if (pa !== pb) return pa - pb;
+    return seqOfKey(a) - seqOfKey(b);
+  });
+  var ordered = [];
+  var seen = new Set();
+  function visit(key, depth) {
+    if (seen.has(key)) return; // cycle guard (workload-forgeable parent links)
+    seen.add(key);
+    ordered.push({ group: groups.get(key), depth: depth });
+    (childrenOf.get(key) || [])
+      .slice()
+      .sort(function (a, b) { return seqOfKey(a) - seqOfKey(b); })
+      .forEach(function (c) { visit(c, depth + 1); });
+  }
+  roots.forEach(function (r) { visit(r, 0); });
+  renderedKeys
+    .slice()
+    .sort(function (a, b) { return seqOfKey(a) - seqOfKey(b); })
+    .forEach(function (key) { if (!seen.has(key)) visit(key, 0); });
+
+  return {
+    agentGroups: ordered, // [{group, depth}], pre-order, parents before children
+    meta: meta,
+    agentCount: meta.size,
+    sessionEnded: sessionEnded, // an agent still open at session end never closed
+    unattributed: groups.get(UNATTRIBUTED_KEY) || { key: UNATTRIBUTED_KEY, members: [] },
+    infrastructure: groups.get(INFRASTRUCTURE_KEY) || { key: INFRASTRUCTURE_KEY, members: [] },
+  };
+}
+
+// agentStatusChip renders the agent's lifecycle state as the harness narrated it:
+// a closed agent shows its outcome, an open one is still running — or, once the
+// session itself has ended, was never closed (a crashed harness or a dropped
+// SubagentStop, the same shape the verifier counts as an open child).
+function agentStatusChip(meta, sessionEnded) {
+  if (!meta) return "";
+  if (meta.completed) {
+    if (meta.outcome && meta.outcome !== "success") {
+      return chipHtml(meta.outcome, statusColor("warn"), null,
+        "the harness narrated this agent's closure with outcome " + meta.outcome);
+    }
+    return chipHtml("completed", statusColor("good"), null,
+      "the harness narrated this agent's closure" + (meta.outcome ? "" : " (no outcome reported)"));
+  }
+  if (sessionEnded) {
+    return chipHtml("never closed", statusColor("crit"), null,
+      "the session ended with no agent.completed for this agent (crashed harness or dropped SubagentStop)");
+  }
+  return chipHtml("running", statusColor("muted"), null, "no agent.completed recorded yet");
+}
+
+// agentTitle names the agent by role: children are numbered in registration order
+// ("Child Agent 1"), qualified with the harness-declared subagent type when there is
+// one ("Child Agent 1 · general-purpose"). The number is a viewer-assigned ordinal
+// over agent.started seq — the harness narrates no name for a subagent, and the
+// spawning tool call's description cannot be tied to a specific child by the record.
+function agentTitle(meta) {
+  var role = meta ? meta.role : "";
+  var title = role === "primary" ? "Primary Agent" : role === "child" ? "Child Agent" : "Agent (unregistered)";
+  if (role === "child" && meta.num) title += " " + meta.num;
+  return meta && meta.type ? title + " · " + meta.type : title;
+}
+
+// ownerAgentOf decides which bucket an event belongs to: any event carrying a
+// positively-identified agent.id (including agent.started/completed, which carry
+// the id they describe) belongs to that agent; a workload event with none is
+// Unattributed Workload (NEVER defaulted to an agent); everything else rides an
+// authenticated non-workload channel and is Infrastructure.
+function ownerAgentOf(ev) {
+  var id = attrRaw(ev, "agent.id");
+  if (id) return id;
+  if (INFRASTRUCTURE_PRODUCERS.has(ev.producer)) return INFRASTRUCTURE_KEY;
+  return UNATTRIBUTED_KEY;
+}
+
+function agentGroupsHtml(ctx, indices) {
+  var info = computeAgentGroups(ctx, indices);
+  var html = "";
+  if (info.agentCount === 0) {
+    html += '<div class="empty" style="padding:10px 16px;">no agent decomposition reported ' +
+      '<span class="meta">(the harness narrated no subagents; activity below is shown at session scope)</span></div>';
+  }
+  info.agentGroups.forEach(function (og) { html += agentGroupHtml(ctx, og.group, info.meta, og.depth, info.sessionEnded); });
+  // The two mandatory buckets are ALWAYS rendered, even when empty, so their
+  // absence is never mistaken for "no unattributed activity".
+  html += bucketGroupHtml(ctx, info.unattributed, "Unattributed Workload",
+    "workload events with no positively-identified agent.id (for sessions recorded before primary attribution this includes the Primary's own direct tool calls)", statusColor("warn"));
+  html += bucketGroupHtml(ctx, info.infrastructure, "BoxedAi Infrastructure",
+    "authenticated non-workload channels (controller, broker, supervisor, recorder); not attributable to a single agent", statusColor("info"));
+  return html;
+}
+
+function agentGroupHtml(ctx, g, meta, depth, sessionEnded) {
+  var expanded = ctx.state.expandedActionGroups.has(g.key);
+  var m = meta.get(g.key);
+  var members = expanded ? g.members.map(function (i) { return actionRowHtml(ctx, i); }).join("") : "";
+  var indent = depth ? ' style="margin-left:' + depth * 18 + 'px"' : "";
+  return '<div class="action-group"' + indent + ">" +
+    '<button type="button" class="action-group-hdr" data-act="toggle-group" data-key="' + esc(g.key) + '">' +
+      '<span class="caret">' + (expanded ? "▾" : "▸") + "</span>" +
+      "<strong>" + esc(agentTitle(m)) + "</strong>" +
+      agentStrengthChip(m) +
+      agentStatusChip(m, sessionEnded) +
+      '<span class="meta">' + esc(g.key) + (m && m.nativeID ? " · native " + esc(m.nativeID) : "") + "</span>" +
+      '<span class="meta">' + g.members.length + " events</span>" +
+    "</button>" +
+    (expanded ? '<table class="action-group-members"><tbody>' + members + "</tbody></table>" : "") +
+    "</div>";
+}
+
+function bucketGroupHtml(ctx, g, title, note, color) {
+  var expanded = ctx.state.expandedActionGroups.has(g.key);
+  var count = g.members.length;
+  var members = expanded && count ? g.members.map(function (i) { return actionRowHtml(ctx, i); }).join("") : "";
+  return '<div class="action-group">' +
+    '<button type="button" class="action-group-hdr" data-act="toggle-group" data-key="' + esc(g.key) + '">' +
+      '<span class="caret">' + (expanded ? "▾" : "▸") + "</span>" +
+      "<strong>" + esc(title) + "</strong>" +
+      chipHtml(count + (count === 1 ? " event" : " events"), color, null, note) +
+      '<span class="meta">' + esc(note) + "</span>" +
+    "</button>" +
+    (expanded && count ? '<table class="action-group-members"><tbody>' + members + "</tbody></table>" : "") +
+    (expanded && !count ? '<div class="empty" style="padding:8px 16px;">(none)</div>' : "") +
+    "</div>";
+}
+
 function mountActionsTab(ctx) {
   var el = ctx.els.tabs.actions;
   el.innerHTML =
@@ -1358,9 +1707,255 @@ function updateActionsTab(ctx) {
   ctx.els.actionsToolbar.innerHTML =
     '<button type="button" class="btn small' + (ctx.state.actionsMode === "flat" ? " active" : "") + '" data-act="actions-mode" data-value="flat">flat</button>' +
     '<button type="button" class="btn small' + (ctx.state.actionsMode === "chain" ? " active" : "") + '" data-act="actions-mode" data-value="chain">by action chain</button>' +
+    '<button type="button" class="btn small' + (ctx.state.actionsMode === "agents" ? " active" : "") + '" data-act="actions-mode" data-value="agents">by agent</button>' +
     '<span class="meta">' + numFmt(domainFiltered.indices.length) + " events</span>";
-  ctx.els.actionsTableWrap.innerHTML = ctx.state.actionsMode === "chain" ?
-    actionsChainHtml(ctx, domainFiltered.indices) : actionsFlatHtml(ctx, domainFiltered.indices);
+  ctx.els.actionsTableWrap.innerHTML =
+    ctx.state.actionsMode === "chain" ? actionsChainHtml(ctx, domainFiltered.indices) :
+    ctx.state.actionsMode === "agents" ? agentGroupsHtml(ctx, domainFiltered.indices) :
+    actionsFlatHtml(ctx, domainFiltered.indices);
+}
+
+// ---- per-tab renderers: agents ----
+//
+// The Agents tab is a read-view over the same per-agent grouping the
+// Actions tab's "by agent" mode uses (computeAgentGroups/agentStrengthChip,
+// see the "per-agent grouping" section above), scoped to ONLY tool.requested
+// events — the concise "what did each agent do" activity set. Everything
+// else (tool.completed, process.*/file.*/network.*/model.*...) is "more
+// info", reachable by expanding a line or via the other tabs, not
+// duplicated here. Unlike the Actions tab's by-agent mode (default
+// collapsed), agent blocks here default OPEN — glanceability is the point —
+// and the Infrastructure bucket is intentionally never shown (locked
+// design: agent activity only, not BoxedAi's own plumbing).
+
+// AGENTS_TAB_COLLAPSE_PREFIX namespaces this tab's collapse-tracking within
+// the SHARED ctx.state.expandedActionGroups Set. The Actions tab's by-agent
+// mode already stores raw agent-id/UNATTRIBUTED_KEY keys in that same Set
+// under a "present == expanded, default closed" convention; this tab wants
+// the opposite default (open), so it can't safely share the Actions tab's
+// raw keys — that would either fight its convention or leak this tab's
+// opens into it. Prefixing keeps both tabs' toggle state in the one Set (as
+// directed) while keeping the meaning independent: for this tab, presence
+// means "explicitly collapsed" and absence — including every agent seen for
+// the first time — means "open".
+var AGENTS_TAB_COLLAPSE_PREFIX = "agents-tab-collapsed:";
+function agentsTabGroupCollapsed(ctx, key) {
+  return ctx.state.expandedActionGroups.has(AGENTS_TAB_COLLAPSE_PREFIX + key);
+}
+function toggleAgentsTabGroup(ctx, key) {
+  var k = AGENTS_TAB_COLLAPSE_PREFIX + key;
+  if (ctx.state.expandedActionGroups.has(k)) ctx.state.expandedActionGroups.delete(k);
+  else ctx.state.expandedActionGroups.add(k);
+}
+
+// toolRequestedIndices lists every tool.requested event's index, in seq
+// order — the Agents tab's concise activity set (see section comment
+// above).
+function toolRequestedIndices(model) {
+  var indices = [];
+  for (var i = 0; i < model.events.length; i++) {
+    if (model.events[i].name === "tool.requested") indices.push(i);
+  }
+  return indices;
+}
+
+// toolActivitySummary extracts the one-line concise summary of a
+// tool.requested/tool.completed event: the tool name, the salient argument that
+// identifies what it acted on (`text`), and the human description shown beside
+// it (`desc`) — a Bash call carries both a command and a description, and the
+// enriched Timeline summary wants to show both. harness.tool.input is a
+// workload-controlled JSON STRING (not an object), so parsing is always
+// try/catch guarded; a parse failure (or a shape with none of the known fields)
+// just yields empty text/desc, leaving the tool name alone. harness.task
+// .description is the spawn narration the hook lifts out of a Task/Agent
+// tool_input when the input excerpt is capped (guest/agent/hooks.go), so it
+// stands in as the description for a spawn.
+function toolActivitySummary(ev) {
+  var toolName = attrRaw(ev, "tool.name") || "tool";
+  var raw = attrRaw(ev, "harness.tool.input");
+  var input = {};
+  if (typeof raw === "string") {
+    try { input = JSON.parse(raw) || {}; } catch (e) { input = {}; }
+  }
+  var text = input.command || input.file_path || input.pattern || input.url || "";
+  var desc = input.description || attrRaw(ev, "harness.task.description") || "";
+  return { tool: toolName, text: text, desc: desc };
+}
+
+// agentActivityLineHtml renders one concise activity line for a
+// tool.requested event: a dim tool-name label + the salient argument in
+// monospace (ellipsis-truncated so long commands never wrap). Clicking the
+// line toggles ctx.state.expandedSeqs — the same per-event expand state the
+// Timeline tab uses — and, when expanded, appends timelineDetailRowHtml(ev)
+// verbatim, so the full body/attrs/copy-JSON/filter-chain/focus-pid detail
+// is identical to Timeline's own expand affordance. Wrapped in a <tr><td
+// colspan="6"> (matching timelineDetailRowHtml's own colspan) purely so
+// both rows share one <table> cleanly; the "6" carries no meaning here.
+function agentActivityLineHtml(ctx, i) {
+  var model = ctx.model, ev = model.events[i];
+  var expanded = ctx.state.expandedSeqs.has(ev.seq);
+  var summary = toolActivitySummary(ev);
+  // Prefer the salient argument; fall back to the description (a Task spawn has
+  // only a description, no command/path/pattern/url) so its line stays labeled.
+  var textVal = summary.text || summary.desc;
+  var textHtml = textVal
+    ? '<span class="agent-line-text ellipsis">' + esc(textVal) + "</span>"
+    : '<span class="empty">(no argument)</span>';
+  var html =
+    '<tr class="clickable agent-line" data-seq="' + ev.seq + '">' +
+      '<td colspan="6">' +
+        '<div class="agent-line-row">' +
+          '<span class="agent-tool-label">' + esc(summary.tool) + "</span>" +
+          textHtml +
+          '<span class="meta mono-num">' + esc(model.tsLabel[i]) + "</span>" +
+        "</div>" +
+      "</td>" +
+    "</tr>";
+  if (expanded) html += timelineDetailRowHtml(ev);
+  return html;
+}
+
+// agentActivityTableHtml renders one group's members as the concise
+// activity log, in seq order (computeAgentGroups already hands back members
+// in seq order — see its own doc comment above).
+function agentActivityTableHtml(ctx, members) {
+  if (!members.length) return '<div class="empty" style="padding:8px 16px;">(none)</div>';
+  var rows = members.map(function (i) { return agentActivityLineHtml(ctx, i); }).join("");
+  return '<table class="action-group-members"><tbody>' + rows + "</tbody></table>";
+}
+
+// agentBlockHtml renders one hierarchy entry (Primary/Child/unregistered
+// agent), indented by its depth in the parent forest exactly like
+// agentGroupHtml (style="margin-left:<depth*18>px"), with the same header
+// (numbered role title + subagent type + agentStrengthChip + agentStatusChip +
+// id/native id + action count) but showing the concise activity log instead of
+// a raw event table, and defaulting OPEN (see AGENTS_TAB_COLLAPSE_PREFIX above).
+function agentBlockHtml(ctx, g, meta, depth, sessionEnded) {
+  var collapsed = agentsTabGroupCollapsed(ctx, g.key);
+  var m = meta.get(g.key);
+  var cls = "action-group" + (depth ? " agent-block-child" : "");
+  var indent = depth ? ' style="margin-left:' + depth * 18 + 'px"' : "";
+  return '<div class="' + cls + '"' + indent + ">" +
+    '<button type="button" class="action-group-hdr" data-act="toggle-agent-group" data-key="' + esc(g.key) + '">' +
+      '<span class="caret">' + (collapsed ? "▸" : "▾") + "</span>" +
+      "<strong>" + esc(agentTitle(m)) + "</strong>" +
+      agentStrengthChip(m) +
+      agentStatusChip(m, sessionEnded) +
+      '<span class="meta">' + esc(g.key) + (m && m.nativeID ? " · native " + esc(m.nativeID) : "") + "</span>" +
+      '<span class="meta">' + numFmt(g.members.length) + (g.members.length === 1 ? " action" : " actions") + "</span>" +
+    "</button>" +
+    (collapsed ? "" : agentActivityTableHtml(ctx, g.members)) +
+    "</div>";
+}
+
+// agentUnattributedBlockHtml renders the mandatory Unattributed Workload
+// bucket (mirrors bucketGroupHtml's honest-presentation framing above):
+// everything the harness never positively attributed to an agent — sessions
+// recorded before the Primary's own direct calls were attributed, hooks that
+// ran without a Primary id, and non-hook workload channels. Same
+// default-open/collapse mechanics as agentBlockHtml; the Infrastructure
+// bucket is intentionally never rendered on this tab.
+function agentUnattributedBlockHtml(ctx, g, decompositionUnavailable) {
+  var collapsed = agentsTabGroupCollapsed(ctx, g.key);
+  var count = g.members.length;
+  var note = decompositionUnavailable
+    ? "agent decomposition unavailable: no lifecycle registrations recorded"
+    : "activity with no positively-identified agent (for sessions recorded before primary attribution this includes the Primary's own direct tool calls)";
+  return '<div class="action-group">' +
+    '<button type="button" class="action-group-hdr" data-act="toggle-agent-group" data-key="' + esc(g.key) + '">' +
+      '<span class="caret">' + (collapsed ? "▸" : "▾") + "</span>" +
+      "<strong>Unattributed Workload</strong>" +
+      '<span class="meta">' + numFmt(count) + (count === 1 ? " action" : " actions") + "</span>" +
+      '<span class="meta">' + esc(note) + "</span>" +
+    "</button>" +
+    (collapsed ? "" : agentActivityTableHtml(ctx, g.members)) +
+    "</div>";
+}
+
+function mountAgentsTab(ctx) {
+  var el = ctx.els.tabs.agents;
+  el.innerHTML =
+    '<div class="subtoolbar" data-role="toolbar"></div>' +
+    '<div class="table-wrap" data-role="tablewrap"></div>';
+  ctx.els.agentsToolbar = el.querySelector('[data-role="toolbar"]');
+  ctx.els.agentsTableWrap = el.querySelector('[data-role="tablewrap"]');
+  bindAgentsTabEvents(ctx, el);
+}
+
+function updateAgentsTab(ctx) {
+  var indices = toolRequestedIndices(ctx.model);
+  var info = computeAgentGroups(ctx, indices, true);
+
+  if (indices.length === 0) {
+    ctx.els.agentsToolbar.innerHTML = '<span class="meta">no agent activity recorded</span>';
+    ctx.els.agentsTableWrap.innerHTML =
+      '<div class="empty" style="padding:12px 16px;">no agent activity recorded ' +
+      '<span class="meta">(the harness narrated no subagents for this session)</span></div>';
+    return;
+  }
+
+  if (info.agentCount === 0) {
+    ctx.els.agentsToolbar.innerHTML =
+      '<button type="button" class="btn small" data-act="agents-collapse-all" title="collapse every agent block and expanded row">collapse all</button>' +
+      '<span class="meta">0 agents · ' + numFmt(indices.length) + " actions</span>";
+    ctx.els.agentsTableWrap.innerHTML = agentUnattributedBlockHtml(ctx, {
+      key: UNATTRIBUTED_KEY,
+      members: indices,
+    }, true);
+    return;
+  }
+
+  ctx.els.agentsToolbar.innerHTML =
+    '<button type="button" class="btn small" data-act="agents-collapse-all" title="collapse every agent block and expanded row">collapse all</button>' +
+    '<span class="meta">' + numFmt(info.agentCount) + (info.agentCount === 1 ? " agent" : " agents") +
+    " · " + numFmt(indices.length) + " actions</span>";
+
+  var html = "";
+  info.agentGroups.forEach(function (og) { html += agentBlockHtml(ctx, og.group, info.meta, og.depth, info.sessionEnded); });
+  html += agentUnattributedBlockHtml(ctx, info.unattributed);
+  ctx.els.agentsTableWrap.innerHTML = html;
+}
+
+// collapseAllAgentsTab folds every rendered agent block closed and clears every
+// expanded activity-line detail, returning the tab to just its agent headers —
+// the Agents-tab counterpart to the Timeline's "collapse all". The block keys
+// are recomputed (not scraped from the DOM) so the collapsed set matches exactly
+// what updateAgentsTab renders: each hierarchy group plus the always-present
+// Unattributed bucket. expandedSeqs is the same per-event detail state the
+// Timeline clears, so a full clear here keeps the two buttons' behaviour aligned.
+function collapseAllAgentsTab(ctx) {
+  var info = computeAgentGroups(ctx, toolRequestedIndices(ctx.model), true);
+  info.agentGroups.forEach(function (og) {
+    ctx.state.expandedActionGroups.add(AGENTS_TAB_COLLAPSE_PREFIX + og.group.key);
+  });
+  ctx.state.expandedActionGroups.add(AGENTS_TAB_COLLAPSE_PREFIX + UNATTRIBUTED_KEY);
+  ctx.state.expandedSeqs.clear();
+}
+
+// bindAgentsTabEvents mirrors the relevant parts of bindTimelineEvents: a
+// row click toggles ctx.state.expandedSeqs and the detail row's copy-JSON/
+// filter-chain/focus-pid buttons behave identically to Timeline's;
+// toggle-agent-group additionally collapses/expands one hierarchy block.
+function bindAgentsTabEvents(ctx, container) {
+  container.addEventListener("click", function (e) {
+    var btn = e.target.closest("[data-act]");
+    if (btn) {
+      var act = btn.dataset.act;
+      if (act === "toggle-agent-group") { toggleAgentsTabGroup(ctx, btn.dataset.key); updateAgentsTab(ctx); return; }
+      if (act === "agents-collapse-all") { collapseAllAgentsTab(ctx); updateAgentsTab(ctx); return; }
+      if (act === "copy-json") { copyEventJSON(ctx, Number(btn.dataset.seq), btn); return; }
+      if (act === "filter-chain") { ctx.setSearch(btn.dataset.value); return; }
+      if (act === "focus-pid") { ctx.focusPid(btn.dataset.value); return; }
+      return;
+    }
+    var row = e.target.closest("tr.agent-line");
+    if (row) {
+      var seq = Number(row.dataset.seq);
+      if (ctx.state.expandedSeqs.has(seq)) ctx.state.expandedSeqs.delete(seq);
+      else ctx.state.expandedSeqs.add(seq);
+      updateAgentsTab(ctx);
+    }
+  });
 }
 
 // ---- per-tab renderers: proof ----
@@ -1518,6 +2113,7 @@ function updateProofTab(ctx) {
 
 var TAB_DEFS = [
   { key: "timeline", label: "Timeline" },
+  { key: "agents", label: "Agents" },
   { key: "processes", label: "Processes" },
   { key: "files", label: "Files" },
   { key: "network", label: "Network" },
@@ -1599,6 +2195,7 @@ function renderTabsBar(ctx) {
 function renderActiveTab(ctx, appendMode) {
   switch (ctx.state.tab) {
     case "timeline": updateTimelineTab(ctx, appendMode); break;
+    case "agents": updateAgentsTab(ctx); break;
     case "processes": updateProcessesTab(ctx); break;
     case "files": updateFilesTab(ctx); break;
     case "network": updateNetworkTab(ctx); break;
@@ -1632,6 +2229,7 @@ function mountShell(ctx) {
       '<div class="tabs" data-role="tabs"></div>' +
     "</div>" +
     '<div class="tab-content" data-tab="timeline"></div>' +
+    '<div class="tab-content hidden" data-tab="agents"></div>' +
     '<div class="tab-content hidden" data-tab="processes"></div>' +
     '<div class="tab-content hidden" data-tab="files"></div>' +
     '<div class="tab-content hidden" data-tab="network"></div>' +
@@ -1650,6 +2248,7 @@ function mountShell(ctx) {
   });
   bindHeaderEvents(ctx);
   mountTimelineTab(ctx);
+  mountAgentsTab(ctx);
   mountProcessesTab(ctx);
   mountFilesTab(ctx);
   mountNetworkTab(ctx);
@@ -1835,37 +2434,177 @@ function summaryKey(s) {
   return s.state + ":" + s.event_count + ":" + s.last_event_seq + ":" + (s.proof && s.proof.status);
 }
 
-function sessionCardHtml(s, selected) {
+// repoLabel shortens a repository reference (a clone URL or an owner/name) to a
+// compact "owner/name" for the group header, falling back to a stable label
+// for sessions that were run against a local checkout with no remote origin.
+function repoLabel(repo) {
+  if (!repo) return "local (no remote)";
+  var s = repo.replace(/\.git$/, "");
+  // scp-like (git@host:owner/name, org-123@github.com:owner/name) or URL.
+  var scp = s.match(/^[^/]*@[^:]+:(.+)$/);
+  if (scp) s = scp[1];
+  else {
+    var m = s.match(/^[a-z]+:\/\/[^/]+\/(.+)$/i);
+    if (m) s = m[1];
+  }
+  var parts = s.split("/").filter(Boolean);
+  if (parts.length >= 2) return parts.slice(-2).join("/");
+  return parts.join("/") || repo;
+}
+
+function branchLabel(branch) {
+  return branch || "(detached)";
+}
+
+// groupKey is the stable identity of a repo group, used for collapse state and
+// group-level select-all so it survives re-renders across polls.
+function groupKey(repo) {
+  return "repo:" + (repo || "");
+}
+
+// sessionMatchesFilter tests the free-text sidebar filter against a session's
+// id, harness, profile, repo and branch so filtering works after grouping too.
+function sessionMatchesFilter(s, q) {
+  if (!q) return true;
+  var hay = (s.session_id + " " + (s.harness || "") + " " + (s.profile || "") + " " +
+    (s.repository || "") + " " + repoLabel(s.repository) + " " + (s.branch || "")).toLowerCase();
+  return hay.indexOf(q) !== -1;
+}
+
+// groupPrevious buckets finished sessions by repository, then branch, so the
+// sidebar can render them under "<owner/name>" › "<branch>" headers. Repos are
+// sorted alphabetically with the no-remote bucket last; branches alphabetically;
+// sessions newest-first (ids carry a UTC timestamp prefix).
+function groupPrevious(sessions) {
+  var byRepo = {};
+  sessions.forEach(function (s) {
+    var rk = groupKey(s.repository);
+    if (!byRepo[rk]) byRepo[rk] = { key: rk, repo: s.repository || "", label: repoLabel(s.repository), branches: {} };
+    var bk = s.branch || "";
+    if (!byRepo[rk].branches[bk]) byRepo[rk].branches[bk] = { branch: bk, label: branchLabel(bk), sessions: [] };
+    byRepo[rk].branches[bk].sessions.push(s);
+  });
+  return Object.keys(byRepo).map(function (rk) {
+    var g = byRepo[rk];
+    var branches = Object.keys(g.branches).map(function (bk) { return g.branches[bk]; });
+    branches.sort(function (a, b) { return a.label.localeCompare(b.label); });
+    branches.forEach(function (b) {
+      b.sessions.sort(function (x, y) { return x.session_id < y.session_id ? 1 : -1; });
+    });
+    var count = branches.reduce(function (n, b) { return n + b.sessions.length; }, 0);
+    return { key: g.key, repo: g.repo, label: g.label, branches: branches, count: count };
+  }).sort(function (a, b) {
+    if (!a.repo !== !b.repo) return a.repo ? -1 : 1; // no-remote bucket last
+    return a.label.localeCompare(b.label);
+  });
+}
+
+function sessionCardHtml(s, selected, opts) {
+  opts = opts || {};
   var stateChip = chipHtml(s.state, sessionStateColorVar(s.state));
   var pulse = s.state === "running" ? ' <span class="pulse-dot" title="running"></span>' : "";
   var statusChip = s.proof && s.proof.status ? chipHtml(s.proof.status, proofStatusColorVar(s.proof.status)) : "";
   var verdictChip = s.proof && s.proof.verdict ? chipHtml(s.proof.verdict, verdictColorVar(s.proof.verdict)) : "";
   var metaLine = [s.harness || "", s.profile || ""].filter(Boolean).join(" · ");
-  return (
+  // Running cards surface repo/branch inline (they aren't grouped under a repo
+  // header the way finished sessions are).
+  var repoLine = "";
+  if (opts.showRepo) {
+    var rb = [repoLabel(s.repository), s.branch ? branchLabel(s.branch) : ""].filter(Boolean).join(" · ");
+    repoLine = '<div class="row-repo">' + esc(rb) + "</div>";
+  }
+  var check = opts.selectable
+    ? '<input type="checkbox" class="session-check" data-select-id="' + esc(s.session_id) + '"' + (opts.checked ? " checked" : "") + ' aria-label="select session">'
+    : "";
+  var card =
     '<button type="button" class="session-card' + (selected ? " selected" : "") + '" data-session-id="' + esc(s.session_id) + '">' +
       '<div class="row1"><span>' + esc(s.session_id) + "</span>" + stateChip + pulse + "</div>" +
+      repoLine +
       '<div class="row2">' + esc(metaLine || "—") + " · " + numFmt(s.event_count) + " events · seq " + numFmt(s.last_event_seq || 0) +
         (s.last_event_ts ? " · " + esc(relTime(s.last_event_ts)) : "") + "</div>" +
       '<div class="row3">' + statusChip + verdictChip + "</div>" +
-    "</button>"
-  );
+    "</button>";
+  if (!opts.selectable) return card;
+  return '<div class="session-row' + (opts.checked ? " checked" : "") + '">' + check + card + "</div>";
 }
 
 function renderSidebarList(dash) {
   var q = dash.filterText;
-  var filtered = dash.sessions.filter(function (s) {
-    if (!q) return true;
-    var hay = (s.session_id + " " + (s.harness || "") + " " + (s.profile || "")).toLowerCase();
-    return hay.indexOf(q) !== -1;
-  });
-  dash.els.counts.textContent = numFmt(dash.sessions.length) + " total" + (q ? " · " + numFmt(filtered.length) + " shown" : "") +
+  var visible = dash.sessions.filter(function (s) { return sessionMatchesFilter(s, q); });
+  dash.els.counts.textContent = numFmt(dash.sessions.length) + " total" + (q ? " · " + numFmt(visible.length) + " shown" : "") +
     (dash.lastPollAt ? " · updated " + fmtClockShort(dash.lastPollAt) : "");
+
+  renderDeleteBar(dash);
+
   if (!dash.sessions.length) {
     dash.els.list.innerHTML = '<div class="empty" style="padding:1rem;">No sessions recorded.</div>';
     return;
   }
-  dash.els.list.innerHTML = filtered.map(function (s) { return sessionCardHtml(s, s.session_id === dash.selectedId); }).join("") ||
-    '<div class="empty" style="padding:1rem;">no sessions match filter</div>';
+
+  var running = visible.filter(function (s) { return s.state === "running"; })
+    .sort(function (x, y) { return x.session_id < y.session_id ? 1 : -1; });
+  var previous = visible.filter(function (s) { return s.state !== "running"; });
+
+  var html = "";
+  if (running.length) {
+    html += '<div class="group-hdr running-hdr"><span class="group-name">Running</span>' +
+      '<span class="group-count">' + numFmt(running.length) + "</span></div>";
+    html += running.map(function (s) {
+      return sessionCardHtml(s, s.session_id === dash.selectedId, { showRepo: true });
+    }).join("");
+  }
+
+  var groups = groupPrevious(previous);
+  if (groups.length) {
+    html += '<div class="group-hdr section-hdr"><span class="group-name">Previous</span>' +
+      '<span class="group-count">' + numFmt(previous.length) + "</span></div>";
+    groups.forEach(function (g) {
+      var collapsed = dash.collapsed[g.key];
+      var groupIds = [];
+      g.branches.forEach(function (b) { b.sessions.forEach(function (s) { groupIds.push(s.session_id); }); });
+      var allSelected = dash.selectMode && groupIds.length > 0 && groupIds.every(function (id) { return dash.selected[id]; });
+      var groupCheck = dash.selectMode
+        ? '<input type="checkbox" class="group-check" data-group-key="' + esc(g.key) + '"' + (allSelected ? " checked" : "") + ' aria-label="select all in repo">'
+        : "";
+      html += '<div class="group-hdr repo-hdr" data-collapse-key="' + esc(g.key) + '">' + groupCheck +
+        '<span class="caret">' + (collapsed ? "▸" : "▾") + "</span>" +
+        '<span class="group-name" title="' + esc(g.repo || g.label) + '">' + esc(g.label) + "</span>" +
+        '<span class="group-count">' + numFmt(g.count) + "</span></div>";
+      if (collapsed) return;
+      g.branches.forEach(function (b) {
+        html += '<div class="branch-hdr"><span class="branch-name">' + esc(b.label) + "</span>" +
+          '<span class="group-count">' + numFmt(b.sessions.length) + "</span></div>";
+        html += b.sessions.map(function (s) {
+          return sessionCardHtml(s, s.session_id === dash.selectedId, {
+            selectable: dash.selectMode,
+            checked: !!dash.selected[s.session_id],
+          });
+        }).join("");
+      });
+    });
+  }
+
+  dash.els.list.innerHTML = html || '<div class="empty" style="padding:1rem;">no sessions match filter</div>';
+}
+
+// selectedCount / renderDeleteBar drive the bulk-delete action bar shown while
+// select mode is on: it reflects how many finished sessions are checked and
+// gates the destructive button.
+function selectedCount(dash) {
+  return Object.keys(dash.selected).filter(function (id) { return dash.selected[id]; }).length;
+}
+
+function renderDeleteBar(dash) {
+  var bar = dash.els.deleteBar;
+  if (!bar) return;
+  if (!dash.selectMode) {
+    bar.hidden = true;
+    return;
+  }
+  bar.hidden = false;
+  var n = selectedCount(dash);
+  dash.els.deleteBtn.disabled = n === 0 || dash.deleting;
+  dash.els.deleteBtn.textContent = dash.deleting ? "Deleting…" : "Delete" + (n ? " (" + n + ")" : "");
 }
 
 function ensureDashboardView(dash) {
@@ -1929,9 +2668,14 @@ function mountDashboard(appEl) {
     '<div class="dash-layout">' +
       '<aside class="dash-sidebar">' +
         '<div class="dash-sidebar-hdr">' +
-          "<h1>sessions</h1>" +
+          '<div class="hdr-top"><h1>sessions</h1>' +
+            '<button type="button" class="btn small" data-role="select-toggle">Select</button></div>' +
           '<div class="counts" data-role="counts"></div>' +
           '<input type="search" placeholder="filter sessions…" data-role="filter">' +
+          '<div class="delete-bar" data-role="delete-bar" hidden>' +
+            '<button type="button" class="btn small danger" data-role="delete-btn" disabled>Delete</button>' +
+            '<button type="button" class="btn small link" data-role="cancel-btn">Cancel</button>' +
+          "</div>" +
         "</div>" +
         '<div class="session-list" data-role="list"></div>' +
       "</aside>" +
@@ -1945,11 +2689,19 @@ function mountDashboard(appEl) {
     selectedId: readHashObject().sess || "",
     lastPollAt: null,
     view: null,
+    selectMode: false,
+    selected: {},   // id -> true for bulk-delete selection
+    collapsed: {},  // repo groupKey -> true when collapsed
+    deleting: false,
     els: {
       counts: appEl.querySelector('[data-role="counts"]'),
       filter: appEl.querySelector('[data-role="filter"]'),
       list: appEl.querySelector('[data-role="list"]'),
       main: appEl.querySelector('[data-role="main"]'),
+      selectToggle: appEl.querySelector('[data-role="select-toggle"]'),
+      deleteBar: appEl.querySelector('[data-role="delete-bar"]'),
+      deleteBtn: appEl.querySelector('[data-role="delete-btn"]'),
+      cancelBtn: appEl.querySelector('[data-role="cancel-btn"]'),
     },
   };
 
@@ -1958,13 +2710,91 @@ function mountDashboard(appEl) {
     renderSidebarList(dash);
   }, SEARCH_DEBOUNCE_MS));
 
+  dash.els.selectToggle.addEventListener("click", function () {
+    setSelectMode(dash, !dash.selectMode);
+  });
+  dash.els.cancelBtn.addEventListener("click", function () { setSelectMode(dash, false); });
+  dash.els.deleteBtn.addEventListener("click", function () { deleteSelectedSessions(dash); });
+
   dash.els.list.addEventListener("click", function (e) {
+    var chk = e.target.closest(".session-check");
+    if (chk) { dash.selected[chk.dataset.selectId] = chk.checked; renderSidebarList(dash); return; }
+    var gchk = e.target.closest(".group-check");
+    if (gchk) { toggleGroupSelect(dash, gchk.dataset.groupKey, gchk.checked); return; }
+    var collapseHdr = e.target.closest("[data-collapse-key]");
+    if (collapseHdr) {
+      var k = collapseHdr.dataset.collapseKey;
+      dash.collapsed[k] = !dash.collapsed[k];
+      renderSidebarList(dash);
+      return;
+    }
     var card = e.target.closest("[data-session-id]");
     if (card) selectDashboardSession(dash, card.dataset.sessionId);
   });
 
   pollDashboardSessions(dash);
   setInterval(function () { pollDashboardSessions(dash); }, DASH_POLL_MS);
+}
+
+function setSelectMode(dash, on) {
+  dash.selectMode = on;
+  if (!on) dash.selected = {};
+  dash.els.selectToggle.textContent = on ? "Done" : "Select";
+  dash.els.selectToggle.classList.toggle("active", on);
+  renderSidebarList(dash);
+}
+
+// toggleGroupSelect checks or clears every finished session under one repo group
+// at once, respecting the active text filter so it only touches visible rows.
+function toggleGroupSelect(dash, key, checked) {
+  var q = dash.filterText;
+  dash.sessions.forEach(function (s) {
+    if (s.state === "running") return;
+    if (groupKey(s.repository) !== key) return;
+    if (!sessionMatchesFilter(s, q)) return;
+    dash.selected[s.session_id] = checked;
+  });
+  renderSidebarList(dash);
+}
+
+// deleteSelectedSessions posts the checked ids to the bulk-delete endpoint,
+// which removes each session's entire on-disk directory. On return it clears
+// selection, drops the just-selected detail view if it was deleted, and forces
+// an immediate sidebar poll so the list reflects the removal without waiting.
+function deleteSelectedSessions(dash) {
+  var ids = Object.keys(dash.selected).filter(function (id) { return dash.selected[id]; });
+  if (!ids.length || dash.deleting) return;
+  if (!window.confirm("Delete " + ids.length + " session" + (ids.length === 1 ? "" : "s") +
+    " and all of their evidence files? This cannot be undone.")) return;
+  dash.deleting = true;
+  renderDeleteBar(dash);
+  fetch("/api/sessions/delete", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ids: ids }),
+  }).then(function (r) { return r.json(); }).then(function (resp) {
+    var deleted = (resp && resp.deleted) || [];
+    var errors = (resp && resp.errors) || {};
+    deleted.forEach(function (id) {
+      delete dash.selected[id];
+      delete dash.summaries[id];
+      if (dash.selectedId === id) {
+        dash.selectedId = "";
+        writeHashObjectMerged({ sess: undefined });
+        if (dash.view) { dash.els.main.innerHTML = '<div class="empty">Select a session.</div>'; dash.view = null; }
+      }
+    });
+    var failed = Object.keys(errors);
+    if (failed.length) window.alert("Could not delete " + failed.length + " session(s):\n" +
+      failed.map(function (id) { return id + ": " + errors[id]; }).join("\n"));
+  }).catch(function () {
+    window.alert("Delete request failed.");
+  }).then(function () {
+    dash.deleting = false;
+    if (!selectedCount(dash)) setSelectMode(dash, false);
+    else renderDeleteBar(dash);
+    pollDashboardSessions(dash);
+  });
 }
 
 // ---- boot ----

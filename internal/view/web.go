@@ -70,6 +70,8 @@ type dashboardSession struct {
 	State        string     `json:"state"`
 	Harness      string     `json:"harness,omitempty"`
 	Profile      string     `json:"profile,omitempty"`
+	Repository   string     `json:"repository,omitempty"`
+	Branch       string     `json:"branch,omitempty"`
 	CreatedAt    string     `json:"created_at,omitempty"`
 	EventCount   int        `json:"event_count"`
 	LastEventSeq int64      `json:"last_event_seq"`
@@ -82,6 +84,14 @@ type dashboardSession struct {
 // /api/sessions.
 type dashboardPayload struct {
 	Sessions []dashboardSession `json:"sessions"`
+}
+
+// deleteSessionsResponse reports the outcome of a bulk delete: the ids that
+// were removed and a per-id reason for any that were not (still running,
+// already gone, invalid id).
+type deleteSessionsResponse struct {
+	Deleted []string          `json:"deleted"`
+	Errors  map[string]string `json:"errors"`
 }
 
 // proofState exposes cryptographic proof status without implying that live
@@ -246,6 +256,36 @@ func newDashboardMux() *http.ServeMux {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
+	mux.HandleFunc("/api/sessions/delete", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "view: method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			IDs []string `json:"ids"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, fmt.Sprintf("view: decode delete request: %v", err), http.StatusBadRequest)
+			return
+		}
+		resp := deleteSessionsResponse{Errors: map[string]string{}}
+		for _, id := range req.IDs {
+			if !isSessionID(id) {
+				resp.Errors[id] = "invalid session id"
+				continue
+			}
+			if err := session.DeleteSession(id); err != nil {
+				resp.Errors[id] = err.Error()
+				continue
+			}
+			purgeDashboardCache(session.SessionDir(id))
+			resp.Deleted = append(resp.Deleted, id)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		if err := json.NewEncoder(w).Encode(resp); err != nil {
+			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
+		}
+	})
 	mux.HandleFunc("/api/session", func(w http.ResponseWriter, r *http.Request) {
 		id := r.URL.Query().Get("id")
 		if !isSessionID(id) {
@@ -319,11 +359,13 @@ func buildDashboardSession(info session.SessionInfo) dashboardSession {
 		}
 	}
 	entry := dashboardSession{
-		SessionID: info.SessionID,
-		State:     string(info.State),
-		Harness:   info.Harness,
-		Profile:   info.Profile,
-		CreatedAt: info.CreatedAt,
+		SessionID:  info.SessionID,
+		State:      string(info.State),
+		Harness:    info.Harness,
+		Profile:    info.Profile,
+		Repository: info.Repository,
+		Branch:     info.Branch,
+		CreatedAt:  info.CreatedAt,
 	}
 	if info.State == session.StateRunning {
 		if db, err := rebuildDashboardProjection(info.Dir); err == nil {
@@ -356,6 +398,14 @@ func cacheSealedDashboardSession(info session.SessionInfo, entry dashboardSessio
 	dashboardCacheMu.Lock()
 	defer dashboardCacheMu.Unlock()
 	dashboardCache[info.Dir] = cachedDashboardSession{signature: signature, session: entry}
+}
+
+// purgeDashboardCache drops any cached sealed-session summary for a deleted
+// session dir so a re-created id (or a stale entry) can't outlive the files.
+func purgeDashboardCache(sessionDir string) {
+	dashboardCacheMu.Lock()
+	defer dashboardCacheMu.Unlock()
+	delete(dashboardCache, sessionDir)
 }
 
 func dashboardSessionSignature(sessionDir string) string {
