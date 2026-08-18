@@ -89,8 +89,8 @@ type dashboardSession struct {
 	VerifyError  string     `json:"verify_error,omitempty"`
 }
 
-// dashboardPayload is the polling-oriented JSON document served at
-// /api/sessions.
+// dashboardPayload is the complete session-list snapshot served at
+// /api/sessions and at the start of a dashboard stream.
 type dashboardPayload struct {
 	Sessions []dashboardSession `json:"sessions"`
 }
@@ -150,22 +150,16 @@ type webSegmentManifest struct {
 	SealedAt          string `json:"sealed_at"`
 }
 
-type cachedDashboardSession struct {
-	signature string
-	session   dashboardSession
-}
-
 var (
-	dashboardCacheMu sync.Mutex
-	dashboardCache   = map[string]cachedDashboardSession{}
-
+	projectionRebuildMu        sync.Mutex
 	rebuildDashboardProjection = Rebuild
+	buildDashboardSummaryProof = buildDashboardProofState
 )
 
 // ServeWeb serves the self-contained web viewer for sessionDir on addr,
 // blocking until the server stops or errors. It exposes the static page at
-// "/" and the event data (rebuilt fresh per request) as JSON at
-// "/api/events".
+// "/", the live event stream at "/api/stream", and a one-shot event snapshot
+// (rebuilt fresh per request) as JSON at "/api/events".
 func ServeWeb(sessionDir, addr string) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -186,6 +180,7 @@ func ServeWebListener(sessionDir string, ln net.Listener) error {
 // httptest, the same way newDashboardMux already is.
 func newWebMux(sessionDir string) *http.ServeMux {
 	mux := http.NewServeMux()
+	stream := newStreamServer()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -205,6 +200,7 @@ func newWebMux(sessionDir string) *http.ServeMux {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
+	mux.Handle("/api/stream", stream.standaloneHandler(sessionDir))
 	registerContentRoutes(mux, fixedSessionResolver(sessionDir))
 	registerAssets(mux)
 	return mux
@@ -251,6 +247,7 @@ func ServeDashboardListener(ln net.Listener) error {
 
 func newDashboardMux() *http.ServeMux {
 	mux := http.NewServeMux()
+	stream := newStreamServer()
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/" {
 			http.NotFound(w, r)
@@ -292,7 +289,6 @@ func newDashboardMux() *http.ServeMux {
 				resp.Errors[id] = err.Error()
 				continue
 			}
-			purgeDashboardCache(session.SessionDir(id))
 			resp.Deleted = append(resp.Deleted, id)
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -326,6 +322,7 @@ func newDashboardMux() *http.ServeMux {
 			http.Error(w, fmt.Sprintf("view: encode response: %v", err), http.StatusInternalServerError)
 		}
 	})
+	mux.Handle("/api/stream", stream.dashboardHandler())
 	registerContentRoutes(mux, querySessionResolver)
 	registerAssets(mux)
 	return mux
@@ -345,7 +342,7 @@ func isSessionID(id string) bool {
 }
 
 // buildDashboardPayload lists all known sessions and attaches enough summary
-// data for polling clients to update rows without fetching every timeline.
+// data for snapshot and streamed row updates without fetching every timeline.
 func buildDashboardPayload() (dashboardPayload, error) {
 	infos, err := session.ListSessions()
 	if err != nil {
@@ -368,11 +365,6 @@ func buildDashboardPayload() (dashboardPayload, error) {
 }
 
 func buildDashboardSession(info session.SessionInfo) dashboardSession {
-	if info.State == session.StateSealed {
-		if cached, ok := cachedSealedDashboardSession(info); ok {
-			return cached
-		}
-	}
 	entry := dashboardSession{
 		SessionID:  info.SessionID,
 		State:      string(info.State),
@@ -383,75 +375,25 @@ func buildDashboardSession(info session.SessionInfo) dashboardSession {
 		CreatedAt:  info.CreatedAt,
 	}
 	if info.State == session.StateRunning {
+		projectionRebuildMu.Lock()
 		if db, err := rebuildDashboardProjection(info.Dir); err == nil {
 			entry.EventCount, entry.LastEventSeq, entry.LastEventTS = eventSummary(db)
 			db.Close()
 		}
+		projectionRebuildMu.Unlock()
 	} else {
 		entry.EventCount, entry.LastEventSeq, entry.LastEventTS = manifestEventSummary(info.Dir)
 	}
-	entry.Proof = buildDashboardProofState(info.Dir, info.State)
-	if info.State == session.StateSealed {
-		cacheSealedDashboardSession(info, entry)
-	}
+	entry.Proof = buildDashboardSummaryProof(info.Dir, info.State)
 	return entry
-}
-
-func cachedSealedDashboardSession(info session.SessionInfo) (dashboardSession, bool) {
-	signature := dashboardSessionSignature(info.Dir)
-	dashboardCacheMu.Lock()
-	defer dashboardCacheMu.Unlock()
-	cached, ok := dashboardCache[info.Dir]
-	if !ok || cached.signature != signature {
-		return dashboardSession{}, false
-	}
-	return cached.session, true
-}
-
-func cacheSealedDashboardSession(info session.SessionInfo, entry dashboardSession) {
-	signature := dashboardSessionSignature(info.Dir)
-	dashboardCacheMu.Lock()
-	defer dashboardCacheMu.Unlock()
-	dashboardCache[info.Dir] = cachedDashboardSession{signature: signature, session: entry}
-}
-
-// purgeDashboardCache drops any cached sealed-session summary for a deleted
-// session dir so a re-created id (or a stale entry) can't outlive the files.
-func purgeDashboardCache(sessionDir string) {
-	dashboardCacheMu.Lock()
-	defer dashboardCacheMu.Unlock()
-	delete(dashboardCache, sessionDir)
-}
-
-func dashboardSessionSignature(sessionDir string) string {
-	segDir := filepath.Join(sessionDir, "evidence", "segments")
-	entries, err := os.ReadDir(segDir)
-	if err != nil {
-		return "no-segments"
-	}
-	var parts []string
-	for _, entry := range entries {
-		if entry.IsDir() {
-			continue
-		}
-		name := entry.Name()
-		if !strings.HasPrefix(name, "segment-") || !(strings.HasSuffix(name, ".manifest.json") || strings.HasSuffix(name, ".manifest.cose") || strings.HasSuffix(name, ".otlp")) {
-			continue
-		}
-		info, err := entry.Info()
-		if err != nil {
-			continue
-		}
-		parts = append(parts, fmt.Sprintf("%s:%d:%d", name, info.Size(), info.ModTime().UnixNano()))
-	}
-	sort.Strings(parts)
-	return strings.Join(parts, "|")
 }
 
 // buildWebPayload rebuilds the projection and assembles the full web payload,
 // including the verdict banner from internal/verify (best-effort: a verify
 // failure is surfaced as VerifyError rather than failing the whole page).
 func buildWebPayload(sessionDir string) (webPayload, error) {
+	projectionRebuildMu.Lock()
+	defer projectionRebuildMu.Unlock()
 	db, err := Rebuild(sessionDir)
 	if err != nil {
 		return webPayload{}, err
@@ -467,25 +409,9 @@ func buildWebPayload(sessionDir string) (webPayload, error) {
 	if err != nil {
 		return webPayload{}, err
 	}
-	events := make([]webEvent, 0, len(rows))
-	for _, row := range rows {
-		var attrs map[string]any
-		if err := json.Unmarshal([]byte(row.AttrsJSON), &attrs); err != nil {
-			return webPayload{}, fmt.Errorf("view: decode attrs for seq %d: %w", row.Seq, err)
-		}
-		events = append(events, webEvent{
-			Seq:            row.Seq,
-			TS:             row.TS,
-			Name:           row.Name,
-			Class:          row.Class,
-			Badge:          classBadge(row.Class),
-			Producer:       row.Producer,
-			ActionID:       row.ActionID,
-			ParentActionID: row.ParentActionID,
-			Outcome:        row.Outcome,
-			Body:           row.Body,
-			Attrs:          attrs,
-		})
+	events, err := webEventsFromRows(rows)
+	if err != nil {
+		return webPayload{}, err
 	}
 
 	tree, err := processTreeFromDB(db)
@@ -510,6 +436,30 @@ func buildWebPayload(sessionDir string) (webPayload, error) {
 		payload.Proof = buildProofState(sessionDir, state, report, nil)
 	}
 	return payload, nil
+}
+
+func webEventsFromRows(rows []eventRow) ([]webEvent, error) {
+	events := make([]webEvent, 0, len(rows))
+	for _, row := range rows {
+		var attrs map[string]any
+		if err := json.Unmarshal([]byte(row.AttrsJSON), &attrs); err != nil {
+			return nil, fmt.Errorf("view: decode attrs for seq %d: %w", row.Seq, err)
+		}
+		events = append(events, webEvent{
+			Seq:            row.Seq,
+			TS:             row.TS,
+			Name:           row.Name,
+			Class:          row.Class,
+			Badge:          classBadge(row.Class),
+			Producer:       row.Producer,
+			ActionID:       row.ActionID,
+			ParentActionID: row.ParentActionID,
+			Outcome:        row.Outcome,
+			Body:           row.Body,
+			Attrs:          attrs,
+		})
+	}
+	return events, nil
 }
 
 func loadSessionState(sessionDir string) session.State {

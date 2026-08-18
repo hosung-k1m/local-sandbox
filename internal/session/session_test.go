@@ -67,6 +67,7 @@ type fakeVM struct {
 	deleteContextErr     error
 	stopContextBounded   bool
 	deleteContextBounded bool
+	beforeDelete         func()
 	emitLifecycle        bool
 	hangIngestOnStop     bool
 	releaseIngest        func()
@@ -206,6 +207,9 @@ func (f *fakeVM) Delete(ctx context.Context) error {
 	f.deleted = true
 	f.deleteContextErr = ctx.Err()
 	_, f.deleteContextBounded = ctx.Deadline()
+	if f.beforeDelete != nil {
+		f.beforeDelete()
+	}
 	return f.deleteErr
 }
 
@@ -556,7 +560,7 @@ func TestRunSealsEvidenceWhenTheBrokerWillNotShutDown(t *testing.T) {
 	}
 }
 
-func TestRunVMDeleteFailureRevertsSealedState(t *testing.T) {
+func TestRunVMDeleteFailurePersistsOnlyFinalIncompleteState(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
 	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
@@ -566,8 +570,19 @@ func TestRunVMDeleteFailureRevertsSealedState(t *testing.T) {
 	repo := t.TempDir()
 	writeFile(t, filepath.Join(repo, "README.md"), "# fixture repo\n")
 	wantErr := errors.New("VM deletion failed")
+	stateDuringDelete := State("")
 	r := &Runner{newVM: func(cfg vm.Config) vmController {
-		return &fakeVM{cfg: cfg, deleteErr: wantErr}
+		return &fakeVM{
+			cfg:       cfg,
+			deleteErr: wantErr,
+			beforeDelete: func() {
+				state, stateErr := LoadState(cfg.SessionID)
+				if stateErr != nil {
+					t.Fatalf("LoadState during VM deletion: %v", stateErr)
+				}
+				stateDuringDelete = state
+			},
+		}
 	}}
 
 	res, err := r.Run(context.Background(), RunOptions{Harness: "exec", RepoPath: repo, Profile: policy.ProfileDevelop, Cmd: "true"})
@@ -576,6 +591,9 @@ func TestRunVMDeleteFailureRevertsSealedState(t *testing.T) {
 	}
 	if res.State != StateIncomplete {
 		t.Errorf("State = %q, want %q", res.State, StateIncomplete)
+	}
+	if stateDuringDelete != StateRunning {
+		t.Errorf("state during VM deletion = %q, want %q until cleanup determines the final state", stateDuringDelete, StateRunning)
 	}
 	if state, stateErr := LoadState(res.SessionID); stateErr != nil {
 		t.Fatalf("LoadState: %v", stateErr)

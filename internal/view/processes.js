@@ -4,7 +4,7 @@
 // vanilla JS)"). app.js's Processes-tab hook (updateProcessesTab) calls
 // window.BoxedAiProc.render(container, events, api) with the FULL ascending
 // event list every time the tab is active — on tab switch and on every
-// live-poll tick — and it empties `container` itself immediately before
+// streamed detail update — and it empties `container` itself immediately before
 // calling render(), so this file always rebuilds its DOM from scratch on
 // every call. UI state that must survive that (selection, expanded rows,
 // view mode, pan/zoom, search) therefore lives in module-level state below,

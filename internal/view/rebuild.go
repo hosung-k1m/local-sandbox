@@ -132,35 +132,57 @@ func projectFile(stmt *sql.Stmt, path string) error {
 
 	r := bufio.NewReader(f)
 	for {
-		var data logsv1.LogsData
-		err := protodelim.UnmarshalFrom(r, &data)
+		events, err := decodeOTLPFrame(r)
 		if errors.Is(err, io.EOF) {
 			break
 		}
 		if err != nil {
 			return fmt.Errorf("view: decode otlp frame in %s: %w", path, err)
 		}
-		for _, rl := range data.GetResourceLogs() {
-			resourceAttrs := kvListToMap(rl.GetResource().GetAttributes())
-			for _, sl := range rl.GetScopeLogs() {
-				for _, lr := range sl.GetLogRecords() {
-					row := recordToRow(resourceAttrs, lr)
-					if _, err := stmt.Exec(row.Seq, row.TS, row.Name, row.Class, row.Producer,
-						row.ActionID, row.ParentActionID, row.Outcome, row.Body, row.AttrsJSON); err != nil {
-						return fmt.Errorf("view: insert event seq %d from %s: %w", row.Seq, path, err)
-					}
-				}
+		for _, event := range events {
+			row := event.row
+			if _, err := stmt.Exec(row.Seq, row.TS, row.Name, row.Class, row.Producer,
+				row.ActionID, row.ParentActionID, row.Outcome, row.Body, row.AttrsJSON); err != nil {
+				return fmt.Errorf("view: insert event seq %d from %s: %w", row.Seq, path, err)
 			}
 		}
 	}
 	return nil
 }
 
-// recordToRow flattens one OTLP LogRecord plus its resource-level attributes
-// into an eventRow, extracting the audit.* attrs back out of the KeyValue list.
-func recordToRow(resourceAttrs map[string]any, lr *logsv1.LogRecord) eventRow {
-	attrs := mergeAttrs(resourceAttrs, kvListToMap(lr.GetAttributes()))
+type decodedEvent struct {
+	sessionID string
+	row       eventRow
+}
 
+// decodeOTLPFrame decodes and shapes one complete recorder frame. Both full
+// projection rebuilds and incremental reads use this seam so they preserve the
+// same event attributes and presentation fields.
+func decodeOTLPFrame(r protodelim.Reader) ([]decodedEvent, error) {
+	var data logsv1.LogsData
+	if err := protodelim.UnmarshalFrom(r, &data); err != nil {
+		return nil, err
+	}
+
+	var events []decodedEvent
+	for _, rl := range data.GetResourceLogs() {
+		resourceAttrs := kvListToMap(rl.GetResource().GetAttributes())
+		for _, sl := range rl.GetScopeLogs() {
+			for _, lr := range sl.GetLogRecords() {
+				attrs := mergeAttrs(resourceAttrs, kvListToMap(lr.GetAttributes()))
+				events = append(events, decodedEvent{
+					sessionID: attrString(attrs, evidence.AttrSessionID),
+					row:       recordToRow(attrs, lr),
+				})
+			}
+		}
+	}
+	return events, nil
+}
+
+// recordToRow flattens one OTLP LogRecord and its merged attributes into an
+// eventRow, extracting the audit.* attrs back out of the KeyValue list.
+func recordToRow(attrs map[string]any, lr *logsv1.LogRecord) eventRow {
 	ts := lr.GetTimeUnixNano()
 	if ts == 0 {
 		ts = lr.GetObservedTimeUnixNano()

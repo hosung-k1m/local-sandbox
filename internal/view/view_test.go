@@ -672,8 +672,6 @@ func TestBuildWebPayloadUsesRunningLifecycleStateForProof(t *testing.T) {
 func TestDashboardSessionsExposeRepositoryAndBranch(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
-	resetDashboardCacheForTest(t)
-
 	id := "bx-20260812-090000-eeee5555"
 	dir := filepath.Join(home, "sessions", id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -777,8 +775,6 @@ func TestDashboardPayloadOrdersRunningSessionsFirst(t *testing.T) {
 func TestDashboardSummaryUsesDeclaredSegmentDigestName(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
-	resetDashboardCacheForTest(t)
-
 	id := "bx-20260810-000000-abcd7777"
 	dir := filepath.Join(home, "sessions", id)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -822,7 +818,6 @@ func TestDashboardSummaryUsesDeclaredSegmentDigestName(t *testing.T) {
 func TestDashboardPayloadDoesNotRebuildSealedHistoricalSessions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
-	resetDashboardCacheForTest(t)
 	var rebuilds int
 	restore := rebuildDashboardProjection
 	rebuildDashboardProjection = func(sessionDir string) (*sql.DB, error) {
@@ -853,17 +848,16 @@ func TestDashboardPayloadDoesNotRebuildSealedHistoricalSessions(t *testing.T) {
 		t.Fatalf("second buildDashboardPayload: %v", err)
 	}
 	if rebuilds != 0 {
-		t.Fatalf("sealed dashboard polls rebuilt projection %d times, want 0", rebuilds)
+		t.Fatalf("sealed dashboard snapshots rebuilt projection %d times, want 0", rebuilds)
 	}
 	if first.Sessions[0].EventCount != 1 || second.Sessions[0].EventCount != 1 {
 		t.Fatalf("event counts = %d/%d, want manifest-derived 1", first.Sessions[0].EventCount, second.Sessions[0].EventCount)
 	}
 }
 
-func TestDashboardSealedCacheInvalidatesWhenManifestMetadataChanges(t *testing.T) {
+func TestDashboardPayloadReflectsManifestMetadataChanges(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
-	resetDashboardCacheForTest(t)
 
 	id := "bx-20260810-000000-ffff6666"
 	dir := filepath.Join(home, "sessions", id)
@@ -895,7 +889,7 @@ func TestDashboardSealedCacheInvalidatesWhenManifestMetadataChanges(t *testing.T
 	}
 }
 
-func TestDashboardAPIsServePollingPayloads(t *testing.T) {
+func TestDashboardAPIsServeSnapshotPayloads(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
 	id := "bx-20260811-120000-cccc3333"
@@ -1396,7 +1390,7 @@ func TestEmbeddedViewerPanesFillTheViewport(t *testing.T) {
 // TestEmbeddedAgentGraphPansAndZoomsOneSharedLayer pins the navigation contract:
 // the pane is clipped by a viewport and moved by a transform on ONE inner layer
 // that carries both the cards and their SVG edge underlay, so nodes and edges
-// can never drift apart. The framing survives a live poll (it lives in module
+// can never drift apart. The framing survives a live update (it lives in module
 // state, not the DOM) and the user's own panning outranks a recomputed fit.
 func TestEmbeddedAgentGraphPansAndZoomsOneSharedLayer(t *testing.T) {
 	source := string(agentGraphJS)
@@ -1550,13 +1544,6 @@ func TestEmbeddedAgentGraphAnimationsRespectReducedMotion(t *testing.T) {
 	if hex := strings.Index(source[start:], "#"); hex >= 0 {
 		t.Fatalf("app.css agent graph section introduces a raw color literal instead of a token: %q", source[start+hex:])
 	}
-}
-
-func resetDashboardCacheForTest(t *testing.T) {
-	t.Helper()
-	dashboardCacheMu.Lock()
-	dashboardCache = map[string]cachedDashboardSession{}
-	dashboardCacheMu.Unlock()
 }
 
 func writeDashboardManifest(t *testing.T, sessionDir string, recordCount int, lastSeq int64, digest, sealedAt string) {

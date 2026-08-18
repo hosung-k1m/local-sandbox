@@ -196,6 +196,15 @@ function sessionStateColorVar(state) {
     default: return statusColor("muted");
   }
 }
+function connectionStateColorVar(state) {
+  switch (state) {
+    case "live": return statusColor("good");
+    case "reconnecting": return statusColor("warn");
+    case "stale": return statusColor("serious");
+    case "complete": return statusColor("good");
+    default: return statusColor("muted");
+  }
+}
 function boolColorVar(b) {
   return b ? statusColor("good") : statusColor("crit");
 }
@@ -285,10 +294,213 @@ var DIFF_MAX_LINES = 600;
 
 var HASH_DEBOUNCE_MS = 200;
 var SEARCH_DEBOUNCE_MS = 150;
-var POLL_MS = 3000;
-var DASH_POLL_MS = 2500;
 var CHUNK_SIZE = 1000;
 var CHUNK_ALL_THRESHOLD = 5000;
+var STREAM_EVENT_TYPES = ["sessions.snapshot", "sessions.upsert", "sessions.remove", "session.snapshot", "session.delta"];
+
+// createEventSourceOwner is the one connection-lifecycle boundary shared by
+// the standalone and dashboard pages. Replacing or closing a source increments
+// its generation before close(), so a callback already queued by the browser
+// cannot mutate the next session's view. Native EventSource reconnect handles
+// transient transport failures; restart() creates a fresh source and therefore
+// intentionally resumes without the superseded source's Last-Event-ID.
+function createEventSourceOwner(opts) {
+  var source = null;
+  var sourceURL = "";
+  var generation = 0;
+
+  function notifyState(state) {
+    if (opts.onState) opts.onState(state);
+  }
+
+  function replace(nextURL, state) {
+    generation++;
+    if (source) source.close();
+    source = null;
+    sourceURL = nextURL;
+    notifyState(state || "connecting");
+
+    var ownGeneration = generation;
+    var nextSource = new EventSource(nextURL);
+    source = nextSource;
+    function current() {
+      return generation === ownGeneration && source === nextSource;
+    }
+
+    nextSource.onopen = function () {
+      if (current()) notifyState("live");
+    };
+    nextSource.onerror = function () {
+      if (!current()) return;
+      notifyState(nextSource.readyState === EventSource.CLOSED ? "stale" : "reconnecting");
+    };
+    opts.eventTypes.forEach(function (type) {
+      nextSource.addEventListener(type, function (message) {
+        if (!current()) return;
+        var payload;
+        try {
+          payload = JSON.parse(message.data);
+        } catch (err) {
+          notifyState("stale");
+          if (opts.onMalformed) opts.onMalformed(type, err);
+          return;
+        }
+        opts.onEvent(type, payload, message.lastEventId || "");
+      });
+    });
+  }
+
+  return {
+    open: function (url) { replace(url, "connecting"); },
+    ensure: function (url) {
+      if (source && sourceURL === url && source.readyState !== EventSource.CLOSED) return;
+      replace(url, "connecting");
+    },
+    restart: function () {
+      if (sourceURL) replace(sourceURL, "reconnecting");
+    },
+    close: function (state) {
+      generation++;
+      if (source) source.close();
+      source = null;
+      if (state) notifyState(state);
+    },
+  };
+}
+
+function eventAttrsEqual(a, b) {
+  var aKeys = Object.keys(a || {}).sort();
+  var bKeys = Object.keys(b || {}).sort();
+  if (aKeys.length !== bKeys.length) return false;
+  for (var i = 0; i < aKeys.length; i++) {
+    if (aKeys[i] !== bKeys[i] || a[aKeys[i]] !== b[bKeys[i]]) return false;
+  }
+  return true;
+}
+
+function streamEventsEqual(a, b) {
+  var fields = ["seq", "ts", "name", "class", "badge", "producer", "action_id", "parent_action_id", "outcome", "body"];
+  for (var i = 0; i < fields.length; i++) {
+    if ((a[fields[i]] || "") !== (b[fields[i]] || "")) return false;
+  }
+  return eventAttrsEqual(a.attrs, b.attrs);
+}
+
+function validSequence(seq) {
+  return typeof seq === "number" && isFinite(seq) && Math.floor(seq) === seq && seq > 0;
+}
+
+function reduceSessionSnapshot(snapshot, expectedSessionID) {
+  if (!snapshot || typeof snapshot.session_id !== "string" || !Array.isArray(snapshot.events)) {
+    return { kind: "reset", reason: "snapshot_shape" };
+  }
+  if (expectedSessionID && snapshot.session_id !== expectedSessionID) {
+    return { kind: "reset", reason: "snapshot_session" };
+  }
+  var lastSeq = 0;
+  for (var i = 0; i < snapshot.events.length; i++) {
+    if (!snapshot.events[i] || !validSequence(snapshot.events[i].seq) || snapshot.events[i].seq <= lastSeq) {
+      return { kind: "reset", reason: "snapshot_order" };
+    }
+    lastSeq = snapshot.events[i].seq;
+  }
+  return { kind: "applied", payload: snapshot };
+}
+
+// reduceSessionDelta merges only a contiguous immutable tail. Overlap is safe
+// when the complete event agrees; a gap, conflicting duplicate, wrong session,
+// or inconsistent summary forces a cursorless authoritative snapshot instead.
+function reduceSessionDelta(current, delta) {
+  if (!current || !delta || current.session_id !== delta.session_id || !Array.isArray(delta.events)) {
+    return { kind: "reset", reason: "session_or_shape" };
+  }
+
+  var events = (current.events || []).slice();
+  var bySeq = new Map();
+  var lastSeq = 0;
+  for (var i = 0; i < events.length; i++) {
+    if (!validSequence(events[i].seq) || events[i].seq <= lastSeq) {
+      return { kind: "reset", reason: "current_order" };
+    }
+    lastSeq = events[i].seq;
+    bySeq.set(events[i].seq, events[i]);
+  }
+
+  var incomingSeq = 0;
+  for (var j = 0; j < delta.events.length; j++) {
+    var event = delta.events[j];
+    if (!event || !validSequence(event.seq) || event.seq <= incomingSeq) {
+      return { kind: "reset", reason: "delta_order" };
+    }
+    incomingSeq = event.seq;
+    if (event.seq <= lastSeq) {
+      var existing = bySeq.get(event.seq);
+      if (!existing || !streamEventsEqual(existing, event)) {
+        return { kind: "reset", reason: "conflicting_overlap" };
+      }
+      continue;
+    }
+    if (event.seq !== lastSeq + 1) {
+      return { kind: "reset", reason: "sequence_gap" };
+    }
+    events.push(event);
+    bySeq.set(event.seq, event);
+    lastSeq = event.seq;
+  }
+
+  if (typeof delta.last_event_seq === "number" && delta.last_event_seq !== lastSeq) {
+    return { kind: "reset", reason: "last_sequence" };
+  }
+  if (typeof delta.event_count === "number" && delta.event_count !== events.length) {
+    return { kind: "reset", reason: "event_count" };
+  }
+
+  var next = {};
+  Object.keys(current).forEach(function (key) { next[key] = current[key]; });
+  next.events = events;
+  if (typeof delta.state === "string") next.state = delta.state;
+  if (typeof delta.event_count === "number") next.event_count = delta.event_count;
+  if (typeof delta.last_event_seq === "number") next.last_event_seq = delta.last_event_seq;
+  if (typeof delta.last_event_ts === "string") next.last_event_ts = delta.last_event_ts;
+  return { kind: "applied", payload: next };
+}
+
+function sortDashboardSessions(sessions) {
+  return sessions.slice().sort(function (a, b) {
+    var aRunning = a.state === "running";
+    var bRunning = b.state === "running";
+    if (aRunning !== bRunning) return aRunning ? -1 : 1;
+    if (a.session_id === b.session_id) return 0;
+    return a.session_id < b.session_id ? 1 : -1;
+  });
+}
+
+function reduceSessionsSnapshot(payload) {
+  if (!payload || !Array.isArray(payload.sessions)) return null;
+  for (var i = 0; i < payload.sessions.length; i++) {
+    if (!payload.sessions[i] || typeof payload.sessions[i].session_id !== "string") return null;
+  }
+  return sortDashboardSessions(payload.sessions);
+}
+
+function reduceSessionsUpsert(sessions, update) {
+  if (!update || typeof update.session_id !== "string") return null;
+  var next = sessions.filter(function (session) { return session.session_id !== update.session_id; });
+  next.push(update);
+  return sortDashboardSessions(next);
+}
+
+function reduceSessionsRemove(sessions, removal) {
+  if (!removal || typeof removal.session_id !== "string") return null;
+  return {
+    sessions: sessions.filter(function (session) { return session.session_id !== removal.session_id; }),
+    removedId: removal.session_id,
+  };
+}
+
+function dashboardStreamURL(sessionID, detailLive) {
+  return sessionID && detailLive ? "/api/stream?session=" + encodeURIComponent(sessionID) : "/api/stream";
+}
 
 // ---- state ----
 
@@ -1552,7 +1764,7 @@ function fileHistoryRowHtml(ctx, path) {
 // "file history" action sets. The row is found by comparing dataset values, not
 // by building an attribute selector — a workload-controlled path may contain
 // quotes — and the request is cleared whether or not the row exists, so a path
-// hidden by the active filter can't leave a focus that re-scrolls on every poll.
+// hidden by the active filter can't leave a focus that re-scrolls on every streamed update.
 function scrollFilesFocusIntoView(ctx) {
   var want = ctx.state.filesFocusPath;
   if (!want) return;
@@ -2733,6 +2945,7 @@ function headerHtml(ctx) {
     '<span class="wordmark">BoxedAi</span>' +
     '<button type="button" class="copy-btn" data-act="copy-value" data-value="' + esc(payload.session_id || "") +
       '" title="click to copy">' + esc(payload.session_id || "(unknown session)") + "</button>" +
+    chipHtml(payload.state || "unknown", sessionStateColorVar(payload.state)) +
     chipHtml(proof.verdict || "NO VERDICT", proof.verdict ? verdictColorVar(proof.verdict) : statusColor("muted")) +
     statusChip +
     '<span class="meta mono-num">' + numFmt(events.length) + " events</span>" +
@@ -2740,6 +2953,7 @@ function headerHtml(ctx) {
     '<button type="button" class="copy-btn" data-act="copy-value" data-value="' + esc(payload.policy_digest || "") +
       '" title="click to copy full digest">' + esc(truncateDigest(payload.policy_digest || "") || "(no digest)") + "</button>" +
     '<span class="spacer"></span>' +
+    chipHtml(ctx.connectionState, connectionStateColorVar(ctx.connectionState), "connection-state") +
     '<label class="toggle"><input type="checkbox" data-act="live-toggle"' + (ctx.state.liveOn ? " checked" : "") + "> live</label>" +
     '<span class="meta mono-num">updated ' + esc(updated) + "</span>" +
     '<button type="button" class="btn small" data-act="manual-refresh" title="refresh now">⟳</button>'
@@ -2858,13 +3072,10 @@ function mountShell(ctx) {
 
 // ---- session view orchestrator ----
 
-// createSessionView mounts the one shared component both pages use. In
-// "standalone" mode it owns its own 3s /api/events poll loop gated by the
-// Live toggle; in "embedded" mode (the dashboard) it never polls itself —
-// the host calls setPayload() on its own schedule and the toggle just
-// notifies the host via opts.onLiveToggle/onManualRefresh, since the
-// dashboard's own sidebar poll already decides when a refetch is worthwhile
-// (see the dashboard section's refetch policy).
+// createSessionView mounts the one shared component both pages use. Transport
+// stays page-owned: the standalone and dashboard hosts call setPayload() from
+// their shared EventSource lifecycle, while Live and manual refresh notify the
+// host through opts.onLiveToggle/onManualRefresh.
 function createSessionView(rootEl, opts) {
   opts = opts || {};
   var ctx = {
@@ -2879,8 +3090,7 @@ function createSessionView(rootEl, opts) {
     root: rootEl,
     els: {},
     mode: opts.mode || "standalone",
-    fetchUrl: opts.fetchUrl,
-    liveTimer: null,
+    connectionState: "connecting",
     prevSummary: null,
     prevEventCount: 0,
     prevFilteredTotal: 0,
@@ -2928,45 +3138,35 @@ function createSessionView(rootEl, opts) {
     else updateFilesTab(ctx);
   };
   ctx.manualRefresh = function () {
-    if (ctx.mode === "standalone") fetchStandalone(ctx);
-    else if (opts.onManualRefresh) opts.onManualRefresh();
+    if (opts.onManualRefresh) opts.onManualRefresh();
   };
   ctx.onLiveToggle = function () {
-    if (ctx.mode === "standalone") {
-      if (ctx.state.liveOn) startPolling(ctx); else stopPolling(ctx);
-    } else if (opts.onLiveToggle) {
-      opts.onLiveToggle(ctx.state.liveOn);
-    }
+    if (opts.onLiveToggle) opts.onLiveToggle(ctx.state.liveOn);
   };
 
   mountShell(ctx);
-  if (ctx.mode === "standalone") fetchStandalone(ctx);
 
   return {
     setPayload: function (payload) { setSessionViewPayload(ctx, payload); },
+    getPayload: function () { return ctx.payload; },
+    setConnectionState: function (state) {
+      ctx.connectionState = state;
+      if (ctx.payload) renderHeader(ctx);
+    },
+    isLive: function () { return ctx.state.liveOn; },
+    setLive: function (on) {
+      if (ctx.state.liveOn === on) return;
+      ctx.state.liveOn = on;
+      if (ctx.payload) renderHeader(ctx);
+      ctx.onLiveToggle();
+    },
     focusPid: ctx.focusPid,
-    destroy: function () { stopPolling(ctx); },
+    destroy: function () {},
   };
 }
 
-function fetchStandalone(ctx) {
-  fetch(ctx.fetchUrl).then(function (r) { return r.json(); }).then(function (data) {
-    setSessionViewPayload(ctx, data);
-  }).catch(function () {
-    // Network hiccup: keep showing the last good payload and try again on
-    // the next tick (or manual click) rather than clearing the view.
-  });
-}
-function startPolling(ctx) {
-  stopPolling(ctx);
-  ctx.liveTimer = setInterval(function () { fetchStandalone(ctx); }, POLL_MS);
-}
-function stopPolling(ctx) {
-  if (ctx.liveTimer) { clearInterval(ctx.liveTimer); ctx.liveTimer = null; }
-}
-
-// setSessionViewPayload is the single entry point every new payload (first
-// load, standalone poll tick, or a dashboard-driven refetch) flows through.
+// setSessionViewPayload is the single entry point every new snapshot or merged
+// delta flows through.
 // It implements the spec's change-detection/append-only/full-rerender
 // decision and preserves active tab, filters, expanded rows, sort, mode
 // toggles and scroll position across whichever path it takes.
@@ -2976,6 +3176,7 @@ function setSessionViewPayload(ctx, payload) {
   var newSummary = {
     len: newEvents.length,
     lastSeq: newEvents.length ? newEvents[newEvents.length - 1].seq : 0,
+    state: payload.state || "",
     status: payload.proof && payload.proof.status,
     verifyError: payload.verify_error || "",
   };
@@ -2983,10 +3184,11 @@ function setSessionViewPayload(ctx, payload) {
   if (!isNewSession && ctx.prevSummary &&
       ctx.prevSummary.len === newSummary.len &&
       ctx.prevSummary.lastSeq === newSummary.lastSeq &&
+      ctx.prevSummary.state === newSummary.state &&
       ctx.prevSummary.status === newSummary.status &&
       ctx.prevSummary.verifyError === newSummary.verifyError) {
     ctx.lastUpdatedAt = new Date().toISOString();
-    renderHeader(ctx); // keep the "updated HH:MM:SS" clock live even on a no-op poll
+    renderHeader(ctx); // keep the "updated HH:MM:SS" clock current even when the payload is unchanged
     return;
   }
 
@@ -3003,13 +3205,10 @@ function setSessionViewPayload(ctx, payload) {
     resetTimelineChunk(ctx.state);
     if (isNewSession && payload.proof) {
       // Re-derive the Live default per session (spec: ON iff provisional);
-      // a manual choice made on the SAME session is never overridden. Only
-      // standalone mode acts on it immediately (starts/stops its own poll
-      // timer) — in embedded/dashboard mode this is just the checkbox's
-      // initial state; the dashboard's own poll cadence is unaffected by it
-      // (see the dashboard section's refetch policy).
+      // a manual choice made on the SAME session is never overridden. The page
+      // owner reconciles its single source after the initial snapshot.
       ctx.state.liveOn = !!payload.proof.provisional;
-      if (ctx.mode === "standalone") ctx.onLiveToggle();
+      ctx.onLiveToggle();
     }
   } else {
     var oldEvents = ctx.model.events;
@@ -3041,17 +3240,84 @@ function setSessionViewPayload(ctx, payload) {
   if (scrollEl) scrollEl.scrollTop = savedScrollTop;
 }
 
+function terminalSessionState(state) {
+  return state === "sealed" || state === "incomplete";
+}
+
+function fetchStandaloneSnapshot(view) {
+  fetch("/api/events").then(function (r) { return r.json(); }).then(function (payload) {
+    var result = reduceSessionSnapshot(payload, "");
+    if (result.kind !== "applied") {
+      view.setConnectionState("stale");
+      return;
+    }
+    view.setPayload(result.payload);
+    if (terminalSessionState(result.payload.state)) view.setConnectionState("complete");
+  }).catch(function () {
+    // Network hiccup: keep showing the last good payload and surface that it
+    // could not be refreshed instead of clearing the view.
+    view.setConnectionState("stale");
+  });
+}
+
+function mountStandalone(appEl) {
+  var view;
+  var owner = createEventSourceOwner({
+    eventTypes: STREAM_EVENT_TYPES,
+    onState: function (state) {
+      if (view) view.setConnectionState(state);
+    },
+    onMalformed: function () {
+      if (view) view.setConnectionState("stale");
+      owner.restart();
+    },
+    onEvent: function (type, payload) {
+      if (type === "session.snapshot") {
+        var snapshot = reduceSessionSnapshot(payload, "");
+        if (snapshot.kind !== "applied") {
+          view.setConnectionState("stale");
+          owner.restart();
+          return;
+        }
+        view.setPayload(snapshot.payload);
+        if (terminalSessionState(snapshot.payload.state)) {
+          view.setLive(false);
+          owner.close("complete");
+        }
+        return;
+      }
+      if (type !== "session.delta") return;
+      var delta = reduceSessionDelta(view.getPayload(), payload);
+      if (delta.kind !== "applied") {
+        view.setConnectionState("stale");
+        owner.restart();
+        return;
+      }
+      view.setPayload(delta.payload);
+    },
+  });
+
+  view = createSessionView(appEl, {
+    mode: "standalone",
+    onManualRefresh: function () {
+      if (view.isLive()) owner.restart();
+      else fetchStandaloneSnapshot(view);
+    },
+    onLiveToggle: function (on) {
+      if (on) owner.ensure("/api/stream");
+      else owner.close("paused");
+    },
+  });
+  owner.open("/api/stream");
+  window.addEventListener("beforeunload", function () { owner.close(); }, { once: true });
+}
+
 // ---- dashboard ----
 //
 // The dashboard is a ~300px session-list sidebar plus one embedded
-// SessionView in the main pane. It owns the /api/sessions poll loop and
-// decides, per the spec's refetch policy, when the selected session's
-// detail actually needs refetching — the embedded SessionView's own
-// change-detection then decides how much of the DOM that refetch touches.
-
-function summaryKey(s) {
-  return s.state + ":" + s.event_count + ":" + s.last_event_seq + ":" + (s.proof && s.proof.status);
-}
+// SessionView in the main pane. Its page-owned EventSource always carries
+// dashboard discovery and carries selected-session detail only while Live is
+// enabled; the embedded SessionView still owns DOM change detection.
 
 // repoLabel shortens a repository reference (a clone URL or an owner/name) to a
 // compact "owner/name" for the group header, falling back to a stable label
@@ -3076,7 +3342,7 @@ function branchLabel(branch) {
 }
 
 // groupKey is the stable identity of a repo group, used for collapse state and
-// group-level select-all so it survives re-renders across polls.
+// group-level select-all so it survives re-renders across streamed updates.
 function groupKey(repo) {
   return "repo:" + (repo || "");
 }
@@ -3157,7 +3423,7 @@ function renderSidebarList(dash) {
   var q = dash.filterText;
   var visible = dash.sessions.filter(function (s) { return sessionMatchesFilter(s, q); });
   dash.els.counts.textContent = numFmt(dash.sessions.length) + " total" + (q ? " · " + numFmt(visible.length) + " shown" : "") +
-    (dash.lastPollAt ? " · updated " + fmtClockShort(dash.lastPollAt) : "");
+    (dash.lastUpdatedAt ? " · updated " + fmtClockShort(dash.lastUpdatedAt) : "");
 
   renderDeleteBar(dash);
 
@@ -3238,55 +3504,135 @@ function ensureDashboardView(dash) {
   dash.els.main.innerHTML = "";
   dash.view = createSessionView(dash.els.main, {
     mode: "embedded",
-    onManualRefresh: function () { if (dash.selectedId) fetchDashboardSession(dash, dash.selectedId); },
-    onLiveToggle: function () { if (dash.selectedId) fetchDashboardSession(dash, dash.selectedId); },
+    onManualRefresh: function () {
+      if (!dash.selectedId) return;
+      if (dash.view.isLive()) dash.owner.restart();
+      else fetchDashboardSession(dash, dash.selectedId);
+    },
+    onLiveToggle: function (on) {
+      dash.detailLive = on;
+      if (on) dash.detailComplete = false;
+      dash.owner.ensure(dashboardStreamURL(dash.selectedId, dash.detailLive));
+      updateDashboardConnectionState(dash, dash.streamState);
+    },
   });
 }
 
 function fetchDashboardSession(dash, id) {
   fetch("/api/session?id=" + encodeURIComponent(id)).then(function (r) { return r.json(); }).then(function (data) {
     if (dash.selectedId !== id) return; // user selected something else before this resolved
+    var snapshot = reduceSessionSnapshot(data, id);
+    if (snapshot.kind !== "applied") {
+      if (dash.view) dash.view.setConnectionState("stale");
+      return;
+    }
     ensureDashboardView(dash);
-    dash.view.setPayload(data);
-  }).catch(function () {});
+    dash.view.setPayload(snapshot.payload);
+    if (terminalSessionState(snapshot.payload.state)) {
+      dash.detailComplete = true;
+      dash.view.setConnectionState("complete");
+    }
+  }).catch(function () {
+    if (dash.view) dash.view.setConnectionState("stale");
+  });
 }
 
 function selectDashboardSession(dash, id) {
   if (dash.selectedId === id) return;
   dash.selectedId = id;
+  dash.detailLive = !!id;
+  dash.detailComplete = false;
   writeHashObjectMerged({ sess: id || undefined });
   renderSidebarList(dash);
-  fetchDashboardSession(dash, id);
+  dash.owner.open(dashboardStreamURL(id, dash.detailLive));
 }
 
-// pollDashboardSessions runs every 2.5s unconditionally; it refetches the
-// selected session's full detail only when that session's sidebar summary
-// changed since the previous tick (state/event_count/last_event_seq/proof
-// .status), when nothing has been fetched for it yet (first selection), or
-// when the embedded view's Live toggle asks for it directly (see
-// onLiveToggle above) — not on every tick, per the spec's refetch policy.
-function pollDashboardSessions(dash) {
-  fetch("/api/sessions").then(function (r) { return r.json(); }).then(function (data) {
-    var sessions = data.sessions || [];
-    var prevSummaries = dash.summaries || {};
-    var nextSummaries = {};
-    sessions.forEach(function (s) { nextSummaries[s.session_id] = summaryKey(s); });
-    dash.sessions = sessions;
-    dash.summaries = nextSummaries;
-    dash.lastPollAt = new Date().toISOString();
+function updateDashboardConnectionState(dash, state) {
+  dash.streamState = state;
+  if (!dash.view) return;
+  if (dash.detailComplete) dash.view.setConnectionState("complete");
+  else dash.view.setConnectionState(dash.detailLive ? state : "paused");
+}
 
+function resetDashboardStream(dash) {
+  updateDashboardConnectionState(dash, "stale");
+  dash.owner.restart();
+}
+
+function clearDashboardSelection(dash) {
+  dash.selectedId = "";
+  dash.detailLive = false;
+  dash.detailComplete = false;
+  writeHashObjectMerged({ sess: undefined });
+  if (dash.view) dash.view.destroy();
+  dash.view = null;
+  dash.els.main.innerHTML = '<div class="empty">Select a session.</div>';
+  dash.owner.ensure("/api/stream");
+}
+
+function applyDashboardRemoval(dash, removal) {
+  var reduced = reduceSessionsRemove(dash.sessions, removal);
+  if (!reduced) return false;
+  dash.sessions = reduced.sessions;
+  delete dash.selected[reduced.removedId];
+  if (dash.selectedId === reduced.removedId) clearDashboardSelection(dash);
+  dash.lastUpdatedAt = new Date().toISOString();
+  renderSidebarList(dash);
+  return true;
+}
+
+function handleDashboardStreamEvent(dash, type, payload) {
+  if (type === "sessions.snapshot") {
+    var sessions = reduceSessionsSnapshot(payload);
+    if (!sessions) { resetDashboardStream(dash); return; }
+    dash.sessions = sessions;
+    dash.lastUpdatedAt = new Date().toISOString();
+    if (dash.selectedId && !sessions.some(function (session) { return session.session_id === dash.selectedId; })) {
+      clearDashboardSelection(dash);
+      renderSidebarList(dash);
+      return;
+    }
     if (!dash.selectedId && sessions.length) {
       selectDashboardSession(dash, sessions[0].session_id);
       return;
     }
     renderSidebarList(dash);
-
-    var id = dash.selectedId;
-    if (!id || !Object.prototype.hasOwnProperty.call(nextSummaries, id)) return;
-    if (prevSummaries[id] !== nextSummaries[id] || !dash.view) {
-      fetchDashboardSession(dash, id);
+    return;
+  }
+  if (type === "sessions.upsert") {
+    var upserted = reduceSessionsUpsert(dash.sessions, payload);
+    if (!upserted) { resetDashboardStream(dash); return; }
+    dash.sessions = upserted;
+    dash.lastUpdatedAt = new Date().toISOString();
+    if (!dash.selectedId) {
+      selectDashboardSession(dash, upserted[0].session_id);
+      return;
     }
-  }).catch(function () {});
+    renderSidebarList(dash);
+    return;
+  }
+  if (type === "sessions.remove") {
+    if (!applyDashboardRemoval(dash, payload)) resetDashboardStream(dash);
+    return;
+  }
+  if (type === "session.snapshot") {
+    if (!dash.selectedId || !dash.detailLive) return;
+    var snapshot = reduceSessionSnapshot(payload, dash.selectedId);
+    if (snapshot.kind !== "applied") { resetDashboardStream(dash); return; }
+    ensureDashboardView(dash);
+    dash.view.setPayload(snapshot.payload);
+    if (terminalSessionState(snapshot.payload.state)) {
+      dash.detailComplete = true;
+      dash.view.setLive(false);
+      dash.owner.ensure("/api/stream");
+      dash.view.setConnectionState("complete");
+    }
+    return;
+  }
+  if (type !== "session.delta" || !dash.selectedId || !dash.detailLive || !dash.view) return;
+  var delta = reduceSessionDelta(dash.view.getPayload(), payload);
+  if (delta.kind !== "applied") { resetDashboardStream(dash); return; }
+  dash.view.setPayload(delta.payload);
 }
 
 function mountDashboard(appEl) {
@@ -3310,10 +3656,13 @@ function mountDashboard(appEl) {
 
   var dash = {
     sessions: [],
-    summaries: {},
     filterText: "",
     selectedId: readHashObject().sess || "",
-    lastPollAt: null,
+    detailLive: false,
+    detailComplete: false,
+    lastUpdatedAt: null,
+    streamState: "connecting",
+    owner: null,
     view: null,
     selectMode: false,
     selected: {},   // id -> true for bulk-delete selection
@@ -3330,6 +3679,13 @@ function mountDashboard(appEl) {
       cancelBtn: appEl.querySelector('[data-role="cancel-btn"]'),
     },
   };
+  dash.detailLive = !!dash.selectedId;
+  dash.owner = createEventSourceOwner({
+    eventTypes: STREAM_EVENT_TYPES,
+    onState: function (state) { updateDashboardConnectionState(dash, state); },
+    onMalformed: function () { resetDashboardStream(dash); },
+    onEvent: function (type, payload) { handleDashboardStreamEvent(dash, type, payload); },
+  });
 
   dash.els.filter.addEventListener("input", debounce(function (e) {
     dash.filterText = e.target.value.trim().toLowerCase();
@@ -3358,8 +3714,8 @@ function mountDashboard(appEl) {
     if (card) selectDashboardSession(dash, card.dataset.sessionId);
   });
 
-  pollDashboardSessions(dash);
-  setInterval(function () { pollDashboardSessions(dash); }, DASH_POLL_MS);
+  dash.owner.open(dashboardStreamURL(dash.selectedId, dash.detailLive));
+  window.addEventListener("beforeunload", function () { dash.owner.close(); }, { once: true });
 }
 
 function setSelectMode(dash, on) {
@@ -3385,8 +3741,8 @@ function toggleGroupSelect(dash, key, checked) {
 
 // deleteSelectedSessions posts the checked ids to the bulk-delete endpoint,
 // which removes each session's entire on-disk directory. On return it clears
-// selection, drops the just-selected detail view if it was deleted, and forces
-// an immediate sidebar poll so the list reflects the removal without waiting.
+// selection and immediately applies the same removal reducer as the stream, so
+// the list does not wait for the matching filesystem notification.
 function deleteSelectedSessions(dash) {
   var ids = Object.keys(dash.selected).filter(function (id) { return dash.selected[id]; });
   if (!ids.length || dash.deleting) return;
@@ -3402,13 +3758,7 @@ function deleteSelectedSessions(dash) {
     var deleted = (resp && resp.deleted) || [];
     var errors = (resp && resp.errors) || {};
     deleted.forEach(function (id) {
-      delete dash.selected[id];
-      delete dash.summaries[id];
-      if (dash.selectedId === id) {
-        dash.selectedId = "";
-        writeHashObjectMerged({ sess: undefined });
-        if (dash.view) { dash.els.main.innerHTML = '<div class="empty">Select a session.</div>'; dash.view = null; }
-      }
+      applyDashboardRemoval(dash, { session_id: id });
     });
     var failed = Object.keys(errors);
     if (failed.length) window.alert("Could not delete " + failed.length + " session(s):\n" +
@@ -3419,7 +3769,6 @@ function deleteSelectedSessions(dash) {
     dash.deleting = false;
     if (!selectedCount(dash)) setSelectMode(dash, false);
     else renderDeleteBar(dash);
-    pollDashboardSessions(dash);
   });
 }
 
@@ -3432,6 +3781,6 @@ document.addEventListener("DOMContentLoaded", function () {
   if (page === "dashboard") {
     mountDashboard(app);
   } else {
-    createSessionView(app, { mode: "standalone", fetchUrl: "/api/events" });
+    mountStandalone(app);
   }
 });

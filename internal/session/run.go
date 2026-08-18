@@ -388,27 +388,20 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		if runErr == nil && sessionStarted && teardownErr == nil {
 			finalState = StateSealed
 		}
+		if vmc != nil && !opts.KeepVM {
+			deleteCtx, cancelDelete := context.WithTimeout(context.Background(), vmCleanupTimeout)
+			if e := vmc.Delete(deleteCtx); e != nil {
+				failTeardown(fmt.Errorf("session: delete vm: %w", e))
+				finalState = StateIncomplete
+			}
+			cancelDelete()
+		}
 		if e := writeState(sessionDir, finalState); e != nil {
 			failTeardown(fmt.Errorf("session: write final state: %w", e))
 			finalState = StateIncomplete
 			if stateErr := writeState(sessionDir, finalState); stateErr != nil {
 				failTeardown(fmt.Errorf("session: write incomplete state: %w", stateErr))
 			}
-		}
-		result.State = finalState
-
-		if vmc != nil && !opts.KeepVM {
-			deleteCtx, cancelDelete := context.WithTimeout(context.Background(), vmCleanupTimeout)
-			if e := vmc.Delete(deleteCtx); e != nil {
-				failTeardown(fmt.Errorf("session: delete vm: %w", e))
-				if finalState != StateIncomplete {
-					finalState = StateIncomplete
-					if stateErr := writeState(sessionDir, finalState); stateErr != nil {
-						failTeardown(fmt.Errorf("session: write incomplete state after VM delete failure: %w", stateErr))
-					}
-				}
-			}
-			cancelDelete()
 		}
 		result.State = finalState
 

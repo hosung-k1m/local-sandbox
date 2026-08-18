@@ -4,7 +4,7 @@
 // vanilla JS)"). app.js's Agents tab calls
 // window.BoxedAiAgentGraph.render(container, data, api) whenever the tab is
 // active in graph mode — on tab switch, on the sub-view toggle and on every
-// live-poll tick — and, exactly like the Processes hook, it empties `container`
+// streamed detail update — and, exactly like the Processes hook, it empties `container`
 // itself immediately before calling render(). So this file rebuilds its DOM from
 // scratch on every call, and everything that must survive that (which nodes have
 // already been seen, which have just disappeared, how far each ticker had got)
@@ -131,7 +131,7 @@ var uiState = {
   lastTopSeq: new Map(), // agent id -> newest action seq already shown (drives the new-line highlight)
   lastCards: new Map(), // agent id -> frozen card snapshot, so an exiting node can still be drawn
   // Where the user has navigated to. This is the reason the transform lives in
-  // module state at all: the tab re-renders on every live poll (~3s), and a
+  // module state at all: the tab re-renders on every streamed update, and a
   // viewport that snapped back to the fit view three times a minute would be
   // unusable. It belongs to ONE session — the id above is the session-qualifying
   // half of api.payloadVersion — so switching sessions in the dashboard drops it
@@ -656,7 +656,7 @@ function applyTransform(container) {
 }
 
 // applyViewTransform is what every render calls: it re-fits only while the user
-// has not navigated, so a live poll keeps a growing graph framed but never yanks
+// has not navigated, so a streamed update keeps a growing graph framed but never yanks
 // the viewport away from someone reading it.
 function applyViewTransform(container) {
   if (!container.querySelector('[data-role="canvas"]')) return true; // empty state
@@ -894,7 +894,7 @@ function showPopover(container, card) {
   if (!node) return;
   cancelHidePopover();
   var el = ensurePopover(container);
-  // Re-anchoring the SAME agent (a live poll rebuilt the pane under the pointer)
+  // Re-anchoring the SAME agent (a streamed update rebuilt the pane under the pointer)
   // keeps the reader's place in the scrollback; a different agent starts at the
   // top of its own history. The offset is read from popoverScroll rather than
   // from the element, because the rebuild detached the old panel — and a detached
@@ -908,7 +908,7 @@ function showPopover(container, card) {
   popoverAgentId = agentId;
 }
 
-// reopenPopover re-anchors an open popover after a rebuild, so a live poll tick
+// reopenPopover re-anchors an open popover after a rebuild, so a streamed update
 // doesn't yank the panel out from under the pointer; if the agent it described
 // is gone, it closes instead of describing a card that no longer exists.
 function reopenPopover(container) {
@@ -1006,7 +1006,7 @@ function ensureBound(container) {
     // Card positions are measured, so a resize (or a sidebar/pane reflow) has to
     // re-measure them; the cards themselves are laid out by flexbox and need no
     // re-render. The framing is recomputed too, unless the user has navigated —
-    // their view survives a window resize like it survives a poll.
+    // their view survives a window resize like it survives a streamed update.
     window.addEventListener("resize", debounce(function () {
       if (!lastContainer || !lastContainer.isConnected) return;
       hidePopover();
