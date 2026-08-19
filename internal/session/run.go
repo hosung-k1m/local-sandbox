@@ -19,10 +19,12 @@ import (
 	"boxedai/internal/image"
 	"boxedai/internal/policy"
 	"boxedai/internal/recorder"
+	"boxedai/internal/remoteaccess"
 	"boxedai/internal/snapshot"
 	"boxedai/internal/trustrecord"
 	"boxedai/internal/verify"
 	"boxedai/internal/vm"
+	"golang.org/x/crypto/ssh"
 )
 
 // Per-session artifact file names under sessions/<id>/ (DESIGN.md layout).
@@ -57,6 +59,9 @@ const (
 
 // RunOptions parameterizes one session (DESIGN.md CLI `boxedai run`).
 type RunOptions struct {
+	// HumanSSHPublicKey enables mediated human workspace access. The matching
+	// private key remains user-owned and never enters BoxedAi.
+	HumanSSHPublicKey string
 	// Harness is the workload: "claude", "codex", or "exec".
 	Harness string
 	// RepoPath is the repository to snapshot into the session workspace.
@@ -201,9 +206,18 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err != nil {
 		return Result{}, err
 	}
-	policyDigest, err := pol.Digest()
-	if err != nil {
-		return Result{}, fmt.Errorf("session: policy digest: %w", err)
+	humanPublicKey := ""
+	if opts.HumanSSHPublicKey == "" {
+		if configured, loadErr := LoadHumanSSHPublicKey(); loadErr == nil {
+			opts.HumanSSHPublicKey = configured
+		}
+	}
+	if opts.HumanSSHPublicKey != "" {
+		humanPublicKey, err = normalizeHumanSSHPublicKey(opts.HumanSSHPublicKey)
+		if err != nil {
+			return Result{}, err
+		}
+		pol.HumanAccess.Enabled = true
 	}
 	hc, err := LoadHostConfig()
 	if err != nil {
@@ -219,6 +233,33 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	img, err := resolveImage(runtime.GOARCH)
 	if err != nil {
 		return Result{}, fmt.Errorf("session: resolve golden image: %w", err)
+	}
+	if pol.HumanAccess.Enabled && (!img.FUSE3 || !img.FUSEPassthrough || !img.HWEKernel) {
+		return Result{}, fmt.Errorf("session: golden image lacks FUSE3/HWE-kernel passthrough workspace support; run `boxedai build-image` to rebuild")
+	}
+	if pol.HumanAccess.Enabled {
+		// These capabilities are derived from the resolved image and the fixed
+		// provisioning/FUSE configuration; the guest readiness gate below still
+		// has to pass before the workload starts.
+		pol.HumanAccess.Runtime = evidence.RuntimeCapabilityState{
+			WriteThroughLowerMount: img.FUSE3, PrivateLowerMount: img.FUSE3, SetfsuidProbe: img.FUSE3,
+			WritebackCacheDisabled: img.FUSEPassthrough, PrivilegedFUSE: img.FUSEPassthrough,
+			MediatedWriteOpen: img.FUSEPassthrough, HostReDerivation: true, UIDSeparation: true,
+		}
+		if !pol.HumanAccess.CanStartWritable(pol.WorkspaceWritable) {
+			return Result{}, fmt.Errorf("session: human access runtime cannot establish attributable writes")
+		}
+	}
+
+	// Compute the policy digest only after HumanAccess.Runtime is finalized
+	// above, so it matches the canonical policy.json written below and the
+	// policy_digest recorded in the grant. Computing it earlier (before the
+	// runtime capability state is filled in) makes human-access sessions seal
+	// a stale digest, so trust-record build fails with "policy artifact digest
+	// does not match grant" and the session is left incomplete.
+	policyDigest, err := pol.Digest()
+	if err != nil {
+		return Result{}, fmt.Errorf("session: policy digest: %w", err)
 	}
 
 	// --- Create the session directory and record the resolved policy. ---
@@ -253,14 +294,40 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	}
 	result.RecorderKeyFingerprint = evidence.SHA256Hex(key.Pub)
 	progress("crypto", "recorder ready: SHA-256 digests; COSE Sign1 with EdDSA (Ed25519); public key "+result.RecorderKeyFingerprint)
+
+	// Build the sealed human-access binding once so the recorder, the on-disk
+	// grant, and the guest provisioning all share one identical contract. The
+	// recorder re-derives workspace mutation actor classes from it, so it must
+	// exist before NewRecorder. All inputs (session id, now, human public key,
+	// runtime capabilities) are finalized above.
+	var humanBinding *evidence.HumanAccessBinding
+	if pol.HumanAccess.Enabled {
+		humanBinding = &evidence.HumanAccessBinding{
+			Runtime: pol.HumanAccess.Runtime,
+			SubjectMap: evidence.SessionSubjectMap{SessionID: sessionID, Subjects: []evidence.SessionSubject{
+				{UID: evidence.WorkloadUID, ActorClass: evidence.MutationActorAgent},
+				{UID: evidence.HumanUID, ActorClass: evidence.MutationActorHuman, SubjectID: "human:" + sessionID, GrantID: "human-grant:" + sessionID},
+			}},
+			Grant: evidence.HumanAccessGrant{
+				SessionID: sessionID, GrantID: "human-grant:" + sessionID, SubjectID: "human:" + sessionID,
+				ExpiresAt: now.Add(24 * time.Hour), UID: evidence.HumanUID,
+				AllowedSurfaces:  []evidence.AccessSurface{evidence.AccessSurfaceVSCodeRemoteSSH, evidence.AccessSurfaceIntelliJRemoteDev},
+				CredentialDigest: humanCredentialDigest(humanPublicKey),
+			},
+		}
+		if err := humanBinding.Validate(); err != nil {
+			return result, fmt.Errorf("session: invalid human access binding: %w", err)
+		}
+	}
 	meta := recorder.SessionMeta{
-		SessionID:      sessionID,
-		TraceID:        traceID,
-		PolicyDigest:   policyDigest,
-		VMImage:        img.Tag,
-		VMImageDigest:  img.DiskDigest,
-		VMID:           sessionID,
-		RecorderPubPEM: key.PubPEM,
+		SessionID:          sessionID,
+		TraceID:            traceID,
+		PolicyDigest:       policyDigest,
+		VMImage:            img.Tag,
+		VMImageDigest:      img.DiskDigest,
+		VMID:               sessionID,
+		RecorderPubPEM:     key.PubPEM,
+		HumanAccessBinding: humanBinding,
 	}
 	rec, err := recorder.NewRecorder(filepath.Join(sessionDir, evidenceDirName), key, meta)
 	if err != nil {
@@ -489,6 +556,9 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 			Required: true,
 		},
 	}
+	if pol.HumanAccess.Enabled {
+		grant.HumanAccess = humanBinding
+	}
 	grantBytes, err := json.MarshalIndent(grant, "", "  ")
 	if err != nil {
 		return result, fmt.Errorf("session: marshal grant: %w", err)
@@ -580,13 +650,29 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	}
 
 	// --- 5/6. Create + boot the VM, then gate on guest-agent health. ---
+	var subjectMap *evidence.SessionSubjectMap
+	var humanAccessGrant *evidence.HumanAccessGrant
+	if grant.HumanAccess != nil {
+		subjectMap = &grant.HumanAccess.SubjectMap
+		humanAccessGrant = &grant.HumanAccess.Grant
+	}
 	vmc = r.factory()(vm.Config{
-		SessionID:        sessionID,
-		AgentID:          primaryAgentID,
-		SessionDir:       sessionDir,
-		WorkspacePath:    workspace,
-		HarnessHomePath:  harnessHome,
-		Writable:         pol.WorkspaceWritable,
+		SessionID:            sessionID,
+		AgentID:              primaryAgentID,
+		SessionDir:           sessionDir,
+		WorkspacePath:        workspace,
+		HarnessHomePath:      harnessHome,
+		Writable:             pol.WorkspaceWritable,
+		MediatedWorkspace:    pol.HumanAccess.Enabled,
+		SubjectMap:           subjectMap,
+		HumanAccessGrant:     humanAccessGrant,
+		HumanAccessPublicKey: humanPublicKey,
+		RemoteAccessEndpoint: func() *remoteaccess.GuestEndpoint {
+			if !pol.HumanAccess.Enabled {
+				return nil
+			}
+			return &remoteaccess.GuestEndpoint{Port: remoteaccess.GuestPort, IP: remoteaccess.GuestIP, UID: evidence.HumanUID, WorkingDirectory: remoteaccess.WorkspaceTarget}
+		}(),
 		BrokerHost:       brokerHost,
 		BrokerPort:       port,
 		WorkloadToken:    br.WorkloadToken(),
@@ -662,23 +748,24 @@ func claudeTelemetryDir(sessionDir, harness string) string {
 // sessionGrant is the session.json grant written before VM boot (DESIGN.md
 // session grant schema). Its digest is recorded on session.granted.
 type sessionGrant struct {
-	Schema              string           `json:"schema"`
-	SessionID           string           `json:"session_id"`
-	TraceID             string           `json:"trace_id"`
-	Harness             string           `json:"harness"`
-	Profile             string           `json:"profile"`
-	RepoPath            string           `json:"repo_path"`
-	Repository          string           `json:"repository,omitempty"`
-	Branch              string           `json:"branch,omitempty"`
-	Commit              string           `json:"commit,omitempty"`
-	CreatedAt           string           `json:"created_at"`
-	PolicyDigest        string           `json:"policy_digest"`
-	InputManifestDigest string           `json:"input_manifest_digest"`
-	VMImage             string           `json:"vm_image"`
-	VMImageDigest       string           `json:"vm_image_digest"`
-	RecorderPub         string           `json:"recorder_pub"`
-	AssuranceMode       string           `json:"assurance_mode"`
-	TrustRecord         trustRecordGrant `json:"trust_record"`
+	Schema              string                       `json:"schema"`
+	SessionID           string                       `json:"session_id"`
+	TraceID             string                       `json:"trace_id"`
+	Harness             string                       `json:"harness"`
+	Profile             string                       `json:"profile"`
+	RepoPath            string                       `json:"repo_path"`
+	Repository          string                       `json:"repository,omitempty"`
+	Branch              string                       `json:"branch,omitempty"`
+	Commit              string                       `json:"commit,omitempty"`
+	CreatedAt           string                       `json:"created_at"`
+	PolicyDigest        string                       `json:"policy_digest"`
+	InputManifestDigest string                       `json:"input_manifest_digest"`
+	VMImage             string                       `json:"vm_image"`
+	VMImageDigest       string                       `json:"vm_image_digest"`
+	HumanAccess         *evidence.HumanAccessBinding `json:"human_access,omitempty"`
+	RecorderPub         string                       `json:"recorder_pub"`
+	AssuranceMode       string                       `json:"assurance_mode"`
+	TrustRecord         trustRecordGrant             `json:"trust_record"`
 }
 
 type trustRecordGrant struct {
@@ -691,6 +778,22 @@ type repositoryProvenance struct {
 	Repository string
 	Branch     string
 	Commit     string
+}
+
+func normalizeHumanSSHPublicKey(value string) (string, error) {
+	key, comment, options, rest, err := ssh.ParseAuthorizedKey([]byte(value))
+	if err != nil || key == nil || len(options) != 0 || len(strings.TrimSpace(string(rest))) != 0 {
+		return "", fmt.Errorf("session: invalid human SSH public key")
+	}
+	canonical := string(ssh.MarshalAuthorizedKey(key))
+	if comment != "" {
+		canonical = strings.TrimSpace(canonical) + " " + comment + "\n"
+	}
+	return canonical, nil
+}
+
+func humanCredentialDigest(publicKey string) string {
+	return evidence.SHA256Hex([]byte(publicKey))
 }
 
 func cloneRepository(ctx context.Context, repository, branch, destination string) error {
@@ -806,14 +909,31 @@ func resolveRepo(path string) (string, error) {
 	return abs, nil
 }
 
-// agentBinaryProvider serves the cross-compiled guest agent for the given goarch
-// from the build output tree (DESIGN.md provisioning step 4). It is read lazily,
+// agentBinaryProvider cross-compiles the guest agent from source for the given
+// goarch and returns the freshly built bytes (DESIGN.md provisioning step 2:
+// "host cross-compiles linux/{arm64,amd64}"). Building on demand, rather than
+// reading a prebuilt file, guarantees the guest is never served a stale binary
+// when guest sources changed since the last manual build. It is invoked lazily,
 // only when the guest actually requests it during provisioning.
 func agentBinaryProvider(arch string) ([]byte, error) {
-	path := filepath.Join("dist", "guest", "boxedai-guest-agent-linux-"+arch)
-	b, err := os.ReadFile(path)
+	if arch != "arm64" && arch != "amd64" {
+		return nil, fmt.Errorf("session: unsupported guest arch %q", arch)
+	}
+
+	outPath := filepath.Join("dist", "guest", "boxedai-guest-agent-linux-"+arch)
+	if err := os.MkdirAll(filepath.Dir(outPath), 0o755); err != nil {
+		return nil, fmt.Errorf("session: create guest agent output dir: %w", err)
+	}
+
+	cmd := exec.Command("./bin/go", "build", "-o", outPath, "./guest/agent")
+	cmd.Env = append(os.Environ(), "GOOS=linux", "GOARCH="+arch)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return nil, fmt.Errorf("session: build guest agent (%s): %w: %s", arch, err, out)
+	}
+
+	b, err := os.ReadFile(outPath)
 	if err != nil {
-		return nil, fmt.Errorf("session: read guest agent binary %s: %w", path, err)
+		return nil, fmt.Errorf("session: read guest agent binary %s: %w", outPath, err)
 	}
 	return b, nil
 }

@@ -92,7 +92,7 @@ State root `~/.boxedai/` (override: env `BOXEDAI_HOME`):
     workspace.orig/            pristine session-start clone, never mounted; baseline for
                                workspace.diff and the viewer's /api/filediff
     harness-home/              guest-mounted fresh Claude/Codex home and selected global instructions
-      settings.json            BoxedAi-authored Claude hook wiring (lefthook/righthook; never host-copied)
+      settings.json            BoxedAi-authored Claude settings: acceptEdits default + hook wiring (lefthook/righthook; never host-copied)
       debug/claude-code.log    native verbose debug log
       raw-api-bodies/          untruncated Messages API request/response bodies
     claude-telemetry/          host-only OTLP HTTP/JSON exports (Claude sessions only)
@@ -349,8 +349,11 @@ capability-gated category are INCOMPLETE, never TAMPER;
 (13) `file-content-store`: every kernel-observed `file.changed` stamped
 `audit.content.capture=full` resolves in the unsigned per-session blob store and
 re-hashes to the digest its sealed segment signed (see "File content capture"). The
-number is its position in this list; the verifier emits it directly after check (10),
-before the trust-record and agent checks. The verifier re-derives the blob path
+(14) `workspace-mutation-actors`: every kernel-observed `workspace.mutated` record
+has actor class `agent`, `human`, or `supervisor`; a supervisor mutation is surfaced
+as an operational anomaly and makes the session INCOMPLETE. The `file-content-store`
+check is emitted directly after check (10), before the trust-record and agent checks.
+The verifier re-derives the blob path
 and the hash itself and must NOT import `internal/blobstore`: a check that resolves a
 blob through the code that wrote it proves only that the code is self-consistent. Only
 `guest_supervisor`/`kernel_observed` records are counted, so workload narration cannot
@@ -641,6 +644,21 @@ box the agent runs in:
 - `SubagentStart`/`SubagentStop` → `boxedai-guest-agent agenthook` → emit
   `agent.started`/`agent.completed` for subagents (see "Agent hierarchy and
   attribution")
+
+The same staged `settings.json` also sets `permissions.defaultMode = acceptEdits`
+so a headless agent can write and edit inside the workspace without an interactive
+approval prompt. Claude's in-app prompt is redundant with BoxedAi's boundary —
+writes land only in the mediated FUSE workspace (attributed and signed), egress is
+broker-gated, and the hardened unit blocks escalation — and in a `-p` run there is
+no principal to answer it, so without this default Write/Edit fail closed while
+Read/Bash still dispatch and the run silently does nothing. `acceptEdits` (not
+`bypassPermissions`) grants exactly that and leaves non-edit tools to prompt when a
+human is present. The staged file sits at Claude's lowest settings precedence, so a
+per-run flag (`-- --permission-mode default` to restore prompting,
+`-- --dangerously-skip-permissions` to allow every tool) or a workspace's own
+`.claude/settings.json` overrides it with no BoxedAi code. Hooks fire in every
+permission mode (the mode governs interactive approval, not hook execution), so
+capture is unaffected.
 
 The Pre/PostToolUse hooks match every tool (`matcher: "*"`); the subagent hooks
 carry no matcher. The controller records the SHA-256 digest of the exact staged
@@ -1043,6 +1061,71 @@ sessions additionally mount a fresh `sessions/<id>/claude-code` directory at
 mounted. Other harnesses mount nothing else. Sessions get `host.lima.internal` for the
 broker.
 
+### Mediated writable workspace (v2)
+
+When mediated human access is enabled, the host workspace is mounted exactly once,
+read-write, at `/var/lib/boxedai/private/workspace-lower` — a private write-through
+backing the privileged mediator writes to on the workload's or human's behalf, so a
+mediated edit actually reaches the host workspace (and the host re-derivation below can
+see it). The golden image creates its `/var/lib/boxedai/private` parent as `root:root`
+mode 0700; the mount has a session-unique virtiofs tag, and the guest refuses a wrong
+tag, owner, group, or mode. `/workspace` is then a separate root-owned FUSE mount. The
+workload receives only `/workspace`; it cannot name or traverse the lower virtiofs mount,
+so the only path by which uid 4242 or 5000 can reach the backing is the attributing
+mediator — the lower is writable by the root mediator, never by those subjects.
+
+The root supervisor refuses to publish `/workspace` unless the lower mount is the
+expected writable virtiofs mount and unique tag, its parent is private, it holds
+`CAP_SYS_ADMIN`, it can make and restore `setfsuid` transitions for both workload
+uid 4242 and human uid 5000 while open/stat/readdir of the lower path return `EACCES`,
+and a root write-through probe (create/write/fsync/unlink of a private sentinel in the
+lower) succeeds — so a lower that silently regressed to read-only fails the session
+closed at startup instead of returning `EROFS` on the first real save.
+It also rejects a FUSE negotiation
+with `CAP_WRITEBACK_CACHE`, since writeback requests do not preserve the opener context
+needed for attribution. The host waits for the mediated-workspace readiness marker as
+well as the process-sensor marker before starting the harness.
+
+Writable FUSE handles store their backing handle in a named inner field. They explicitly
+delegate only read, getattr, flush, fsync, locking, seek, and release behavior; they do
+not expose `PassthroughFd` or `Ioctl`, and `Allocate` returns `EOPNOTSUPP`.
+`CopyFileRange` is likewise rejected. Each mutation is durably submitted to the recorder
+before the lower filesystem call; an unavailable recorder returns `EIO` and the backing
+mutation is not attempted.
+
+The sealed `SessionSubjectMap` is the operation gate. A workload UID maps to `agent`, a
+live matching human grant maps the human UID to `human`, root supervisor work maps to
+`supervisor`, and every other or incomplete identity is denied or recorded as
+`unattributed`. Writable-handle registrations are tracked by inode. Mutation evidence
+includes the kernel request UID, registered opener UID, actor class, and an attribution
+basis: `caller` when the request identity is present, `opener_fallback` when one active
+opener is the only available source, or `ambiguous` when no unique attribution exists.
+The recorder re-derives that actor class from the host-held sealed binding for
+guest-supervisor mutations only — never from the event payload — so a mutation posted on
+any other channel can never seal as `human` or `agent`. The host also re-derives the
+resulting bounded content digest from its workspace view before
+the event reaches the recorder; a failed re-derivation is session-fatal, except that a
+`write` whose file has since vanished on the host (a legal unlink-while-open pattern,
+reachable only now that writes land) records the empty-content digest and a
+`mutation.host.orphaned` marker rather than aborting the session.
+
+`runtime.human_access` in the signed trust record remains additive to the v1 envelope.
+For an attributable mediated session its runtime claim requires
+`private_lower_mount`, `setfsuid_probe`, and `writeback_cache_disabled` in addition to
+the `write_through_lower_mount`, privileged FUSE, mediated-open, host re-derivation,
+and UID-separation claims. The `write_through_lower_mount` bit (renamed from the earlier
+`read_only_lower_mount` when the backing became writable; the `boxedai.trust-record/v1`
+schema was amended in place — no mediated record predating the change ever verified, so
+nothing that once passed is stranded) asserts a single writable private virtiofs backing
+whose write-through the mediator probed before publishing `/workspace`. It deliberately
+does NOT claim the backing is unwritable by guest root: a root process could write the
+lower directly, outside mediation and outside the recorded `workspace.mutated` stream.
+The trust boundary the record does carry is against the workload (uid 4242) and human
+(uid 5000) subjects, held by the private root-only parent and the `EACCES` bypass probes.
+Detecting an unrecorded root (or host-side) write to the backing — by requiring every net
+input→output workspace change to be covered by a signed mutation — is a planned verifier
+check (`mediated-mutation-coverage`), not yet implemented.
+
 Provisioning splits the same way — bake-time steps run ONCE, amortized across every
 future session; session-time steps run on every `boxedai run` against that
 already-baked image:
@@ -1070,12 +1153,15 @@ lockdown; the bake boot never runs a workload):
    provisioning logs and continues, but session launch remains fail-closed until a
    process lifecycle sensor proves readiness (Tetragon, else the bounded procfs
    fallback in session-time step 4).
-4. Install (but do not configure) the nftables and rsyslog packages, and enable
-   rsyslog's systemd unit. No ruleset is written and rsyslog is not started yet — the
-   ruleset needs a real session's broker IP, which does not exist at bake time.
+4. Install the Ubuntu 24.04 HWE kernel meta-package, FUSE, and (but do not
+   configure) the nftables and rsyslog packages. The stock cloud image's 6.8
+   kernel is below FUSE passthrough's 6.9 minimum, so the exported disk first
+   boots into the HWE kernel on its next session boot. Enable rsyslog's systemd
+   unit. No ruleset is written and rsyslog is not started yet — the ruleset
+   needs a real session's broker IP, which does not exist at bake time.
 
-`build-image` verifies both harness CLIs plus any configured CA and npm registry,
-then stops the bake VM, copies its disk to `images/<arch>/disk.img`,
+`build-image` verifies both harness CLIs, the installed HWE kernel meta-package,
+plus any configured CA and npm registry, then stops the bake VM, copies its disk to `images/<arch>/disk.img`,
 hashes it, and writes `manifest.json` (see "Host filesystem layout" above) — this is
 the golden image `boxedai run` boots from via `image.Resolve`.
 

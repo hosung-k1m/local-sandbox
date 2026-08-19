@@ -4,7 +4,11 @@
 // DESIGN.md "VM (internal/vm) and guest supervisor" and "Harness launch".
 package vm
 
-import "boxedai/internal/policy"
+import (
+	"boxedai/internal/evidence"
+	"boxedai/internal/policy"
+	"boxedai/internal/remoteaccess"
+)
 
 // Config is everything GenerateLimaYAML and LaunchHarness need to stand up
 // one session's VM and drive its interactive harness. The session package
@@ -24,6 +28,20 @@ type Config struct {
 	HarnessHomePath string
 	// Writable is false for the review profile (read-only mount).
 	Writable bool
+	// MediatedWorkspace routes a writable workspace through the guest FUSE
+	// boundary. The controller enables it only after the sealed runtime contract
+	// has established that attributable writes are supported.
+	MediatedWorkspace bool
+	// SubjectMap and HumanAccessGrant are sealed controller bindings consumed by
+	// the guest mediator. They are required when MediatedWorkspace is enabled.
+	SubjectMap       *evidence.SessionSubjectMap
+	HumanAccessGrant *evidence.HumanAccessGrant
+	// RemoteAccessEndpoint describes the private guest socket the controller
+	// may use for human access. Nil keeps the production endpoint disabled.
+	RemoteAccessEndpoint *remoteaccess.GuestEndpoint
+	// HumanAccessPublicKey is the controller-issued ephemeral SSH public key.
+	// The corresponding private key never enters the guest or launch plan.
+	HumanAccessPublicKey string
 	// BrokerHost is the guest-reachable broker hostname, "host.lima.internal".
 	BrokerHost string
 	// BrokerPort is the broker's listen port.

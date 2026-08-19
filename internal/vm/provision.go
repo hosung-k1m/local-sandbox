@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"text/template"
+
+	"boxedai/internal/evidence"
+	"boxedai/internal/remoteaccess"
 )
 
 // guestAgentConfig is written to /etc/boxedai/agent.json (0600, root) during
@@ -14,13 +17,19 @@ import (
 // supervisor token, workload uid, workspace path") but not a JSON schema,
 // since guest/agent (a separate binary) owns parsing it.
 type guestAgentConfig struct {
-	SessionID       string `json:"session_id"`
-	BrokerURL       string `json:"broker_url"`
-	SupervisorToken string `json:"supervisor_token"`
-	WorkloadUID     int    `json:"workload_uid"`
-	WorkspacePath   string `json:"workspace_path"`
-	TetragonLog     string `json:"tetragon_log"`
-	NFTLogSource    string `json:"nft_log_source"`
+	SessionID            string                      `json:"session_id"`
+	BrokerURL            string                      `json:"broker_url"`
+	SupervisorToken      string                      `json:"supervisor_token"`
+	WorkloadUID          int                         `json:"workload_uid"`
+	WorkspacePath        string                      `json:"workspace_path"`
+	WorkspaceLowerPath   string                      `json:"workspace_lower_path"`
+	MediatedWorkspace    bool                        `json:"mediated_workspace"`
+	SubjectMap           *evidence.SessionSubjectMap `json:"subject_map,omitempty"`
+	HumanAccessGrant     *evidence.HumanAccessGrant  `json:"human_access_grant,omitempty"`
+	RemoteAccessEndpoint *remoteaccess.GuestEndpoint `json:"remote_access_endpoint,omitempty"`
+	HumanAccessPublicKey string                      `json:"human_access_public_key,omitempty"`
+	TetragonLog          string                      `json:"tetragon_log"`
+	NFTLogSource         string                      `json:"nft_log_source"`
 }
 
 // guestTetragonLog is where bake provisioning tells tetragon to export events
@@ -86,6 +95,80 @@ var stepCreateUserTmpl = template.Must(template.New("step-user").Parse(`#!/bin/s
 set -eu
 if ! id -u agent >/dev/null 2>&1; then
   useradd --create-home --home-dir /home/agent --uid {{.WorkloadUID}} --user-group --shell /bin/bash agent
+fi
+`))
+
+var stepHumanSSH = template.Must(template.New("step-human-ssh").Parse(`#!/bin/sh
+set -eu
+if [ -n '{{.HumanAccessPublicKeyB64}}' ]; then
+  if ! id -u human >/dev/null 2>&1; then
+    useradd --create-home --home-dir /home/human --uid 5000 --user-group --shell /bin/bash human
+  fi
+  install -d -o human -g human -m 0700 /home/human/.ssh
+  echo '{{.HumanAccessPublicKeyB64}}' | base64 -d > /home/human/.ssh/authorized_keys
+  chown human:human /home/human/.ssh/authorized_keys
+  chmod 0600 /home/human/.ssh/authorized_keys
+  cat > /usr/local/bin/boxedai-human-shell <<'SHELL_EOF'
+#!/bin/sh
+set -eu
+cd /workspace
+if [ -n "${SSH_ORIGINAL_COMMAND:-}" ]; then
+  exec bwrap --die-with-parent --unshare-all --new-session \
+    --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 \
+    --ro-bind /etc /etc --proc /proc --dev /dev --bind /workspace /workspace \
+    --chdir /workspace /bin/sh -c "$SSH_ORIGINAL_COMMAND"
+fi
+exec bwrap --die-with-parent --unshare-all --new-session \
+  --ro-bind /usr /usr --ro-bind /bin /bin --ro-bind /lib /lib --ro-bind-try /lib64 /lib64 \
+  --ro-bind /etc /etc --proc /proc --dev /dev --bind /workspace /workspace \
+  --chdir /workspace /bin/bash --noprofile --norc
+SHELL_EOF
+  chmod 0755 /usr/local/bin/boxedai-human-shell
+  # A DEDICATED sshd instance on 127.0.0.1:2222 (reached only through the
+  # forwarded remote-access socket), never the shared system sshd. Dropping this
+  # into /etc/ssh/sshd_config.d/ and restarting the system ssh unit would apply
+  # AllowUsers + ForceCommand + Port to the port-22 sshd that Lima's own management
+  # SSH depends on, locking out limactl shell -- which is exactly how the host runs
+  # its boot-marker and guest-agent health probes -- so every session would abort
+  # with "boot marker not ready" / "guest agent not healthy". Keep the sshds apart.
+  cat > /etc/ssh/sshd_config.boxedai-human <<'SSHD_EOF'
+Port 2222
+ListenAddress 127.0.0.1
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowUsers human
+PubkeyAuthentication yes
+AuthorizedKeysFile .ssh/authorized_keys
+ForceCommand /usr/local/bin/boxedai-human-shell
+HostKey /etc/ssh/ssh_host_ed25519_key
+PidFile /run/boxedai-human-sshd.pid
+# The human account is created passwordless (useradd, no -p), so its shadow entry
+# is locked (!). A standalone sshd defaults to UsePAM no and then rejects locked
+# accounts outright ("account is locked"), even for pubkey auth. Delegate account
+# and session management to PAM (as Ubuntu's system sshd does) so pubkey login to
+# the passwordless human account is permitted; password/kbd-interactive auth stay
+# disabled above, so PAM is used only for the account/session stages.
+UsePAM yes
+SSHD_EOF
+  cat > /etc/systemd/system/boxedai-human-sshd.service <<'UNIT_EOF'
+[Unit]
+Description=BoxedAi mediated human SSH access
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=/bin/mkdir -p /run/sshd
+ExecStartPre=/usr/sbin/sshd -t -f /etc/ssh/sshd_config.boxedai-human
+ExecStart=/usr/sbin/sshd -D -f /etc/ssh/sshd_config.boxedai-human
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+  systemctl daemon-reload
+  systemctl enable --now boxedai-human-sshd
 fi
 `))
 
@@ -204,16 +287,31 @@ UNIT_EOF
 ) || echo "boxedai: tetragon install failed, guest agent will fall back to procfs" >&2
 `))
 
-// stepBakePackagesTmpl installs (but does not configure) the nftables and
-// rsyslog packages into the golden image. Only the package install + enable
-// happen here: the nftables ruleset itself needs a real session's broker IP,
-// which does not exist yet at bake time (see stepNftablesRulesetTmpl).
+// stepBakePackagesTmpl installs (but does not configure) the HWE kernel,
+// FUSE, nftables, and rsyslog packages into the golden image. Ubuntu 24.04's
+// stock cloud image is still on a 6.8 kernel, below FUSE passthrough's 6.9
+// minimum. The HWE meta-package makes the exported disk boot a supported
+// kernel on its first session boot. Only the package install + enable happen
+// here: the nftables ruleset itself needs a real session's broker IP, which
+// does not exist yet at bake time (see stepNftablesRulesetTmpl).
 // Enabling rsyslog now means its systemd enable-state is baked into the
 // image, so every session boots with it already running, ready to receive
 // the kern.* records the session's nftables ruleset will start logging.
 var stepBakePackagesTmpl = template.Must(template.New("bake-step-packages").Parse(`#!/bin/sh
 set -eu
-apt-get install -y --no-install-recommends nftables rsyslog
+apt-get install -y --no-install-recommends bubblewrap fuse3 linux-generic-hwe-24.04 nftables openssh-server rsyslog
+# Ubuntu 24.04 ships kernel.apparmor_restrict_unprivileged_userns=1, which blocks
+# unprivileged bwrap from creating the user+network namespaces the human shell
+# needs -- without it bwrap dies with "loopback: Failed RTM_NEWADDR: Operation not
+# permitted". Make bwrap setuid-root so it takes its privileged setup path: it
+# configures the namespaces (including the sandbox loopback) as root, then drops
+# to the caller's uid before exec. --unshare-all uses --unshare-user-try, so it
+# simply skips the userns when the sysctl forbids one, keeping net/pid/ipc/uts
+# isolation intact. This is bubblewrap's classic deployment model and avoids
+# relaxing the host-wide apparmor sysctl.
+chmod u+s /usr/bin/bwrap
+install -d -o root -g root -m 0700 /var/lib/boxedai/private
+install -d -o root -g root -m 0755 /var/lib/boxedai/private/workspace-lower
 systemctl enable rsyslog
 `))
 
@@ -231,6 +329,10 @@ chmod 0755 /usr/local/bin/boxedai-guest-agent
 echo '{{.AgentConfigB64}}' | base64 -d > /etc/boxedai/agent.json
 chmod 0600 /etc/boxedai/agent.json
 chown root:root /etc/boxedai/agent.json
+{{if .MediatedWorkspace}}
+test -d /var/lib/boxedai/private
+test -O /var/lib/boxedai/private
+{{end}}
 
 cat > /etc/systemd/system/boxedai-guest-agent.service <<'UNIT_EOF'
 [Unit]
@@ -375,17 +477,19 @@ systemctl enable --now boxedai-guest-agent
 // already-baked golden image. It carries none of bake's node/npm/CA fields —
 // session provisioning never touches apt or npm.
 type provisionData struct {
-	BrokerHost      string
-	BrokerPort      int
-	SupervisorToken string
-	SessionID       string
-	Arch            string // GOARCH convention: "arm64" | "amd64"
-	AgentConfigB64  string
-	WorkloadUID     int
-	TetragonLog     string
+	BrokerHost        string
+	BrokerPort        int
+	SupervisorToken   string
+	SessionID         string
+	Arch              string // GOARCH convention: "arm64" | "amd64"
+	AgentConfigB64    string
+	WorkloadUID       int
+	MediatedWorkspace bool
+	TetragonLog       string
 	// TetragonExecStart re-pins the baked unit's command line for this session
 	// (see tetragonExecStart).
-	TetragonExecStart string
+	TetragonExecStart       string
+	HumanAccessPublicKeyB64 string
 }
 
 // bakeProvisionData is the template data for bake provisioning (see
@@ -452,14 +556,31 @@ func claudeNativePackageArch(goArch string) (string, error) {
 // npm: those packages and CLIs are already present in the golden image
 // cfg.ImagePath boots from (see bakeProvisionScripts).
 func provisionScripts(cfg Config) ([]limaProvision, error) {
+	if cfg.RemoteAccessEndpoint != nil {
+		if !cfg.MediatedWorkspace {
+			return nil, fmt.Errorf("vm: remote access endpoint requires a mediated workspace")
+		}
+		if err := cfg.RemoteAccessEndpoint.Validate(); err != nil {
+			return nil, fmt.Errorf("vm: invalid remote access endpoint: %w", err)
+		}
+		if cfg.HumanAccessPublicKey == "" {
+			return nil, fmt.Errorf("vm: human access endpoint requires an ephemeral public key")
+		}
+	}
 	agentCfg := guestAgentConfig{
-		SessionID:       cfg.SessionID,
-		BrokerURL:       fmt.Sprintf("http://%s:%d", cfg.BrokerHost, cfg.BrokerPort),
-		SupervisorToken: cfg.SupervisorToken,
-		WorkloadUID:     agentUID,
-		WorkspacePath:   guestWorkspaceMount,
-		TetragonLog:     guestTetragonLog,
-		NFTLogSource:    guestNFTLogSource,
+		SessionID:            cfg.SessionID,
+		BrokerURL:            fmt.Sprintf("http://%s:%d", cfg.BrokerHost, cfg.BrokerPort),
+		SupervisorToken:      cfg.SupervisorToken,
+		WorkloadUID:          agentUID,
+		WorkspacePath:        guestWorkspaceMount,
+		WorkspaceLowerPath:   guestWorkspaceLowerMount,
+		MediatedWorkspace:    cfg.MediatedWorkspace,
+		SubjectMap:           cfg.SubjectMap,
+		HumanAccessGrant:     cfg.HumanAccessGrant,
+		RemoteAccessEndpoint: cfg.RemoteAccessEndpoint,
+		HumanAccessPublicKey: cfg.HumanAccessPublicKey,
+		TetragonLog:          guestTetragonLog,
+		NFTLogSource:         guestNFTLogSource,
 	}
 	agentCfgJSON, err := json.Marshal(agentCfg)
 	if err != nil {
@@ -467,20 +588,23 @@ func provisionScripts(cfg Config) ([]limaProvision, error) {
 	}
 
 	data := provisionData{
-		BrokerHost:        cfg.BrokerHost,
-		BrokerPort:        cfg.BrokerPort,
-		SupervisorToken:   cfg.SupervisorToken,
-		SessionID:         cfg.SessionID,
-		Arch:              cfg.Arch,
-		AgentConfigB64:    base64.StdEncoding.EncodeToString(agentCfgJSON),
-		WorkloadUID:       agentUID,
-		TetragonLog:       guestTetragonLog,
-		TetragonExecStart: tetragonExecStart,
+		BrokerHost:              cfg.BrokerHost,
+		BrokerPort:              cfg.BrokerPort,
+		SupervisorToken:         cfg.SupervisorToken,
+		SessionID:               cfg.SessionID,
+		Arch:                    cfg.Arch,
+		AgentConfigB64:          base64.StdEncoding.EncodeToString(agentCfgJSON),
+		WorkloadUID:             agentUID,
+		MediatedWorkspace:       cfg.MediatedWorkspace,
+		TetragonLog:             guestTetragonLog,
+		TetragonExecStart:       tetragonExecStart,
+		HumanAccessPublicKeyB64: base64.StdEncoding.EncodeToString([]byte(cfg.HumanAccessPublicKey)),
 	}
 
 	steps := []*template.Template{
 		stepCreateUserTmpl,
 		stepGuestAgentTmpl,
+		stepHumanSSH,
 		stepNftablesRulesetTmpl,
 		stepEnableAgentTmpl,
 	}

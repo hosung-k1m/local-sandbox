@@ -6,6 +6,9 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
+
+	"boxedai/internal/evidence"
 )
 
 func validRecord(publicKey ed25519.PublicKey) Record {
@@ -86,6 +89,52 @@ func TestSignAndVerifyEnvelopeUsesCallerKeyAndJCS(t *testing.T) {
 	}
 	if verified.Signature != record.Signature {
 		t.Errorf("signature changed after verification")
+	}
+}
+
+func TestTrustRecordBindsSealedHumanAccessContract(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("GenerateKey: %v", err)
+	}
+	record := validRecord(publicKey)
+	record.Runtime.HumanAccess = &evidence.HumanAccessBinding{
+		Runtime: evidence.RuntimeCapabilityState{
+			WriteThroughLowerMount: true,
+			PrivateLowerMount:      true,
+			SetfsuidProbe:          true,
+			WritebackCacheDisabled: true,
+			PrivilegedFUSE:         true,
+			MediatedWriteOpen:      true,
+			HostReDerivation:       true,
+			UIDSeparation:          true,
+		},
+		SubjectMap: evidence.SessionSubjectMap{
+			SessionID: record.Session.ID,
+			Subjects: []evidence.SessionSubject{
+				{UID: evidence.WorkloadUID, ActorClass: evidence.MutationActorAgent},
+				{UID: evidence.HumanUID, ActorClass: evidence.MutationActorHuman, SubjectID: "operator-1", GrantID: "grant-1"},
+			},
+		},
+		Grant: evidence.HumanAccessGrant{
+			SessionID:        record.Session.ID,
+			GrantID:          "grant-1",
+			SubjectID:        "operator-1",
+			ExpiresAt:        time.Date(2026, time.August, 18, 12, 30, 0, 0, time.UTC),
+			AllowedSurfaces:  []evidence.AccessSurface{evidence.AccessSurfaceBrowserTerminal},
+			UID:              evidence.HumanUID,
+			CredentialDigest: "sha256:" + strings.Repeat("2", 64),
+		},
+	}
+	if err := Sign(&record, privateKey); err != nil {
+		t.Fatalf("Sign: %v", err)
+	}
+	data, err := json.Marshal(record)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if _, err := VerifyEnvelope(data, publicKey); err != nil {
+		t.Fatalf("VerifyEnvelope: %v", err)
 	}
 }
 

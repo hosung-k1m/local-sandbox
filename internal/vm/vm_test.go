@@ -13,6 +13,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"boxedai/internal/policy"
+	"boxedai/internal/remoteaccess"
 )
 
 func testConfig(t *testing.T, writable bool) Config {
@@ -439,6 +440,77 @@ func TestGenerateLimaYAML_ReviewProfileIsReadOnly(t *testing.T) {
 	}
 }
 
+func TestGenerateLimaYAML_MediatedWorkspaceUsesWritablePrivateLowerMount(t *testing.T) {
+	cfg := testConfig(t, true)
+	cfg.MediatedWorkspace = true
+	out, err := GenerateLimaYAML(cfg)
+	if err != nil {
+		t.Fatalf("GenerateLimaYAML: %v", err)
+	}
+	var tmpl limaTemplate
+	if err := yaml.Unmarshal([]byte(out), &tmpl); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := tmpl.Mounts[0]; got.MountPoint != guestWorkspaceLowerMount || !got.Writable {
+		t.Fatalf("mediated workspace mount = %+v, want writable %s", got, guestWorkspaceLowerMount)
+	}
+}
+
+func TestGenerateLimaYAML_MediatedWorkspaceAddsPrivateGuestPortForward(t *testing.T) {
+	cfg := testConfig(t, true)
+	cfg.MediatedWorkspace = true
+	cfg.RemoteAccessEndpoint = &remoteaccess.GuestEndpoint{
+		Port:             remoteaccess.GuestPort,
+		IP:               remoteaccess.GuestIP,
+		UID:              5000,
+		WorkingDirectory: remoteaccess.WorkspaceTarget,
+	}
+	cfg.HumanAccessPublicKey = "ssh-ed25519 AAAATEST human"
+	out, err := GenerateLimaYAML(cfg)
+	if err != nil {
+		t.Fatalf("GenerateLimaYAML: %v", err)
+	}
+	var tmpl limaTemplate
+	if err := yaml.Unmarshal([]byte(out), &tmpl); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if len(tmpl.PortForwards) != 1 {
+		t.Fatalf("port forwards = %+v, want one guest port forward", tmpl.PortForwards)
+	}
+	forward := tmpl.PortForwards[0]
+	if forward.GuestPort != guestRemoteAccessPort || forward.GuestIP != "127.0.0.1" || forward.HostSocket != filepath.Join(cfg.SessionDir, "remote-access", "guest.sock") {
+		t.Fatalf("socket forward = %+v, want loopback guest port and session-private host socket", forward)
+	}
+}
+
+func TestWaitForGuestHealthyRequiresWorkspaceMediatorWhenEnabled(t *testing.T) {
+	mediatorProbes := 0
+	run := func(_ context.Context, stdout, _ io.Writer, args ...string) error {
+		if args[3] == "systemctl" {
+			_, _ = io.WriteString(stdout, "active\n")
+			return nil
+		}
+		if args[3] == "test" && args[len(args)-1] == guestProcessSensorReadyPath {
+			return nil
+		}
+		if args[3] == "test" && args[len(args)-1] == guestWorkspaceMediatorReadyPath {
+			mediatorProbes++
+			if mediatorProbes == 1 {
+				return errors.New("mediator not ready")
+			}
+			return nil
+		}
+		t.Fatalf("unexpected health probe: %v", args)
+		return nil
+	}
+	if err := waitForGuestHealthyWithWorkspaceMediator(context.Background(), "test-instance", time.Second, time.Millisecond, true, run); err != nil {
+		t.Fatalf("waitForGuestHealthyWithWorkspaceMediator: %v", err)
+	}
+	if mediatorProbes != 2 {
+		t.Fatalf("workspace mediator probes = %d, want 2", mediatorProbes)
+	}
+}
+
 func TestGenerateLimaYAML_CodexMountsSessionHome(t *testing.T) {
 	cfg := testConfig(t, true)
 	cfg.Harness = "codex"
@@ -536,6 +608,45 @@ func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 	} {
 		if strings.Contains(got, banned) {
 			t.Errorf("session provisioning should not contain %q (belongs to bake provisioning)", banned)
+		}
+	}
+}
+
+func TestGenerateLimaYAML_ProvisioningConfiguresRestrictedHumanSSH(t *testing.T) {
+	cfg := testConfig(t, true)
+	cfg.MediatedWorkspace = true
+	cfg.RemoteAccessEndpoint = &remoteaccess.GuestEndpoint{Port: remoteaccess.GuestPort, IP: remoteaccess.GuestIP, UID: 5000, WorkingDirectory: remoteaccess.WorkspaceTarget}
+	cfg.HumanAccessPublicKey = "ssh-ed25519 AAAATEST human"
+	out, err := GenerateLimaYAML(cfg)
+	if err != nil {
+		t.Fatalf("GenerateLimaYAML: %v", err)
+	}
+	var tmpl limaTemplate
+	if err := yaml.Unmarshal([]byte(out), &tmpl); err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	var combined strings.Builder
+	for _, p := range tmpl.Provision {
+		combined.WriteString(p.Script)
+	}
+	got := combined.String()
+	for _, want := range []string{"useradd --create-home --home-dir /home/human --uid 5000", "PasswordAuthentication no", "ListenAddress 127.0.0.1", "Port 2222", "ForceCommand /usr/local/bin/boxedai-human-shell", "chmod 0600 /home/human/.ssh/authorized_keys"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("provisioning missing %q", want)
+		}
+	}
+	// Human SSH must run as its OWN sshd instance on 2222, never by reconfiguring
+	// or restarting the shared system sshd on port 22 -- that would lock Lima's
+	// `limactl shell` (host boot-marker + guest-health probes) out of the guest
+	// and abort every session. Guard against the drop-in/restart regression.
+	for _, want := range []string{"/etc/ssh/sshd_config.boxedai-human", "boxedai-human-sshd.service", "sshd -D -f /etc/ssh/sshd_config.boxedai-human", "UsePAM yes"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("provisioning missing dedicated human sshd marker %q", want)
+		}
+	}
+	for _, banned := range []string{"sshd_config.d/boxedai-human", "systemctl restart ssh", "systemctl enable --now ssh"} {
+		if strings.Contains(got, banned) {
+			t.Errorf("provisioning must not touch the shared system sshd, found %q", banned)
 		}
 	}
 }
@@ -753,11 +864,11 @@ func TestBakeProvisionScripts_ContainsBakeContent(t *testing.T) {
 		"--export-file-max-backups=1",       // ... with a bounded disk cost
 		"--export-file-rotation-interval=0", // ... and no time-based rotation
 		"--metrics-server=127.0.0.1:2112",
-		"PATH=/usr/local/lib/tetragon/:",                              // helper lookup
-		"--bpf-lib=/usr/local/lib/tetragon/bpf",                       // explicit service path
-		"systemctl enable tetragon",                                   // baked enable state
-		"apt-get install -y --no-install-recommends nftables rsyslog", // package install
-		"systemctl enable rsyslog",                                    // baked enable state
+		"PATH=/usr/local/lib/tetragon/:",        // helper lookup
+		"--bpf-lib=/usr/local/lib/tetragon/bpf", // explicit service path
+		"systemctl enable tetragon",             // baked enable state
+		"apt-get install -y --no-install-recommends bubblewrap fuse3 linux-generic-hwe-24.04 nftables openssh-server rsyslog", // package install
+		"systemctl enable rsyslog", // baked enable state
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("bake provisioning scripts missing expected content %q", want)
@@ -811,6 +922,12 @@ func TestBakeVerificationChecksTetragonRuntimePayloadWhenInstalled(t *testing.T)
 		if !strings.Contains(bakeVerificationScript, want) {
 			t.Errorf("bake verification missing Tetragon runtime check %q", want)
 		}
+	}
+}
+
+func TestBakeVerificationRequiresHWEKernelPackage(t *testing.T) {
+	if !strings.Contains(bakeVerificationScript, "dpkg-query -W -f='${db:Status-Status}\\n' linux-generic-hwe-24.04 | grep -Fx installed") {
+		t.Fatal("bake verification does not require the installed HWE kernel meta-package")
 	}
 }
 

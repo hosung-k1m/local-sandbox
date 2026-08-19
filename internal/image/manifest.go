@@ -38,6 +38,17 @@ type Manifest struct {
 	// CodexPackage is the npm package Build installed for the "codex"
 	// harness, "@openai/codex".
 	CodexPackage string `json:"codex_package"`
+	// FUSE3 records that the image includes the userspace helper required by
+	// the privileged mediated workspace gate.
+	FUSE3 bool `json:"fuse3"`
+	// FUSEPassthrough records that the image includes the FUSE stack required
+	// for the kernel-negotiated passthrough readiness check.
+	FUSEPassthrough bool `json:"fuse_passthrough"`
+	// HWEKernel records that the Ubuntu HWE meta-kernel is baked into the disk.
+	// The stock Ubuntu 24.04 cloud image starts on Linux 6.8, below FUSE
+	// passthrough's 6.9 minimum. A missing field from an older manifest decodes
+	// false and cannot enable a mediated workspace.
+	HWEKernel bool `json:"hwe_kernel"`
 	// ExtraCADigest identifies the corporate CA baked into the guest without
 	// storing another copy of the certificate in the image manifest.
 	ExtraCADigest string `json:"extra_ca_digest,omitempty"`

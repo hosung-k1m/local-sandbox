@@ -33,7 +33,12 @@ type grant struct {
 	VMImage             string `json:"vm_image"`
 	VMImageDigest       string `json:"vm_image_digest"`
 	RecorderPub         string `json:"recorder_pub"` // PEM PKIX Ed25519 public key
-	TrustRecord         struct {
+	// HumanAccess mirrors trustrecord/build.go's buildGrant field exactly: it is the
+	// same on-disk human_access binding, embedded verbatim into the signed record's
+	// runtime claim for mediated sessions, so the expected runtime claim below can
+	// reproduce it byte-for-byte instead of always expecting a bare (non-mediated) one.
+	HumanAccess *evidence.HumanAccessBinding `json:"human_access,omitempty"`
+	TrustRecord struct {
 		Schema   string `json:"schema"`
 		Path     string `json:"path"`
 		Required bool   `json:"required"`

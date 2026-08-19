@@ -245,6 +245,38 @@ func checkSensor(records []record) (ok bool, lossCount int, detail string) {
 	return false, lossCount, joinStrings(problems)
 }
 
+// checkWorkspaceMutationActors is the host-side semantic backstop for mediated
+// workspace evidence. Only the three sealed actor classes are actionable. A
+// supervisor mutation is structurally valid but an operational anomaly: it is
+// surfaced and drives an INCOMPLETE verdict rather than being silently folded into
+// a human or agent claim.
+func checkWorkspaceMutationActors(records []record) (ok bool, supervisorCount int, detail string) {
+	var invalid []string
+	for _, r := range records {
+		if r.name != evidence.EventWorkspaceMutated {
+			continue
+		}
+		if !isGuestKernelRecord(r) {
+			invalid = append(invalid, fmt.Sprintf("workspace.mutated (seq %d) is not guest kernel-observed evidence", r.seq))
+			continue
+		}
+		switch evidence.MutationActorClass(r.str(evidence.AttrMutationActorClass)) {
+		case evidence.MutationActorAgent, evidence.MutationActorHuman:
+		case evidence.MutationActorSupervisor:
+			supervisorCount++
+		default:
+			invalid = append(invalid, fmt.Sprintf("workspace.mutated (seq %d) has invalid actor %q", r.seq, r.str(evidence.AttrMutationActorClass)))
+		}
+	}
+	if len(invalid) > 0 {
+		return false, supervisorCount, joinStrings(invalid)
+	}
+	if supervisorCount > 0 {
+		return false, supervisorCount, fmt.Sprintf("%d supervisor workspace mutation(s) recorded", supervisorCount)
+	}
+	return true, 0, "workspace mutation actors are agent or human"
+}
+
 // checkFlow verifies the flow invariants (DESIGN check 9): every effect.dispatched
 // is preceded by an effect.approved for the same action (matched by
 // audit.content.digest, falling back to audit.action.id), and every

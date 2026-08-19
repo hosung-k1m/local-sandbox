@@ -53,6 +53,18 @@ func (r *recorder) buildLogsData(seq int64, eventID string, rr resolvedRecord) *
 		attrs[evidence.AttrAgentAttributionMethod] = string(method)
 		attrs[evidence.AttrAgentAttributionStrength] = string(strength)
 	}
+	if rr.name == evidence.EventWorkspaceMutated {
+		uid := int64(-1)
+		switch value := rr.attrs[evidence.AttrMutationUID].(type) {
+		case int:
+			uid = int64(value)
+		case int64:
+			uid = value
+		case float64:
+			uid = int64(value)
+		}
+		attrs[evidence.AttrMutationActorClass] = string(evidence.MutationActorForRecord(rr.producer, uid, r.meta.HumanAccessBinding, rr.wall))
+	}
 
 	rec := &logspb.LogRecord{
 		TimeUnixNano:         uint64(rr.wall.UnixNano()),

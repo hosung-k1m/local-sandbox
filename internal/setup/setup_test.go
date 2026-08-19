@@ -55,6 +55,7 @@ func TestRunConfiguresHostBuildsOnceAndDoctorReportsReady(t *testing.T) {
 		Tag:           "boxedai-base-arm64",
 		Arch:          "arm64",
 		DiskDigest:    "sha256:fixture",
+		HWEKernel:     true,
 		ExtraCADigest: digest("fixture-ca-pem\n"),
 		NPMRegistry:   BlockNPMRegistry,
 	}
@@ -115,6 +116,20 @@ func TestRunConfiguresHostBuildsOnceAndDoctorReportsReady(t *testing.T) {
 
 	if doctor := Doctor(context.Background(), "arm64"); !doctor.Ready || doctor.Status != "ready" || doctor.Image == nil {
 		t.Fatalf("Doctor result = %+v, want ready image", doctor)
+	}
+}
+
+func TestImageMatchesConfigRejectsPreHWEImage(t *testing.T) {
+	m := image.Manifest{
+		ExtraCADigest: digest("fixture-ca-pem\n"),
+		NPMRegistry:   BlockNPMRegistry,
+	}
+	if imageMatchesConfig(m, "fixture-ca-pem\n") {
+		t.Fatal("pre-HWE image matched current setup requirements")
+	}
+	m.HWEKernel = true
+	if !imageMatchesConfig(m, "fixture-ca-pem\n") {
+		t.Fatal("HWE image did not match current setup requirements")
 	}
 }
 

@@ -58,6 +58,19 @@ func TestLoadConfig_DefaultsTetragonLog(t *testing.T) {
 	}
 }
 
+func TestLoadConfig_MediatedWorkspaceRequiresLowerPath(t *testing.T) {
+	path := writeConfig(t, `{
+		"session_id": "bx-1",
+		"broker_url": "http://host.lima.internal:5555",
+		"supervisor_token": "tok",
+		"workspace_path": "/workspace",
+		"mediated_workspace": true
+	}`)
+	if _, err := LoadConfig(path); err == nil {
+		t.Fatal("LoadConfig: want error for mediated workspace without lower path")
+	}
+}
+
 func TestLoadConfig_MissingRequiredField(t *testing.T) {
 	path := writeConfig(t, `{"broker_url": "http://host.lima.internal:5555"}`)
 

@@ -41,6 +41,72 @@
             "digest": {"$ref": "#/$defs/digest"}
           },
           "additionalProperties": false
+        },
+        "human_access": {
+          "type": "object",
+          "required": ["runtime", "subject_map", "grant"],
+          "properties": {
+            "runtime": {
+              "type": "object",
+              "required": ["write_through_lower_mount", "private_lower_mount", "setfsuid_probe", "writeback_cache_disabled", "privileged_fuse", "mediated_write_open", "host_re_derivation", "uid_separation"],
+              "properties": {
+                "write_through_lower_mount": {"const": true},
+                "private_lower_mount": {"const": true},
+                "setfsuid_probe": {"const": true},
+                "writeback_cache_disabled": {"const": true},
+                "privileged_fuse": {"const": true},
+                "mediated_write_open": {"const": true},
+                "host_re_derivation": {"const": true},
+                "uid_separation": {"const": true}
+              },
+              "additionalProperties": false
+            },
+            "subject_map": {
+              "type": "object",
+              "required": ["session_id", "subjects"],
+              "properties": {
+                "session_id": {"type": "string", "pattern": "^bx-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$"},
+                "subjects": {
+                  "type": "array",
+                  "minItems": 2,
+                  "maxItems": 2,
+                  "items": {
+                    "type": "object",
+                    "required": ["uid", "actor_class"],
+                    "properties": {
+                      "uid": {"enum": [4242, 5000]},
+                      "actor_class": {"enum": ["human", "agent"]},
+                      "subject_id": {"type": "string", "minLength": 1},
+                      "grant_id": {"type": "string", "minLength": 1}
+                    },
+                    "additionalProperties": false
+                  }
+                }
+              },
+              "additionalProperties": false
+            },
+            "grant": {
+              "type": "object",
+              "required": ["session_id", "grant_id", "subject_id", "expires_at", "allowed_surfaces", "uid", "credential_digest", "revoked"],
+              "properties": {
+                "session_id": {"type": "string", "pattern": "^bx-[0-9]{8}-[0-9]{6}-[0-9a-f]{8}$"},
+                "grant_id": {"type": "string", "minLength": 1},
+                "subject_id": {"type": "string", "minLength": 1},
+                "expires_at": {"type": "string", "format": "date-time"},
+                "allowed_surfaces": {
+                  "type": "array",
+                  "minItems": 1,
+                  "uniqueItems": true,
+                  "items": {"enum": ["browser_terminal", "vscode_remote_ssh", "intellij_remote_development"]}
+                },
+                "uid": {"const": 5000},
+                "credential_digest": {"$ref": "#/$defs/digest"},
+                "revoked": {"type": "boolean"}
+              },
+              "additionalProperties": false
+            }
+          },
+          "additionalProperties": false
         }
       },
       "additionalProperties": false

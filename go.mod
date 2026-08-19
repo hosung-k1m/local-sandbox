@@ -6,6 +6,7 @@ require (
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-json-experiment/json v0.0.0-20260623181947-01eb4420fa68
 	github.com/gowebpki/jcs v1.0.1
+	github.com/hanwen/go-fuse/v2 v2.9.0
 	github.com/mattn/go-isatty v0.0.24
 	github.com/prometheus/common v0.62.0
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
@@ -31,6 +32,7 @@ require (
 	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
 	github.com/spf13/pflag v1.0.9 // indirect
 	github.com/x448/float16 v0.8.4 // indirect
+	golang.org/x/crypto v0.41.0 // indirect
 	golang.org/x/text v0.40.0 // indirect
 	modernc.org/libc v1.74.4 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

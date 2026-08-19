@@ -144,6 +144,11 @@ func rederiveTrustRecord(sessionDir string, g grant, signed trustrecord.Record, 
 		Isolation: trustrecord.RuntimeIsolationLima,
 		Image:     trustrecord.RuntimeImage{Name: g.VMImage, Digest: g.VMImageDigest},
 	}
+	// Mirrors trustrecord/build.go's embedding: build.go copies grant.HumanAccess onto
+	// the record's runtime verbatim (nil for a non-mediated session), so the expected
+	// side must carry the same grant-derived value or every mediated session's runtime
+	// claim would mismatch regardless of tampering.
+	expectedRuntime.HumanAccess = g.HumanAccess
 	expectedPolicy := trustrecord.Policy{Profile: g.Profile, Digest: g.PolicyDigest}
 	compareTrustClaim(&problems, "session", signed.Session, expectedSession)
 	compareTrustClaim(&problems, "source", signed.Source, source)

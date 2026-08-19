@@ -64,11 +64,12 @@ dist/boxedai build-image                              # bakes Node, Claude Code,
                                                         # and Tetragon into a golden disk
 ```
 
-`build-image` boots a throwaway VM, installs Node plus both `@anthropic-ai/claude-code`
-and `@openai/codex` (the image is harness-agnostic) and Tetragon into it, and saves the
-resulting disk under `~/.boxedai/images/<arch>/`. `boxedai run` boots directly from that
-disk instead of provisioning a fresh Ubuntu image every session, and fails fast with a
-clear error if the image is missing.
+`build-image` boots a throwaway VM, installs the Ubuntu HWE kernel (required for FUSE
+passthrough), Node, both `@anthropic-ai/claude-code` and `@openai/codex` (the image is
+harness-agnostic), and Tetragon into it, then saves the resulting disk under
+`~/.boxedai/images/<arch>/`. `boxedai run` boots directly from that disk instead of
+provisioning a fresh Ubuntu image every session, and fails fast with a clear error if the
+image is missing.
 
 ```
 dist/boxedai run claude .                             # interactive Claude Code in a sandbox

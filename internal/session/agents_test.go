@@ -90,7 +90,7 @@ func TestAgentCompletedEvent(t *testing.T) {
 // TestHarnessSettingsDigest asserts only Claude (the sole hook-wiring harness)
 // yields a digest, and it is the digest of the exact staged settings bytes.
 func TestHarnessSettingsDigest(t *testing.T) {
-	if got, want := harnessSettingsDigest("claude"), evidence.SHA256Hex([]byte(claudeHooksSettingsJSON)); got != want {
+	if got, want := harnessSettingsDigest("claude"), evidence.SHA256Hex([]byte(claudeSettingsJSON)); got != want {
 		t.Errorf("claude settings digest = %q, want %q", got, want)
 	}
 	for _, h := range []string{"codex", "exec", "unknown"} {

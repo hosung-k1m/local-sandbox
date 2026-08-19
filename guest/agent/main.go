@@ -26,6 +26,7 @@ const stopSentinel = "/etc/boxedai/stop"
 // incomplete and drives an INCOMPLETE verdict.
 // VM.WaitHealthy requires it before launching the harness.
 const processSensorReadyPath = "/run/boxedai/process-sensor-ready"
+const workspaceMediatorReadyPath = "/run/boxedai/workspace-mediator-ready"
 
 const sentinelPollInterval = 1 * time.Second
 
@@ -57,12 +58,23 @@ func main() {
 	if err := os.Remove(processSensorReadyPath); err != nil && !os.IsNotExist(err) {
 		log.Fatalf("agent: remove stale process sensor readiness: %v", err)
 	}
+	if err := os.Remove(workspaceMediatorReadyPath); err != nil && !os.IsNotExist(err) {
+		log.Fatalf("agent: remove stale workspace mediator readiness: %v", err)
+	}
 
 	// The batcher runs on its own context so it can outlive the watchers
 	// long enough to flush events they emit while shutting down.
 	batchCtx, cancelBatch := context.WithCancel(context.Background())
 	batchDone := make(chan struct{})
 	go func() { defer close(batchDone); batch.Run(batchCtx) }()
+	if cfg.MediatedWorkspace {
+		if err := startMediatedWorkspace(cfg, batch); err != nil {
+			log.Fatalf("agent: start workspace mediator: %v", err)
+		}
+		if err := os.WriteFile(workspaceMediatorReadyPath, []byte("ready\n"), 0o644); err != nil {
+			log.Fatalf("agent: mark workspace mediator ready: %v", err)
+		}
+	}
 
 	watchCtx, cancelWatchers := context.WithCancel(context.Background())
 	fatalWatcher := make(chan error, 1)
@@ -87,7 +99,9 @@ func main() {
 		}
 		return err
 	})
-	startWatcher("file", func(ctx context.Context) error { return runFileWatcher(ctx, cfg.WorkspacePath, batch) })
+	if !cfg.MediatedWorkspace {
+		startWatcher("file", func(ctx context.Context) error { return runFileWatcher(ctx, cfg.WorkspacePath, batch) })
+	}
 	startWatcher("network", func(ctx context.Context) error { return runNetworkWatcher(ctx, cfg.NFTLogSource, batch) })
 
 	fatalErr := waitForStop(watchCtx, cancelWatchers, fatalWatcher)

@@ -101,6 +101,9 @@ func TestBuildSuccess(t *testing.T) {
 	if m.ClaudeCodePackage != claudeCodePackage || m.CodexPackage != codexPackage {
 		t.Errorf("package fields = %+v, want %s/%s", m, claudeCodePackage, codexPackage)
 	}
+	if !m.FUSE3 || !m.FUSEPassthrough || !m.HWEKernel {
+		t.Errorf("FUSE prerequisites = FUSE3:%t FUSEPassthrough:%t HWEKernel:%t, want all true", m.FUSE3, m.FUSEPassthrough, m.HWEKernel)
+	}
 	if m.ExtraCADigest != valueDigest("fixture-ca") || m.NPMRegistry != "https://registry.example.internal/npm/" {
 		t.Errorf("corporate image inputs = %+v", m)
 	}

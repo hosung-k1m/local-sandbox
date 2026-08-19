@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -332,6 +333,110 @@ func TestAgentAttributionIsChannelDerived(t *testing.T) {
 		if got := r.attrs[evidence.AttrAgentAttributionStrength]; got != wantStrength {
 			t.Errorf("%s (%s) attribution strength = %q, want %q", r.name, r.producer, got, wantStrength)
 		}
+	}
+}
+
+func TestMutationActorClassIsRecorderDerived(t *testing.T) {
+	root := t.TempDir()
+	key, err := LoadOrGenerateKey(filepath.Join(root, "keys"))
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey: %v", err)
+	}
+	evDir := filepath.Join(root, "evidence")
+	rec, err := NewRecorder(evDir, key, SessionMeta{SessionID: "bx-mutation-attr"})
+	if err != nil {
+		t.Fatalf("NewRecorder: %v", err)
+	}
+	mutation := func(uid int64) evidence.Event {
+		return evidence.Event{
+			Name: evidence.EventWorkspaceMutated,
+			Attrs: map[string]any{
+				evidence.AttrMutationUID:          uid,
+				evidence.AttrMutationBasis:        "caller",
+				evidence.AttrMutationOpenerUID:    uid,
+				evidence.AttrMutationOpenMode:     string(evidence.MutationOpenWriteOnly),
+				evidence.AttrMutationOperation:    string(evidence.MutationOperationDelete),
+				evidence.AttrMutationPath:         "notes.txt",
+				evidence.AttrMutationPositionKind: string(evidence.MutationPositionNonPositional),
+				evidence.AttrContentDigest:        evidence.SHA256Hex([]byte("bounded content")),
+				evidence.AttrMutationActorClass:   string(evidence.MutationActorHuman),
+			},
+		}
+	}
+	if err := rec.Emit(evidence.ChannelWorkload, mutation(evidence.HumanUID)); err != nil {
+		t.Fatalf("emit workload mutation: %v", err)
+	}
+	if err := rec.Emit(evidence.ChannelGuestSupervisor, mutation(evidence.WorkloadUID)); err != nil {
+		t.Fatalf("emit guest mutation: %v", err)
+	}
+	if _, err := rec.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	segments, err := filepath.Glob(filepath.Join(evDir, "segments", "segment-*.otlp"))
+	if err != nil {
+		t.Fatalf("glob segments: %v", err)
+	}
+	var records []readRecord
+	for i, segment := range segments {
+		records = append(records, readSegment(t, segment, i+1)...)
+	}
+	var classes []string
+	for _, record := range records {
+		if record.name == evidence.EventWorkspaceMutated {
+			classes = append(classes, record.attrs[evidence.AttrMutationActorClass])
+		}
+	}
+	if want := []string{string(evidence.MutationActorUnattributed), string(evidence.MutationActorAgent)}; !slices.Equal(classes, want) {
+		t.Errorf("mutation actor classes = %v, want %v", classes, want)
+	}
+
+	// With a sealed HumanAccessBinding present in SessionMeta, the recorder's
+	// channel gate still applies: only the guest-supervisor channel reaches the
+	// full grant-aware classifier and promotes uid 5000 to human, while the same
+	// uid on the workload's own channel stays unattributed (a workload cannot
+	// forge a human mutation on its own channel).
+	humanEvDir := filepath.Join(root, "evidence-human")
+	binding := &evidence.HumanAccessBinding{
+		SubjectMap: evidence.SessionSubjectMap{SessionID: "bx-mutation-attr-human", Subjects: []evidence.SessionSubject{
+			{UID: evidence.WorkloadUID, ActorClass: evidence.MutationActorAgent},
+			{UID: evidence.HumanUID, ActorClass: evidence.MutationActorHuman, SubjectID: "human:bx-mutation-attr-human", GrantID: "human-grant:bx-mutation-attr-human"},
+		}},
+		Grant: evidence.HumanAccessGrant{
+			SessionID: "bx-mutation-attr-human", GrantID: "human-grant:bx-mutation-attr-human", SubjectID: "human:bx-mutation-attr-human",
+			ExpiresAt: time.Now().Add(time.Hour), UID: evidence.HumanUID,
+			AllowedSurfaces:  []evidence.AccessSurface{evidence.AccessSurfaceVSCodeRemoteSSH},
+			CredentialDigest: evidence.SHA256Hex([]byte("credential")),
+		},
+	}
+	humanRec, err := NewRecorder(humanEvDir, key, SessionMeta{SessionID: "bx-mutation-attr-human", HumanAccessBinding: binding})
+	if err != nil {
+		t.Fatalf("NewRecorder (human binding): %v", err)
+	}
+	if err := humanRec.Emit(evidence.ChannelGuestSupervisor, mutation(evidence.HumanUID)); err != nil {
+		t.Fatalf("emit guest-supervisor human mutation: %v", err)
+	}
+	if err := humanRec.Emit(evidence.ChannelWorkload, mutation(evidence.HumanUID)); err != nil {
+		t.Fatalf("emit workload human-uid mutation: %v", err)
+	}
+	if _, err := humanRec.Close(); err != nil {
+		t.Fatalf("Close (human binding): %v", err)
+	}
+	humanSegments, err := filepath.Glob(filepath.Join(humanEvDir, "segments", "segment-*.otlp"))
+	if err != nil {
+		t.Fatalf("glob segments (human binding): %v", err)
+	}
+	var humanRecords []readRecord
+	for i, segment := range humanSegments {
+		humanRecords = append(humanRecords, readSegment(t, segment, i+1)...)
+	}
+	var humanClasses []string
+	for _, record := range humanRecords {
+		if record.name == evidence.EventWorkspaceMutated {
+			humanClasses = append(humanClasses, record.attrs[evidence.AttrMutationActorClass])
+		}
+	}
+	if want := []string{string(evidence.MutationActorHuman), string(evidence.MutationActorUnattributed)}; !slices.Equal(humanClasses, want) {
+		t.Errorf("mutation actor classes with human binding = %v, want %v", humanClasses, want)
 	}
 }
 

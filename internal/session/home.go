@@ -7,13 +7,19 @@
 package session
 
 import (
+	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
+
+	"golang.org/x/crypto/ssh"
 )
 
 // homeEnv overrides the default ~/.boxedai state root when set.
@@ -45,6 +51,65 @@ func keysDir() string { return filepath.Join(Home(), "keys") }
 
 // configPath is ~/.boxedai/config.json, the host configuration file.
 func configPath() string { return filepath.Join(Home(), "config.json") }
+
+func humanSSHKeyDir() string         { return filepath.Join(Home(), "human-ssh") }
+func HumanSSHPrivateKeyPath() string { return filepath.Join(humanSSHKeyDir(), "id_ed25519") }
+func HumanSSHPublicKeyPath() string  { return filepath.Join(humanSSHKeyDir(), "id_ed25519.pub") }
+
+func HumanSSHPublicKeyFingerprint(publicKey string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(publicKey)))
+	return "SHA256:" + hex.EncodeToString(sum[:])
+}
+
+func LoadHumanSSHPublicKey() (string, error) {
+	data, err := os.ReadFile(HumanSSHPublicKeyPath())
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+// EnsureHumanSSHKeypair creates the controller-owned human SSH key exactly
+// once. Existing material is never replaced; a partial pair fails closed.
+func EnsureHumanSSHKeypair() (string, string, error) {
+	dir := humanSSHKeyDir()
+	privatePath, publicPath := HumanSSHPrivateKeyPath(), HumanSSHPublicKeyPath()
+	_, privateErr := os.Stat(privatePath)
+	_, publicErr := os.Stat(publicPath)
+	if privateErr == nil || publicErr == nil {
+		if privateErr != nil || publicErr != nil {
+			return "", "", fmt.Errorf("session: human SSH keypair is incomplete")
+		}
+		public, err := os.ReadFile(publicPath)
+		return strings.TrimSpace(string(public)), publicPath, err
+	}
+	if !os.IsNotExist(privateErr) || !os.IsNotExist(publicErr) {
+		return "", "", fmt.Errorf("session: inspect human SSH keypair: %v %v", privateErr, publicErr)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return "", "", fmt.Errorf("marshal private key: %w", err)
+	}
+	pub, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", fmt.Errorf("marshal public key: %w", err)
+	}
+	privatePEM, err := ssh.MarshalPrivateKey(ed25519.PrivateKey(priv), "boxedai-human")
+	if err != nil {
+		return "", "", fmt.Errorf("marshal private key: %w", err)
+	}
+	publicKey, err := ssh.NewPublicKey(ed25519.PublicKey(pub))
+	if err != nil {
+		return "", "", fmt.Errorf("marshal public key: %w", err)
+	}
+	publicLine := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(publicKey))) + " boxedai-human\n"
+	if err := os.WriteFile(privatePath, pem.EncodeToMemory(privatePEM), 0o600); err != nil {
+		return "", "", err
+	}
+	if err := os.WriteFile(publicPath, []byte(publicLine), 0o644); err != nil {
+		return "", "", err
+	}
+	return strings.TrimSpace(publicLine), publicPath, nil
+}
 
 // sessionsDir is ~/.boxedai/sessions, the parent of every per-session directory.
 func sessionsDir() string { return filepath.Join(Home(), "sessions") }

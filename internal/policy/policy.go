@@ -54,6 +54,18 @@ type FileCapture struct {
 	ExcludeDirs []string `json:"exclude_dirs"`
 }
 
+// HumanAccess governs the optional mediated human workspace surface. A writable
+// feature-enabled session is valid only when every runtime capability required for
+// source-derived attribution is present.
+type HumanAccess struct {
+	Enabled bool                            `json:"enabled"`
+	Runtime evidence.RuntimeCapabilityState `json:"runtime"`
+}
+
+func (h HumanAccess) CanStartWritable(workspaceWritable bool) bool {
+	return !workspaceWritable || !h.Enabled || h.Runtime.SupportsAttributableWrites()
+}
+
 // Policy is the resolved, immutable session policy. Its canonical-JSON digest is
 // the audit.policy.digest stamped on every evidence record.
 type Policy struct {
@@ -70,6 +82,7 @@ type Policy struct {
 	// It rides in the policy (rather than a separate config) so the capture rules
 	// in force are covered by the attested policy digest on every record.
 	FileCapture FileCapture `json:"file_capture"`
+	HumanAccess HumanAccess `json:"human_access"`
 }
 
 // defaultTools granted by profiles with CapInternalRead.

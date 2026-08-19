@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"io/fs"
 	"os"
@@ -111,7 +112,66 @@ func (c *captureEmitter) Emit(ch evidence.Channel, ev evidence.Event) error {
 		// producer upstream that could observe the stamp.
 		c.stamp(ev.Attrs)
 	}
+	if ch == evidence.ChannelGuestSupervisor && ev.Name == evidence.EventWorkspaceMutated {
+		if err := c.rederiveMutation(ev.Attrs); err != nil {
+			return err
+		}
+	}
 	return c.inner.Emit(ch, ev)
+}
+
+// rederiveMutation replaces the guest candidate digest with a bounded read from
+// the host workspace before the candidate reaches the recorder. A deletion has
+// no remaining content, so its host-derived digest is the empty byte sequence.
+func (c *captureEmitter) rederiveMutation(attrs map[string]any) error {
+	path, _ := attrs[evidence.AttrMutationPath].(string)
+	if path == "" {
+		return errors.New("session: mediated mutation missing path for host re-derivation")
+	}
+	content, err := c.readMutation(path)
+	if err != nil {
+		operation, _ := attrs[evidence.AttrMutationOperation].(string)
+		if operation != string(evidence.MutationOperationWrite) {
+			attrs[evidence.AttrContentDigest] = evidence.SHA256Hex(nil)
+			attrs["mutation.host.rederived"] = true
+			return nil
+		}
+		// A write can legitimately outlive the path that named it: create -> write ->
+		// unlink -> write-to-the-still-open-fd is a normal POSIX idiom (editors, build
+		// tools, atomic temp-file swaps) and is only reachable now that writes actually
+		// succeed on the write-through mount. That race is recorded like the no-content
+		// case above, but flagged orphaned rather than folded silently into an ordinary
+		// re-derivation. Every other write error (permission, I/O, ...) still fails the
+		// session below.
+		if errors.Is(err, fs.ErrNotExist) {
+			attrs[evidence.AttrContentDigest] = evidence.SHA256Hex(nil)
+			attrs["mutation.host.rederived"] = true
+			attrs["mutation.host.orphaned"] = true
+			return nil
+		}
+		return fmt.Errorf("session: re-derive mediated mutation %q: %w", path, err)
+	}
+	attrs[evidence.AttrContentDigest] = evidence.SHA256Hex(content)
+	attrs["mutation.host.rederived"] = true
+	return nil
+}
+
+func (c *captureEmitter) readMutation(relPath string) ([]byte, error) {
+	rel := filepath.FromSlash(relPath)
+	if !filepath.IsLocal(rel) {
+		return nil, errors.New("non-local mutation path")
+	}
+	root, err := os.OpenRoot(c.workspaceDir)
+	if err != nil {
+		return nil, fmt.Errorf("open workspace root: %w", err)
+	}
+	defer root.Close()
+	file, err := root.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return io.ReadAll(io.LimitReader(file, c.fc.MaxBytes))
 }
 
 // stamp records the capture outcome on one file.changed event's attributes.

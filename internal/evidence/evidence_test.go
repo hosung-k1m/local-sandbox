@@ -1,6 +1,9 @@
 package evidence
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 // TestAgentLifecycleEventsAreCatalogued guards the two agent lifecycle names: they
 // must be in the Catalog (so the recorder accepts them) and Validate must pass, or
@@ -101,5 +104,158 @@ func TestAgentAttributionForChannel(t *testing.T) {
 			t.Errorf("AgentAttributionFor(%q) = %q/%q, want %q/%q",
 				c.ch, method, strength, c.wantMethod, c.wantStrength)
 		}
+	}
+}
+
+// TestHumanMutationAttributionRequiresASealedActiveGrant locks the no-promotion
+// boundary for the UID split used by the mediated workspace. UID 5000 is not a
+// human claim by itself: it becomes human only when it matches the immutable
+// session subject map and a live, non-revoked controller grant.
+func TestHumanMutationAttributionRequiresASealedActiveGrant(t *testing.T) {
+	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+	subjects := SessionSubjectMap{
+		SessionID: "bx-test-session",
+		Subjects: []SessionSubject{
+			{UID: WorkloadUID, ActorClass: MutationActorAgent},
+			{UID: HumanUID, ActorClass: MutationActorHuman, SubjectID: "operator-1", GrantID: "grant-1"},
+		},
+	}
+	grant := HumanAccessGrant{
+		SessionID:        subjects.SessionID,
+		GrantID:          "grant-1",
+		SubjectID:        "operator-1",
+		ExpiresAt:        now.Add(time.Minute),
+		AllowedSurfaces:  []AccessSurface{AccessSurfaceBrowserTerminal},
+		UID:              HumanUID,
+		CredentialDigest: SHA256Hex([]byte("credential")),
+	}
+
+	for _, tc := range []struct {
+		name  string
+		uid   int64
+		grant *HumanAccessGrant
+		at    time.Time
+		want  MutationActorClass
+	}{
+		{"workload uid is agent", WorkloadUID, &grant, now, MutationActorAgent},
+		{"root uid is supervisor", 0, &grant, now, MutationActorSupervisor},
+		{"active sealed human grant", HumanUID, &grant, now, MutationActorHuman},
+		{"human uid without grant is unattributed", HumanUID, nil, now, MutationActorUnattributed},
+		{"expired human grant is unattributed", HumanUID, &grant, grant.ExpiresAt, MutationActorUnattributed},
+		{"other uid is unattributed", 6000, &grant, now, MutationActorUnattributed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MutationActorFor(tc.uid, subjects, tc.grant, tc.at); got != tc.want {
+				t.Errorf("MutationActorFor(%d) = %q, want %q", tc.uid, got, tc.want)
+			}
+		})
+	}
+	if !subjects.AllowsMutation(WorkloadUID, &grant, MutationOperationWrite, now) {
+		t.Fatal("workload mutation rejected by sealed operation gate")
+	}
+	if !subjects.AllowsMutation(0, &grant, MutationOperationMetadata, now) {
+		t.Fatal("supervisor mutation rejected by sealed operation gate")
+	}
+	if subjects.AllowsMutation(6000, &grant, MutationOperationWrite, now) {
+		t.Fatal("unknown uid accepted by sealed operation gate")
+	}
+}
+
+// TestMutationActorForRecord locks the channel gate on the recorder's
+// binding-aware classifier: only a guest-supervisor mutation can join the sealed
+// human-access binding and promote to human/supervisor; every other channel — even
+// carrying the identical valid binding — falls back to the channel-only
+// classifier, so a workload cannot forge a human mutation on its own channel.
+func TestMutationActorForRecord(t *testing.T) {
+	now := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+	subjects := SessionSubjectMap{
+		SessionID: "bx-test-session",
+		Subjects: []SessionSubject{
+			{UID: WorkloadUID, ActorClass: MutationActorAgent},
+			{UID: HumanUID, ActorClass: MutationActorHuman, SubjectID: "operator-1", GrantID: "grant-1"},
+		},
+	}
+	grant := HumanAccessGrant{
+		SessionID:        subjects.SessionID,
+		GrantID:          "grant-1",
+		SubjectID:        "operator-1",
+		ExpiresAt:        now.Add(time.Minute),
+		AllowedSurfaces:  []AccessSurface{AccessSurfaceBrowserTerminal},
+		UID:              HumanUID,
+		CredentialDigest: SHA256Hex([]byte("credential")),
+	}
+	binding := &HumanAccessBinding{SubjectMap: subjects, Grant: grant}
+	expiredGrant := grant
+	expiredGrant.ExpiresAt = now.Add(-time.Minute)
+	expiredBinding := &HumanAccessBinding{SubjectMap: subjects, Grant: expiredGrant}
+
+	for _, tc := range []struct {
+		name    string
+		channel Channel
+		uid     int64
+		binding *HumanAccessBinding
+		want    MutationActorClass
+	}{
+		{"guest-supervisor human uid with valid binding", ChannelGuestSupervisor, HumanUID, binding, MutationActorHuman},
+		{"guest-supervisor workload uid with valid binding", ChannelGuestSupervisor, WorkloadUID, binding, MutationActorAgent},
+		{"guest-supervisor root uid with valid binding", ChannelGuestSupervisor, 0, binding, MutationActorSupervisor},
+		{"guest-supervisor human uid with expired grant", ChannelGuestSupervisor, HumanUID, expiredBinding, MutationActorUnattributed},
+		{"workload channel human uid with valid binding is gated", ChannelWorkload, HumanUID, binding, MutationActorUnattributed},
+		{"guest-supervisor workload uid with nil binding", ChannelGuestSupervisor, WorkloadUID, nil, MutationActorAgent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MutationActorForRecord(tc.channel, tc.uid, tc.binding, now); got != tc.want {
+				t.Errorf("MutationActorForRecord(%q, %d) = %q, want %q", tc.channel, tc.uid, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMediatedMutationRejectsIncompleteContract ensures every mutable FUSE
+// candidate names its source-derived operation, open mode, relative path, and
+// positional semantics before it can enter the recorder.
+func TestMediatedMutationRejectsIncompleteContract(t *testing.T) {
+	ev := Event{
+		Name: EventWorkspaceMutated,
+		Attrs: map[string]any{
+			AttrMutationUID:          int64(HumanUID),
+			AttrMutationOpenerUID:    int64(HumanUID),
+			AttrMutationBasis:        "caller",
+			AttrMutationActorClass:   string(MutationActorHuman),
+			AttrMutationOpenMode:     string(MutationOpenReadWrite),
+			AttrMutationOperation:    string(MutationOperationWrite),
+			AttrMutationPath:         "notes.txt",
+			AttrMutationPosition:     int64(0),
+			AttrMutationPositionKind: string(MutationPositionPositional),
+			AttrContentDigest:        SHA256Hex([]byte("bounded content")),
+		},
+	}
+	if err := ev.Validate(); err != nil {
+		t.Fatalf("Validate complete mutation: %v", err)
+	}
+	delete(ev.Attrs, AttrMutationPositionKind)
+	if err := ev.Validate(); err == nil {
+		t.Fatal("Validate incomplete mutation = nil, want error")
+	}
+}
+
+func TestMediatedMutationRejectsWorkspaceRootEscape(t *testing.T) {
+	ev := Event{
+		Name: EventWorkspaceMutated,
+		Attrs: map[string]any{
+			AttrMutationUID:          int64(HumanUID),
+			AttrMutationOpenerUID:    int64(HumanUID),
+			AttrMutationBasis:        "caller",
+			AttrMutationActorClass:   string(MutationActorHuman),
+			AttrMutationOpenMode:     string(MutationOpenReadWrite),
+			AttrMutationOperation:    string(MutationOperationWrite),
+			AttrMutationPath:         "..",
+			AttrMutationPosition:     int64(0),
+			AttrMutationPositionKind: string(MutationPositionPositional),
+			AttrContentDigest:        SHA256Hex([]byte("bounded content")),
+		},
+	}
+	if err := ev.Validate(); err == nil {
+		t.Fatal("Validate workspace-root escape = nil, want error")
 	}
 }

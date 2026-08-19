@@ -15,15 +15,36 @@ const (
 	claudeSettingsFileName = "settings.json"
 )
 
-// claudeHooksSettingsJSON is the BoxedAi-authored Claude Code settings.json
-// staged into the session harness home, never the host's own settings (see
-// the exclusion in stageHarnessInstructions below). It wires PreToolUse/
-// PostToolUse to the guest agent's lefthook/righthook subcommands so every
-// tool invocation is recorded as tool.requested/tool.completed evidence, and
-// SubagentStart/SubagentStop (no matcher — they match on agent type) to the
-// agenthook subcommand so every subagent is registered as agent.started/
-// agent.completed (DESIGN.md "Harness hook capture", "Agent hierarchy").
-const claudeHooksSettingsJSON = `{
+// claudeSettingsJSON is the BoxedAi-authored Claude Code settings.json staged
+// into the session harness home, never the host's own settings (see the
+// exclusion in stageHarnessInstructions below).
+//
+// permissions.defaultMode is acceptEdits so the agent can write/edit inside the
+// workspace without an interactive approval prompt. This is sound only because
+// the VM is the security boundary: writes land solely in the mediated FUSE
+// workspace (per-mutation attributed and signed), egress is broker-gated, and
+// the systemd unit blocks escalation — Claude's in-app prompt is redundant with
+// those controls and, in a headless `-p` run, fails closed with no principal to
+// answer it (Read/Bash dispatch but Write/Edit silently deny, so the run does
+// nothing). acceptEdits, not bypassPermissions: it fixes exactly that failure
+// while leaving non-edit tools to prompt when a human is present. The staged
+// file sits at Claude's lowest settings precedence, so a user flag
+// (`-- --permission-mode default`, `-- --dangerously-skip-permissions`) or a
+// workspace's own .claude/settings.json overrides it with no BoxedAi code. Do
+// not copy this default anywhere lacking the VM/FUSE/broker boundary.
+//
+// hooks wires PreToolUse/PostToolUse to the guest agent's lefthook/righthook
+// subcommands so every tool invocation is recorded as tool.requested/
+// tool.completed evidence, and SubagentStart/SubagentStop (no matcher — they
+// match on agent type) to the agenthook subcommand so every subagent is
+// registered as agent.started/agent.completed. Hooks fire in every permission
+// mode (mode governs interactive approval, not hook execution), so capture is
+// unaffected by defaultMode (DESIGN.md "Harness hook capture", "Agent
+// hierarchy").
+const claudeSettingsJSON = `{
+  "permissions": {
+    "defaultMode": "acceptEdits"
+  },
   "hooks": {
     "PreToolUse": [
       {"matcher": "*", "hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent lefthook", "timeout": 15}]}
@@ -41,16 +62,16 @@ const claudeHooksSettingsJSON = `{
 }
 `
 
-// harnessSettingsDigest is the SHA-256 of the exact staged hook settings.json
-// bytes, or "" for harnesses that stage no hooks. stageHarnessInstructions
-// writes []byte(claudeHooksSettingsJSON) verbatim, so digesting the constant
-// matches the on-disk file; the controller stamps this on the Primary Agent's
-// agent.started as attestable hook-wiring provenance.
+// harnessSettingsDigest is the SHA-256 of the exact staged settings.json bytes,
+// or "" for harnesses that stage no settings. stageHarnessInstructions writes
+// []byte(claudeSettingsJSON) verbatim, so digesting the constant matches the
+// on-disk file; the controller stamps this on the Primary Agent's agent.started
+// as attestable settings provenance (permission posture and hook wiring).
 func harnessSettingsDigest(harness string) string {
 	if harness != "claude" {
 		return ""
 	}
-	return evidence.SHA256Hex([]byte(claudeHooksSettingsJSON))
+	return evidence.SHA256Hex([]byte(claudeSettingsJSON))
 }
 
 var hostUserHomeDir = os.UserHomeDir
@@ -114,12 +135,13 @@ func stageHarnessInstructions(sessionDir, harness string) (string, error) {
 			return "", err
 		}
 	}
-	// Claude-only: stage the BoxedAi-authored hook wiring (never the host's
-	// own settings.json — codex/exec get no hook mechanism in v0.1).
+	// Claude-only: stage the BoxedAi-authored settings — permission default plus
+	// hook wiring (never the host's own settings.json — codex/exec get no hook
+	// mechanism in v0.1).
 	if harness == "claude" {
 		settingsTarget := filepath.Join(destination, claudeSettingsFileName)
-		if err := os.WriteFile(settingsTarget, []byte(claudeHooksSettingsJSON), 0o600); err != nil {
-			return "", fmt.Errorf("session: write claude hooks settings: %w", err)
+		if err := os.WriteFile(settingsTarget, []byte(claudeSettingsJSON), 0o600); err != nil {
+			return "", fmt.Errorf("session: write claude settings: %w", err)
 		}
 	}
 	return destination, nil

@@ -3,6 +3,8 @@ package policy
 import (
 	"slices"
 	"testing"
+
+	"boxedai/internal/evidence"
 )
 
 func TestDevelopAllowsApprovalGatedGitHubPushByDefault(t *testing.T) {
@@ -166,5 +168,29 @@ func TestPolicyDigestReflectsFileCapture(t *testing.T) {
 	}
 	if d1 == d2 {
 		t.Error("Digest unchanged after FileCapture.SecretGlobs differed")
+	}
+}
+
+func TestHumanAccessPolicyRejectsUnsupportedWritableRuntime(t *testing.T) {
+	p, err := Resolve(ProfileDevelop, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.HumanAccess.Enabled = true
+	if p.HumanAccess.CanStartWritable(p.WorkspaceWritable) {
+		t.Fatal("unsupported human access runtime may start writable session")
+	}
+	p.HumanAccess.Runtime = evidence.RuntimeCapabilityState{
+		WriteThroughLowerMount: true,
+		PrivateLowerMount:      true,
+		SetfsuidProbe:          true,
+		WritebackCacheDisabled: true,
+		PrivilegedFUSE:         true,
+		MediatedWriteOpen:      true,
+		HostReDerivation:       true,
+		UIDSeparation:          true,
+	}
+	if !p.HumanAccess.CanStartWritable(p.WorkspaceWritable) {
+		t.Fatal("complete human access runtime may not start writable session")
 	}
 }

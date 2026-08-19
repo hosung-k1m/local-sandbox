@@ -1,6 +1,7 @@
 package vm
 
 import (
+	"boxedai/internal/remoteaccess"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +12,16 @@ import (
 // guestWorkspaceMount is the fixed mount point inside the guest; DESIGN.md
 // mounts sessions/<id>/workspace here as the workload's repository.
 const guestWorkspaceMount = "/workspace"
+
+// guestWorkspaceLowerMount is a private WRITABLE virtiofs backing mount
+// exposed only to the privileged workspace mediator. Workloads never receive
+// it directly; the mediator's root-owned FUSE layer writes through to it so
+// mutations reach the host workspace directory while still being attributed.
+const (
+	guestWorkspacePrivateDir = "/var/lib/boxedai/private"
+	guestWorkspaceLowerMount = guestWorkspacePrivateDir + "/workspace-lower"
+	guestRemoteAccessPort    = remoteaccess.GuestPort
+)
 
 // Claude Code writes its native debug log, transcripts, and other session
 // state below this directory. Claude sessions mount a fresh, session-local
@@ -53,13 +64,14 @@ const (
 // limaTemplate is the subset of Lima's instance config schema BoxedAi needs.
 // Field names match Lima's own YAML keys exactly.
 type limaTemplate struct {
-	VMType                string          `yaml:"vmType"`
-	Arch                  string          `yaml:"arch"`
-	Images                []limaImage     `yaml:"images"`
-	Mounts                []limaMount     `yaml:"mounts"`
-	MountTypesUnsupported []string        `yaml:"mountTypesUnsupported"`
-	Containerd            limaContainerd  `yaml:"containerd"`
-	Provision             []limaProvision `yaml:"provision"`
+	VMType                string            `yaml:"vmType"`
+	Arch                  string            `yaml:"arch"`
+	Images                []limaImage       `yaml:"images"`
+	Mounts                []limaMount       `yaml:"mounts"`
+	MountTypesUnsupported []string          `yaml:"mountTypesUnsupported"`
+	Containerd            limaContainerd    `yaml:"containerd"`
+	Provision             []limaProvision   `yaml:"provision"`
+	PortForwards          []limaPortForward `yaml:"portForwards,omitempty"`
 	// Disk is Lima's `disk:` logical-size override, e.g. "20GiB". Empty
 	// (omitted) for real sessions, which use Lima's own vz default; set only
 	// for the bake boot (see GenerateBakeLimaYAML / bakeDiskSize).
@@ -69,6 +81,12 @@ type limaTemplate struct {
 	// which takes Lima's own vz defaults.
 	Memory string `yaml:"memory,omitempty"`
 	CPUs   int    `yaml:"cpus,omitempty"`
+}
+
+type limaPortForward struct {
+	GuestPort  int    `yaml:"guestPort"`
+	GuestIP    string `yaml:"guestIP"`
+	HostSocket string `yaml:"hostSocket"`
 }
 
 type limaImage struct {
@@ -95,8 +113,10 @@ type limaProvision struct {
 // GenerateLimaYAML renders the Lima instance configuration for a session:
 // vmType vz on the host's own arch, the pre-baked golden image at
 // cfg.ImagePath (see internal/image) instead of a freshly downloaded Ubuntu
-// image, a writable (or read-only, for the review profile) workspace mount,
-// and, for Claude only, a fresh session-local diagnostics mount, sized to
+// image, a writable (or read-only, for the review profile) workspace mount --
+// or, when mediated, a private WRITABLE virtiofs lower mount exposed only to
+// the privileged workspace mediator, never to the workload directly -- and,
+// for Claude only, a fresh session-local diagnostics mount, sized to
 // sessionMemory/sessionCPUs so the guest actually has the RAM the workload unit's
 // MemoryMax assumes. It exposes no
 // other host directory, configures no port forwards, and ends its fast
@@ -114,10 +134,16 @@ func GenerateLimaYAML(cfg Config) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	workspaceMount := guestWorkspaceMount
+	workspaceWritable := cfg.Writable
+	if cfg.MediatedWorkspace {
+		workspaceMount = guestWorkspaceLowerMount
+		workspaceWritable = true
+	}
 	mounts := []limaMount{{
 		Location:   cfg.WorkspacePath,
-		MountPoint: guestWorkspaceMount,
-		Writable:   cfg.Writable,
+		MountPoint: workspaceMount,
+		Writable:   workspaceWritable,
 	}}
 	if cfg.Harness == "claude" || cfg.Harness == "codex" {
 		mountPoint := guestClaudeConfigDir
@@ -146,6 +172,13 @@ func GenerateLimaYAML(cfg Config) (string, error) {
 		Memory:                sessionMemory,
 		CPUs:                  sessionCPUs,
 	}
+	if cfg.RemoteAccessEndpoint != nil {
+		tmpl.PortForwards = []limaPortForward{{
+			GuestPort:  guestRemoteAccessPort,
+			GuestIP:    remoteaccess.GuestIP,
+			HostSocket: filepath.Join(cfg.SessionDir, "remote-access", "guest.sock"),
+		}}
+	}
 	b, err := yaml.Marshal(tmpl)
 	if err != nil {
 		return "", fmt.Errorf("vm: marshal lima config: %w", err)
@@ -167,6 +200,11 @@ func WriteLimaYAML(cfg Config) (string, error) {
 		}
 		if err := os.MkdirAll(filepath.Join(harnessHomePath(cfg), "raw-api-bodies"), 0o700); err != nil {
 			return "", fmt.Errorf("vm: create Claude raw API body dir: %w", err)
+		}
+	}
+	if cfg.RemoteAccessEndpoint != nil {
+		if err := os.MkdirAll(filepath.Join(cfg.SessionDir, "remote-access"), 0o700); err != nil {
+			return "", fmt.Errorf("vm: create remote access socket dir: %w", err)
 		}
 	}
 	dir := filepath.Join(cfg.SessionDir, "vm")

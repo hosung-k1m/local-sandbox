@@ -26,13 +26,14 @@ var knownProfiles = map[string]policy.Profile{
 // newRunCmd builds `boxedai run <claude|codex|exec> [path]`.
 func newRunCmd() *cobra.Command {
 	var (
-		profile    string
-		caps       []string
-		secrets    []string
-		execCmd    string
-		keepVM     bool
-		repository string
-		branch     string
+		profile           string
+		caps              []string
+		secrets           []string
+		execCmd           string
+		keepVM            bool
+		repository        string
+		branch            string
+		humanSSHPublicKey string
 	)
 	cmd := &cobra.Command{
 		Use:   "run <claude|codex|exec> [path] [-- harness-args...]",
@@ -50,6 +51,7 @@ func newRunCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
+			opts.HumanSSHPublicKey = humanSSHPublicKey
 			opts.Progress = func(stage, detail string) {
 				fmt.Fprintf(c.ErrOrStderr(), "==> %-12s %s\n", stage, detail)
 			}
@@ -80,6 +82,7 @@ func newRunCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&keepVM, "keep-vm", false, "leave the Lima VM in place after the session (debugging)")
 	cmd.Flags().StringVar(&repository, "repo", "", "remote Git repository to clone fresh for this session")
 	cmd.Flags().StringVar(&branch, "branch", "", "branch to check out from --repo")
+	cmd.Flags().StringVar(&humanSSHPublicKey, "human-ssh-public-key", "", "OpenSSH public key enabling mediated human SSH workspace access")
 	return cmd
 }
 

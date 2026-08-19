@@ -14,6 +14,7 @@ import (
 const defaultLimactl = "./bin/limactl"
 
 const guestProcessSensorReadyPath = "/run/boxedai/process-sensor-ready"
+const guestWorkspaceMediatorReadyPath = "/run/boxedai/workspace-mediator-ready"
 
 // stopGrace is how long Stop waits after writing the stop sentinel, matching
 // the guest agent's 5s freeze+drain window (DESIGN.md "Kill switch").
@@ -153,7 +154,7 @@ func (vm *VM) Start(ctx context.Context) error {
 // session.started / launching the harness (DESIGN.md session flow step 7:
 // "abort, INCOMPLETE" on timeout).
 func (vm *VM) WaitHealthy(ctx context.Context, timeout time.Duration) error {
-	return waitForGuestHealthy(ctx, vm.Cfg.SessionID, timeout, healthPollInterval, vm.run)
+	return waitForGuestHealthyWithWorkspaceMediator(ctx, vm.Cfg.SessionID, timeout, healthPollInterval, vm.Cfg.MediatedWorkspace, vm.run)
 }
 
 func waitForGuestHealthy(
@@ -161,6 +162,17 @@ func waitForGuestHealthy(
 	name string,
 	timeout time.Duration,
 	pollInterval time.Duration,
+	run limactlRunFunc,
+) error {
+	return waitForGuestHealthyWithWorkspaceMediator(ctx, name, timeout, pollInterval, false, run)
+}
+
+func waitForGuestHealthyWithWorkspaceMediator(
+	ctx context.Context,
+	name string,
+	timeout time.Duration,
+	pollInterval time.Duration,
+	requireWorkspaceMediator bool,
 	run limactlRunFunc,
 ) error {
 	waitCtx, cancelWait := context.WithTimeout(ctx, timeout)
@@ -183,7 +195,15 @@ func waitForGuestHealthy(
 				err := run(probeCtx, io.Discard, io.Discard, "shell", name, "--", "test", "-f", guestProcessSensorReadyPath)
 				cancelProbe()
 				if err == nil {
-					return nil
+					if !requireWorkspaceMediator {
+						return nil
+					}
+					probeCtx, cancelProbe = context.WithTimeout(waitCtx, limaShellProbeTimeout)
+					err = run(probeCtx, io.Discard, io.Discard, "shell", name, "--", "test", "-f", guestWorkspaceMediatorReadyPath)
+					cancelProbe()
+					if err == nil {
+						return nil
+					}
 				}
 			}
 		}
@@ -312,6 +332,8 @@ func (b *BakeVM) Verify(ctx context.Context) error {
 var bakeVerificationScript = `
 command -v claude
 command -v codex
+command -v fusermount3
+dpkg-query -W -f='${db:Status-Status}\n' linux-generic-hwe-24.04 | grep -Fx installed
 claude --version
 codex --version
 if command -v tetragon >/dev/null 2>&1; then

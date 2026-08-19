@@ -40,19 +40,20 @@ const (
 )
 
 type buildGrant struct {
-	Schema              string `json:"schema"`
-	SessionID           string `json:"session_id"`
-	TraceID             string `json:"trace_id"`
-	Harness             string `json:"harness"`
-	Profile             string `json:"profile"`
-	Repository          string `json:"repository"`
-	Branch              string `json:"branch"`
-	Commit              string `json:"commit"`
-	CreatedAt           string `json:"created_at"`
-	PolicyDigest        string `json:"policy_digest"`
-	InputManifestDigest string `json:"input_manifest_digest"`
-	VMImage             string `json:"vm_image"`
-	VMImageDigest       string `json:"vm_image_digest"`
+	Schema              string                       `json:"schema"`
+	SessionID           string                       `json:"session_id"`
+	TraceID             string                       `json:"trace_id"`
+	Harness             string                       `json:"harness"`
+	Profile             string                       `json:"profile"`
+	Repository          string                       `json:"repository"`
+	Branch              string                       `json:"branch"`
+	Commit              string                       `json:"commit"`
+	CreatedAt           string                       `json:"created_at"`
+	PolicyDigest        string                       `json:"policy_digest"`
+	InputManifestDigest string                       `json:"input_manifest_digest"`
+	VMImage             string                       `json:"vm_image"`
+	VMImageDigest       string                       `json:"vm_image_digest"`
+	HumanAccess         *evidence.HumanAccessBinding `json:"human_access,omitempty"`
 	TrustRecord         struct {
 		Schema   string `json:"schema"`
 		Path     string `json:"path"`
@@ -226,6 +227,12 @@ func Build(sessionDir string, issuedAt time.Time, publicKey ed25519.PublicKey) (
 			Canonicalization:       CanonicalizationRFC8785,
 			RecorderKeyFingerprint: PublicKeyFingerprint(publicKey),
 		},
+	}
+	if grant.HumanAccess != nil {
+		if err := grant.HumanAccess.Validate(); err != nil {
+			return Record{}, fmt.Errorf("trust record: invalid human access binding: %w", err)
+		}
+		record.Runtime.HumanAccess = grant.HumanAccess
 	}
 	if grant.Repository != "" || grant.Branch != "" || grant.Commit != "" {
 		record.Source = &Source{Repository: grant.Repository, Branch: grant.Branch, Commit: grant.Commit}

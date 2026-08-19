@@ -1,5 +1,7 @@
 package trustrecord
 
+import "boxedai/internal/evidence"
+
 const (
 	MaxSafeInteger             = int64(1<<53 - 1)
 	Profile                    = "boxedai.trust-record/v1"
@@ -44,9 +46,10 @@ type Source struct {
 }
 
 type Runtime struct {
-	Platform  string       `json:"platform"`
-	Isolation string       `json:"isolation"`
-	Image     RuntimeImage `json:"image"`
+	Platform    string                       `json:"platform"`
+	Isolation   string                       `json:"isolation"`
+	Image       RuntimeImage                 `json:"image"`
+	HumanAccess *evidence.HumanAccessBinding `json:"human_access,omitempty"`
 }
 
 type RuntimeImage struct {

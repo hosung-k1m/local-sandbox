@@ -30,7 +30,7 @@ func TestStageHarnessInstructionsCopiesOnlyConventionalFiles(t *testing.T) {
 		t.Errorf("staged content = %q", content)
 	}
 	// The host's settings.json must never leak through: the staged file is
-	// always the BoxedAi-authored hook config, byte for byte.
+	// always the BoxedAi-authored config, byte for byte.
 	settingsContent, err := os.ReadFile(filepath.Join(destination, "settings.json"))
 	if err != nil {
 		t.Fatalf("read staged settings.json: %v", err)
@@ -38,8 +38,14 @@ func TestStageHarnessInstructionsCopiesOnlyConventionalFiles(t *testing.T) {
 	if strings.Contains(string(settingsContent), "must not copy") {
 		t.Errorf("staged settings.json leaked host content: %s", settingsContent)
 	}
-	if string(settingsContent) != claudeHooksSettingsJSON {
-		t.Errorf("staged settings.json = %s, want BoxedAi-authored hook config %s", settingsContent, claudeHooksSettingsJSON)
+	if string(settingsContent) != claudeSettingsJSON {
+		t.Errorf("staged settings.json = %s, want BoxedAi-authored config %s", settingsContent, claudeSettingsJSON)
+	}
+	// The staged config must carry the acceptEdits permission default so a
+	// headless agent can write/edit without an interactive prompt (regression
+	// guard for the permission posture, not just the hook wiring).
+	if !strings.Contains(string(settingsContent), `"defaultMode": "acceptEdits"`) {
+		t.Errorf("staged settings.json missing acceptEdits permission default: %s", settingsContent)
 	}
 	settingsInfo, err := os.Stat(filepath.Join(destination, "settings.json"))
 	if err != nil {

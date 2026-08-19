@@ -1,5 +1,7 @@
 package recorder
 
+import "boxedai/internal/evidence"
+
 // SessionMeta carries the session-constant values the recorder stamps onto every
 // evidence record and into each segment manifest. It is supplied once at
 // NewRecorder and never mutated. Fields map to the audit.*/vm.* attribute namespaces
@@ -26,4 +28,12 @@ type SessionMeta struct {
 	// RecorderPubPEM is the recorder public key PKIX PEM, carried so the session
 	// can embed it in session.json as the verifier trust root.
 	RecorderPubPEM string
+	// HumanAccessBinding is the sealed human-access contract for a mediated
+	// session (nil for non-mediated sessions). The recorder reads it to
+	// authoritatively re-derive workspace mutation actor classes from host-owned
+	// data. Like the rest of SessionMeta it is supplied once and MUST NOT be
+	// mutated after construction: the same pointer is shared with session.json
+	// marshaling and guest provisioning, and revocation is tracked in side-state,
+	// never by flipping a field on this binding.
+	HumanAccessBinding *evidence.HumanAccessBinding
 }

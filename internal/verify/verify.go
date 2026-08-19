@@ -98,6 +98,11 @@ type Facets struct {
 	FileContentWithheld   int  `json:"file_content_withheld"`
 	FileContentMisses     int  `json:"file_content_misses"`
 	FileContentStoreValid bool `json:"file_content_store_valid"`
+	// WorkspaceMutationActorsValid is the host semantic invariant for mediated
+	// workspace evidence. Supervisor mutations are counted separately because they
+	// are structurally valid but operationally anomalous.
+	WorkspaceMutationActorsValid bool `json:"workspace_mutation_actors_valid"`
+	SupervisorWorkspaceMutations int  `json:"supervisor_workspace_mutation_count"`
 }
 
 // Check is one named verification step and its outcome (DESIGN "Verifier"
@@ -130,7 +135,8 @@ const (
 	stepOutput     = "output-manifest"
 	// stepContentStore re-resolves the unsigned per-session blob store against the
 	// signed file.changed digests (DESIGN "File content capture").
-	stepContentStore = "file-content-store"
+	stepContentStore            = "file-content-store"
+	stepWorkspaceMutationActors = "workspace-mutation-actors"
 )
 
 // segFiles bundles the three files that make up one sealed segment.
@@ -251,6 +257,8 @@ func Verify(sessionDir string) (Report, error) {
 	contentStore := checkFileContentStore(records, sessionDir)
 	contentStoreOK := !contentStore.tamper && !contentStore.incomplete
 
+	workspaceActorsOK, supervisorMutations, workspaceActorsDetail := checkWorkspaceMutationActors(records)
+
 	grantOK, grantDetail := checkSessionGrantBinding(sessionDir, g, records)
 	trustResult := checkTrustRecord(sessionDir, g, publicKey, segs, manifests, records)
 	trustOK := !trustResult.tamper && !trustResult.incomplete
@@ -271,6 +279,7 @@ func Verify(sessionDir string) (Report, error) {
 		{stepFlow, flowOK, flowDetail},
 		{stepOutput, outputOK, outputDetail},
 		{stepContentStore, contentStoreOK, contentStore.detail},
+		{stepWorkspaceMutationActors, workspaceActorsOK, workspaceActorsDetail},
 		{stepTrustRecord, trustOK, trustResult.detail},
 		{stepAgents, agentsOK, agentDetail},
 	}
@@ -299,6 +308,8 @@ func Verify(sessionDir string) (Report, error) {
 	rep.Facets.FileContentWithheld = contentStore.withheld
 	rep.Facets.FileContentMisses = contentStore.misses
 	rep.Facets.FileContentStoreValid = contentStore.storeValid
+	rep.Facets.WorkspaceMutationActorsValid = workspaceActorsOK
+	rep.Facets.SupervisorWorkspaceMutations = supervisorMutations
 	for _, c := range rep.Checks {
 		status := "ok"
 		if !c.Passed {
@@ -320,7 +331,7 @@ func Verify(sessionDir string) (Report, error) {
 		rep.Verdict = VerdictTamperSuspected
 	case !flowOK:
 		rep.Verdict = VerdictBypassDetected
-	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete || !agentsOK || contentStore.incomplete:
+	case !lifecycleOK || closeStatus != "sealed" || !sensorOK || hasUnsealedTail || trustResult.incomplete || !agentsOK || contentStore.incomplete || !workspaceActorsOK:
 		rep.Verdict = VerdictIncomplete
 	default:
 		rep.Verdict = VerdictLocalOnly

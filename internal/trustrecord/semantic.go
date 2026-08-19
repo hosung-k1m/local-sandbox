@@ -6,6 +6,14 @@ import (
 )
 
 func ValidateSemantics(record Record) error {
+	if record.Runtime.HumanAccess != nil {
+		if err := record.Runtime.HumanAccess.Validate(); err != nil {
+			return fmt.Errorf("trust record: human access binding: %w", err)
+		}
+		if record.Runtime.HumanAccess.SubjectMap.SessionID != record.Session.ID {
+			return fmt.Errorf("trust record: human access subject map does not match session")
+		}
+	}
 	if record.Policy.Digest != record.Artifacts.PolicyDigest {
 		return fmt.Errorf("trust record: policy digest does not match policy artifact digest")
 	}

@@ -133,6 +133,11 @@ func Run(ctx context.Context, opts Options) Result {
 	if err := writeCorporateConfig(inspected.caPEM); err != nil {
 		return failedResult("setup", opts.Arch, inspected.checks, "config_write_failed", "Could not write the BoxedAi host configuration: "+safeCause(err))
 	}
+	publicKey, publicPath, err := session.EnsureHumanSSHKeypair()
+	if err != nil {
+		return failedResult("setup", opts.Arch, inspected.checks, "human_ssh_key_failed", "Could not prepare the controller-owned human SSH keypair: "+safeCause(err))
+	}
+	fingerprint := session.HumanSSHPublicKeyFingerprint(publicKey)
 	emit(opts.Emit, "configure", "complete")
 
 	emit(opts.Emit, "image", "running")
@@ -147,6 +152,7 @@ func Run(ctx context.Context, opts Options) Result {
 
 	checks := append(inspected.checks,
 		Check{ID: "host_config", Status: "pass", Message: "Corporate CA and Block npm registry are configured."},
+		Check{ID: "human_ssh_key", Status: "pass", Message: fmt.Sprintf("Human SSH key fingerprint %s at %s.", fingerprint, publicPath)},
 		Check{ID: "golden_image", Status: "pass", Message: "Golden sandbox image is built and verified."},
 	)
 	return Result{
@@ -313,7 +319,7 @@ func manifestStatus(m image.Manifest, status string) *ImageStatus {
 }
 
 func imageMatchesConfig(m image.Manifest, caPEM string) bool {
-	return m.ExtraCADigest == digest(caPEM) && m.NPMRegistry == BlockNPMRegistry
+	return m.HWEKernel && m.ExtraCADigest == digest(caPEM) && m.NPMRegistry == BlockNPMRegistry
 }
 
 func digest(value string) string {

@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	cose "github.com/veraison/go-cose"
 	commonv1 "go.opentelemetry.io/proto/otlp/common/v1"
@@ -19,6 +20,7 @@ import (
 	"google.golang.org/protobuf/encoding/protodelim"
 
 	"boxedai/internal/evidence"
+	"boxedai/internal/trustrecord"
 )
 
 // The fixtures below are built entirely by hand from go-cose / protodelim (never
@@ -317,6 +319,55 @@ func happyEvents(outDigest string) []eventSpec {
 		{name: evidence.EventWorkspaceManifested, contentDigest: outDigest},
 		{name: evidence.EventSessionStopped},
 		{name: evidence.EventSessionSealed},
+	}
+}
+
+func TestVerify_IncompleteWorkspaceMutationActorInvariant(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		actor               evidence.MutationActorClass
+		wantSupervisorCount int
+		wantDetail          string
+	}{
+		{"unattributed actor", evidence.MutationActorUnattributed, 0, "invalid actor"},
+		{"supervisor anomaly", evidence.MutationActorSupervisor, 1, "supervisor workspace mutation"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			base := happyEvents(f.outDigest)
+			stopIdx := len(base) - 2
+			events := append([]eventSpec{}, base[:stopIdx]...)
+			events = append(events, eventSpec{
+				name:     evidence.EventWorkspaceMutated,
+				producer: string(evidence.ChannelGuestSupervisor),
+				class:    string(evidence.ClassKernelObserved),
+				attrs: map[string]any{
+					evidence.AttrMutationActorClass: string(tc.actor),
+				},
+			})
+			events = append(events, base[stopIdx:]...)
+			f.writeSegment(events)
+
+			rep, err := Verify(f.dir)
+			if err != nil {
+				t.Fatalf("Verify: %v", err)
+			}
+			if rep.Verdict != VerdictIncomplete {
+				t.Fatalf("verdict = %s, want INCOMPLETE\n%s", rep.Verdict, rep.String())
+			}
+			if checkPassed(rep, stepWorkspaceMutationActors) {
+				t.Fatal("workspace mutation actor check passed, want anomaly")
+			}
+			if rep.Facets.WorkspaceMutationActorsValid {
+				t.Fatal("WorkspaceMutationActorsValid = true, want false")
+			}
+			if rep.Facets.SupervisorWorkspaceMutations != tc.wantSupervisorCount {
+				t.Fatalf("SupervisorWorkspaceMutations = %d, want %d", rep.Facets.SupervisorWorkspaceMutations, tc.wantSupervisorCount)
+			}
+			if !strings.Contains(checkDetail(rep, stepWorkspaceMutationActors), tc.wantDetail) {
+				t.Fatalf("actor check detail = %q, want %q", checkDetail(rep, stepWorkspaceMutationActors), tc.wantDetail)
+			}
+		})
 	}
 }
 
@@ -881,6 +932,157 @@ func TestDeriveEvidenceClaimRejectsTraceIDMismatch(t *testing.T) {
 	}
 }
 
+// TestRederiveTrustRecordAcceptsMediatedHumanAccessBinding is the regression test
+// for the mediated-session false-tamper bug: trustrecord/build.go embeds the
+// grant's human_access binding into the signed record's runtime claim, but the
+// verifier's expected runtime claim never included it, so compareTrustClaim's
+// reflect.DeepEqual disagreed for every mediated session regardless of tampering.
+// A fully self-consistent mediated session must now rederive with zero problems.
+func TestRederiveTrustRecordAcceptsMediatedHumanAccessBinding(t *testing.T) {
+	dir := t.TempDir()
+
+	// The four sealed artifacts rederiveTrustRecord digests from disk. Only their
+	// exact bytes matter to deriveArtifacts; content is otherwise opaque.
+	sessionBytes := []byte("session-grant-bytes")
+	policyBytes := []byte("policy-bytes")
+	inputBytes := []byte("input-manifest-bytes")
+	outputBytes := []byte("output-manifest-bytes")
+	for name, data := range map[string][]byte{
+		"session.json":         sessionBytes,
+		"policy.json":          policyBytes,
+		"input-manifest.json":  inputBytes,
+		"output-manifest.json": outputBytes,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), data, 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	sessionDigest := evidence.SHA256Hex(sessionBytes)
+	policyDigest := evidence.SHA256Hex(policyBytes)
+	inputDigest := evidence.SHA256Hex(inputBytes)
+	outputDigest := evidence.SHA256Hex(outputBytes)
+
+	binding := &evidence.HumanAccessBinding{
+		Runtime: evidence.RuntimeCapabilityState{
+			WriteThroughLowerMount: true,
+			PrivateLowerMount:      true,
+			SetfsuidProbe:          true,
+			WritebackCacheDisabled: true,
+			PrivilegedFUSE:         true,
+			MediatedWriteOpen:      true,
+			HostReDerivation:       true,
+			UIDSeparation:          true,
+		},
+		SubjectMap: evidence.SessionSubjectMap{
+			SessionID: testSessionID,
+			Subjects: []evidence.SessionSubject{
+				{UID: evidence.WorkloadUID, ActorClass: evidence.MutationActorAgent},
+				{UID: evidence.HumanUID, ActorClass: evidence.MutationActorHuman, SubjectID: "operator-1", GrantID: "grant-1"},
+			},
+		},
+		Grant: evidence.HumanAccessGrant{
+			SessionID:        testSessionID,
+			GrantID:          "grant-1",
+			SubjectID:        "operator-1",
+			ExpiresAt:        time.Date(2026, time.August, 18, 12, 30, 0, 0, time.UTC),
+			AllowedSurfaces:  []evidence.AccessSurface{evidence.AccessSurfaceBrowserTerminal},
+			UID:              evidence.HumanUID,
+			CredentialDigest: "sha256:" + strings.Repeat("2", 64),
+		},
+	}
+
+	g := grant{
+		SessionID:           testSessionID,
+		TraceID:             "11111111111111111111111111111111",
+		Harness:             "exec",
+		Profile:             "develop",
+		CreatedAt:           "2026-08-10T00:00:00Z",
+		PolicyDigest:        policyDigest,
+		InputManifestDigest: inputDigest,
+		VMImage:             "boxedai-base-test",
+		VMImageDigest:       "sha256:" + strings.Repeat("9", 64),
+		HumanAccess:         binding,
+	}
+
+	// controllerAttrs builds the attribute set checkArtifactEventBindings and
+	// deriveEvidenceClaim expect from a controller-produced artifact-binding event.
+	controllerAttrs := func(contentDigest string, extra map[string]any) map[string]any {
+		attrs := map[string]any{
+			evidence.AttrSchemaVersion: evidence.SchemaVersion,
+			evidence.AttrSessionID:     g.SessionID,
+			evidence.AttrPolicyDigest:  g.PolicyDigest,
+			evidence.AttrProducer:      string(evidence.ChannelController),
+			evidence.AttrContentDigest: contentDigest,
+		}
+		for k, v := range extra {
+			attrs[k] = v
+		}
+		return attrs
+	}
+	records := []record{
+		{seq: 1, seg: 0, traceID: g.TraceID, name: evidence.EventSessionGranted, attrs: controllerAttrs(sessionDigest, nil)},
+		{seq: 2, seg: 0, traceID: g.TraceID, name: evidence.EventPolicyLoaded, attrs: controllerAttrs(policyDigest, nil)},
+		{seq: 3, seg: 0, traceID: g.TraceID, name: evidence.EventWorkspaceManifested, attrs: controllerAttrs(inputDigest, map[string]any{"workspace.phase": "input"})},
+		{seq: 4, seg: 0, traceID: g.TraceID, name: evidence.EventWorkspaceManifested, attrs: controllerAttrs(outputDigest, map[string]any{"workspace.phase": "output"})},
+	}
+
+	segmentBytes := []byte("sealed segment bytes")
+	otlpPath := filepath.Join(dir, "segment-000001.otlp")
+	manifestPath := filepath.Join(dir, "segment-000001.manifest.json")
+	if err := os.WriteFile(otlpPath, segmentBytes, 0o644); err != nil {
+		t.Fatalf("write otlp: %v", err)
+	}
+	if err := os.WriteFile(manifestPath, []byte("{}"), 0o644); err != nil {
+		t.Fatalf("write manifest: %v", err)
+	}
+	manifests := []segmentManifest{{
+		Schema: "boxedai.segment/v1", SessionID: g.SessionID, SegmentNumber: 1,
+		FirstSequence: 1, LastSequence: 4, RecordCount: 4,
+		SegmentDigest: evidence.SHA256Hex(segmentBytes), PolicyDigest: g.PolicyDigest,
+		SealedAt: "2026-08-10T00:00:01Z",
+	}}
+	segs := []segFiles{{number: 1, otlp: otlpPath, manifest: manifestPath}}
+
+	// artifacts/evidenceClaim/activityClaim are derived with the verifier's own
+	// functions, exactly as the rest of rederiveTrustRecord will re-derive them; this
+	// test's focus is the runtime/human-access claim, so every other claim is built to
+	// match rather than hand-duplicating unrelated derivation logic.
+	artifacts, err := deriveArtifacts(dir)
+	if err != nil {
+		t.Fatalf("deriveArtifacts: %v", err)
+	}
+	evidenceClaim, err := deriveEvidenceClaim(g, segs, manifests, records)
+	if err != nil {
+		t.Fatalf("deriveEvidenceClaim: %v", err)
+	}
+	activityClaim, err := deriveActivityClaim(records)
+	if err != nil {
+		t.Fatalf("deriveActivityClaim: %v", err)
+	}
+
+	signed := trustrecord.Record{
+		Schema:   trustrecord.Profile,
+		IssuedAt: "2026-08-10T00:00:02Z",
+		Session:  trustrecord.Session{ID: g.SessionID, TraceID: g.TraceID, Harness: g.Harness, CreatedAt: g.CreatedAt},
+		Runtime: trustrecord.Runtime{
+			Platform:    trustrecord.RuntimePlatformSoftware,
+			Isolation:   trustrecord.RuntimeIsolationLima,
+			Image:       trustrecord.RuntimeImage{Name: g.VMImage, Digest: g.VMImageDigest},
+			HumanAccess: g.HumanAccess, // exactly what build.go embeds for a mediated session
+		},
+		Origin:    trustrecord.Origin{Kind: trustrecord.OriginHostControlPlane, Producer: trustrecord.OriginProducerRecorder},
+		Policy:    trustrecord.Policy{Profile: g.Profile, Digest: g.PolicyDigest},
+		Artifacts: artifacts,
+		Evidence:  evidenceClaim,
+		Activity:  activityClaim,
+		Assurance: trustrecord.Assurance{Level: 0, VerdictCeiling: trustrecord.AssuranceVerdictLocalOnly},
+	}
+
+	if problems := rederiveTrustRecord(dir, g, signed, segs, manifests, records); len(problems) != 0 {
+		t.Fatalf("rederiveTrustRecord = %v, want zero problems for a self-consistent mediated session", problems)
+	}
+}
+
 func checkPassed(rep Report, name string) bool {
 	for _, c := range rep.Checks {
 		if c.Name == name {
@@ -888,4 +1090,13 @@ func checkPassed(rep Report, name string) bool {
 		}
 	}
 	return false
+}
+
+func checkDetail(rep Report, name string) string {
+	for _, check := range rep.Checks {
+		if check.Name == name {
+			return check.Detail
+		}
+	}
+	return ""
 }
