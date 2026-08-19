@@ -1360,6 +1360,16 @@ single-session viewer) carries the session's `state` marker
 session from a finished one without inferring it from the stream: a session killed
 before it could emit `session.stopped` leaves no such event to find, and every agent
 still open in it would otherwise read as running forever.
+The web client also derives conservative Bash-request/process navigation from the
+complete event list: the relationship joins workload-narrated HARNESS intent to
+independently observed KERNEL execution without raising either source's provenance
+or assurance ceiling. It recomputes the derived indexes from the full accumulated
+list after live deltas and fails closed when required Claude-root, guest-hook,
+command-wrapper, PID, or unique exec-ID evidence is missing, malformed, duplicated,
+or ambiguous. Linked rows retain their original evidence, eligible unlinked requests
+and executions receive explicit unmatched labels, and only exact reason-coded
+startup or hook shapes are presentation-exempt; show-everything always recovers
+those raw rows.
 `boxedai view <session> --web` remains the single-session viewer. Both viewers show overview header (session, policy,
 verdict), timeline table with class badges, event bodies and attributes, action
 and parent-action ids, process tree, file changes, network attempts, and tool

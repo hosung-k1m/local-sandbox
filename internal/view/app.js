@@ -269,21 +269,14 @@ function nameGroup(name) {
 
 var PROCESS_CREATED = "process.created";
 
-// GUEST_AGENT_BINARY_PATH/isGuestAgentBinaryExec mirror
-// internal/view/timeline.go's guestAgentBinaryPath/isGuestAgentBinaryExec for
-// the "Agent activity" preset (the include-set itself is served from Go as
-// ctx.agentActivityNames, see setSessionViewPayload). Claude Code invokes
-// hooks via a shell, so the common shape is process.binary=/bin/sh with the
-// full guest-agent path in process.argv, not process.binary itself; this
-// predicate — unlike the static name set — can't be served from the Go side
-// without a redundant per-event server-side flag, so it is mirrored by hand
-// here. Keep it in sync with timeline.go if either changes.
+// GUEST_AGENT_BINARY_PATH remains part of the exact derived taxonomy below.
+// isNoiseExemptExecution deliberately relies on the complete-event derived
+// taxonomy instead of generic binary or argv matching. This keeps unknown
+// process executions visible to the operator and makes each hidden exemption
+// auditable through its stable reason when they choose to show everything.
 var GUEST_AGENT_BINARY_PATH = "/usr/local/bin/boxedai-guest-agent";
-function isGuestAgentBinaryExec(ev) {
-  if (ev.name !== "process.executed") return false;
-  if (attrRaw(ev, "process.binary") === GUEST_AGENT_BINARY_PATH) return true;
-  var argv = attrRaw(ev, "process.argv");
-  return typeof argv === "string" && argv.indexOf(GUEST_AGENT_BINARY_PATH) !== -1;
+function isNoiseExemptExecution(model, ev) {
+  return model.executionClassification && model.executionClassification.get(ev.seq) === "noise-exempt";
 }
 
 // DIFF_MAX_LINES bounds how much of one unified diff is rendered. Diff text is
@@ -659,6 +652,490 @@ function corpusOf(ev, kvStr) {
     (ev.action_id || "") + " " + (ev.parent_action_id || "")).toLowerCase();
 }
 
+// deriveBashProcessLinks produces browser-only navigation metadata from the
+// complete raw event list. It deliberately retains the original event objects:
+// a HARNESS request remains workload narration and a KERNEL execution remains
+// independently observed evidence even when the narrow anchors below agree.
+function deriveBashProcessLinks(events) {
+  var requests = [];
+  var allExecutions = [];
+  var executionExemptions = new Map();
+  var executionsByExecID = new Map();
+  var executionsByPID = new Map();
+  var processCreations = [];
+
+  for (var i = 0; i < events.length; i++) {
+    var event = events[i];
+    var request = eligibleBashRequest(event);
+    if (request) {
+      request.index = i;
+      requests.push(request);
+    }
+
+    var creation = eligibleKernelProcessCreation(event);
+    if (creation) {
+      creation.index = i;
+      processCreations.push(creation);
+    }
+
+    var execution = eligibleKernelExecution(event);
+    if (!execution) continue;
+    execution.index = i;
+    allExecutions.push(execution);
+    if (execution.execID) {
+      if (executionsByExecID.has(execution.execID)) executionsByExecID.set(execution.execID, null);
+      else executionsByExecID.set(execution.execID, execution);
+    }
+    if (execution.pid !== null) {
+      var samePID = executionsByPID.get(execution.pid) || [];
+      samePID.push(execution);
+      executionsByPID.set(execution.pid, samePID);
+    }
+  }
+
+  allExecutions.forEach(function (execution) {
+    var exemption = guestHookExemptionReason(execution, executionsByExecID);
+    if (exemption) executionExemptions.set(execution.event.seq, exemption);
+  });
+  var executions = allExecutions.filter(function (execution) {
+    return !executionExemptions.has(execution.event.seq);
+  });
+
+  requests.forEach(function (request) {
+    request.anchor = bashRequestAnchor(request, executionsByExecID, executionsByPID);
+  });
+
+  var requestCandidates = new Map();
+  var requestWindows = new Map();
+  var executionCandidates = new Map();
+  requests.forEach(function (request, requestIndex) {
+    var nextRequestIndex = nextRequestWithAnchor(requests, requestIndex);
+    requestWindows.set(request.event.seq, nextRequestIndex);
+    if (!request.anchor) return;
+    executions.forEach(function (execution) {
+      if (execution.index <= request.index || execution.index >= nextRequestIndex) return;
+      if (!execution.rootCandidate) return;
+      if (!isUniqueExecution(execution, executionsByExecID)) return;
+      if (!matchesBashRequest(request, execution)) return;
+      var candidates = requestCandidates.get(request.event.seq) || [];
+      candidates.push(execution);
+      requestCandidates.set(request.event.seq, candidates);
+    });
+  });
+
+  // A request window bounds its forward candidates so sequential identical
+  // commands can be distinguished. The reverse side must still retain every
+  // matching request since the prior matching execution: otherwise two
+  // identical requests that overlap before one execution would let the later
+  // request look uniquely supported merely because the earlier one has no
+  // forward candidate of its own.
+  executions.forEach(function (execution) {
+    if (!isUniqueExecution(execution, executionsByExecID)) return;
+    var executionKey = bashExecutionMatchKey(execution);
+    if (!executionKey) return;
+    var reverse = [];
+    var priorExecution = null;
+    executions.forEach(function (candidate) {
+      if (candidate.index >= execution.index || bashExecutionMatchKey(candidate) !== executionKey) return;
+      if (!priorExecution || candidate.index > priorExecution.index) priorExecution = candidate;
+    });
+    requests.forEach(function (request) {
+      if (request.index >= execution.index || !request.anchor) return;
+      if (priorExecution && request.index <= priorExecution.index) return;
+      if (bashRequestMatchKey(request) === executionKey) reverse.push(request);
+    });
+    if (reverse.length) executionCandidates.set(execution.event.seq, reverse);
+  });
+
+  var requestLinks = new Map();
+  var executionLinks = new Map();
+  requests.forEach(function (request) {
+    var candidates = requestCandidates.get(request.event.seq) || [];
+    if (candidates.length !== 1) return;
+    var execution = candidates[0];
+    if ((executionCandidates.get(execution.event.seq) || []).length !== 1) return;
+    requestLinks.set(request.event.seq, {
+      executionSeq: execution.event.seq,
+      argv: claudeWrapperCommand(execution) || execution.argv,
+      matchBasis: request.anchor.basis,
+    });
+    executionLinks.set(execution.event.seq, request.event.seq);
+    linkBashExecutionDescendants(
+      execution,
+      request,
+      requestWindows.get(request.event.seq),
+      executions,
+      processCreations,
+      executionExemptions,
+      executionLinks,
+      executionsByExecID,
+    );
+  });
+
+  var startupExemptions = startupNoiseExemptions(allExecutions, processCreations, requestLinks, executionsByExecID);
+  startupExemptions.forEach(function (reason, seq) {
+    executionExemptions.set(seq, reason);
+  });
+  var executionClassification = new Map();
+  allExecutions.forEach(function (execution) {
+    executionClassification.set(execution.event.seq,
+      executionLinks.has(execution.event.seq) ? "matched" : "unmatched");
+  });
+  executionExemptions.forEach(function (_, seq) {
+    executionClassification.set(seq, "noise-exempt");
+  });
+  return {
+    requestLinks: requestLinks,
+    executionLinks: executionLinks,
+    executionClassification: executionClassification,
+    executionExemptions: executionExemptions,
+  };
+}
+
+function eligibleBashRequest(event) {
+  if (!event || event.name !== "tool.requested" || event.class !== "harness_observed" ||
+      event.badge !== "HARNESS" || event.producer !== "workload") return null;
+  if (attrRaw(event, "tool.name") !== "Bash") return null;
+  var input = attrRaw(event, "harness.tool.input");
+  if (typeof input !== "string") return null;
+  try {
+    var parsed = JSON.parse(input);
+    if (!parsed || typeof parsed.command !== "string" || parsed.command === "") return null;
+    var parentPID = positiveInteger(attrRaw(event, "process.parent_pid"));
+    var pid = positiveInteger(attrRaw(event, "process.pid"));
+    return {
+      event: event,
+      command: parsed.command,
+      parentPID: parentPID,
+      pid: pid,
+    };
+  } catch (_) {
+    return null;
+  }
+}
+
+function eligibleKernelExecution(event) {
+  if (!event || event.name !== "process.executed" || event.class !== "kernel_observed" ||
+      event.badge !== "KERNEL" || event.producer !== "guest_supervisor") return null;
+  var argv = attrRaw(event, "process.argv");
+  var parentPID = positiveInteger(attrRaw(event, "process.parent_pid"));
+  var parentExecID = attrRaw(event, "process.parent_exec_id");
+  var execID = attrRaw(event, "process.exec.id");
+  var pid = positiveInteger(attrRaw(event, "process.pid"));
+  var binary = attrRaw(event, "process.binary");
+  var hasArgv = typeof argv === "string" && argv !== "";
+  var validDescendantIdentity = typeof binary === "string" && binary !== "" &&
+    pid !== null && parentPID !== null && typeof parentExecID === "string" && parentExecID !== "" &&
+    typeof execID === "string" && execID !== "";
+  if (!hasArgv && !validDescendantIdentity) return null;
+  return {
+    event: event,
+    argv: hasArgv ? argv : "",
+    parentPID: parentPID,
+    parentExecID: parentExecID,
+    execID: typeof execID === "string" && execID !== "" ? execID : "",
+    pid: pid,
+    binary: typeof binary === "string" ? binary : "",
+    rootCandidate: hasArgv,
+  };
+}
+
+function eligibleKernelProcessCreation(event) {
+  if (!event || event.name !== PROCESS_CREATED || event.class !== "kernel_observed" ||
+      event.badge !== "KERNEL" || event.producer !== "guest_supervisor") return null;
+  var pid = positiveInteger(attrRaw(event, "process.pid"));
+  var parentPID = positiveInteger(attrRaw(event, "process.parent_pid"));
+  var parentExecID = attrRaw(event, "process.parent_exec_id");
+  if (pid === null || parentPID === null || typeof parentExecID !== "string" || parentExecID === "") return null;
+  return {
+    event: event,
+    pid: pid,
+    parentPID: parentPID,
+    parentExecID: parentExecID,
+  };
+}
+
+function positiveInteger(value) {
+  if (typeof value === "number" && isFinite(value) && Math.floor(value) === value && value > 0) return value;
+  if (typeof value === "string" && /^\d+$/.test(value) && Number(value) > 0) return Number(value);
+  return null;
+}
+
+function isUniqueExecution(execution, executionsByExecID) {
+  return !!execution && execution.execID !== "" && executionsByExecID.get(execution.execID) === execution;
+}
+
+function bashRequestAnchor(request, executionsByExecID, executionsByPID) {
+  if (request.pid === null || request.parentPID === null) return null;
+  var hooks = (executionsByPID.get(request.pid) || []).filter(function (execution) {
+    return isUniqueExecution(execution, executionsByExecID) && execution.binary === GUEST_AGENT_BINARY_PATH &&
+      guestHookName(execution.argv) &&
+      execution.parentPID === request.parentPID;
+  });
+  if (hooks.length !== 1) return null;
+  var wrapper = executionsByExecID.get(hooks[0].parentExecID);
+  var hookName = guestHookName(hooks[0].argv);
+  if (!wrapper || hooks[0].parentPID !== wrapper.pid ||
+      !isGuestHookWrapper(wrapper, hookName, executionsByExecID)) return null;
+  return {
+    key: "hook:" + wrapper.parentExecID,
+    basis: "guest_hook_lineage+claude_parent_exec_id+exact_claude_eval_command",
+  };
+}
+
+function nextRequestWithAnchor(requests, requestIndex) {
+  var request = requests[requestIndex];
+  for (var i = requestIndex + 1; i < requests.length; i++) {
+    if (request.anchor && requests[i].anchor && requests[i].anchor.key === request.anchor.key) return requests[i].index;
+  }
+  return Infinity;
+}
+
+function bashRequestMatchKey(request) {
+  return request.anchor ? request.anchor.key + ":" + request.command : "";
+}
+
+function bashExecutionMatchKey(execution) {
+  var command = claudeWrapperCommand(execution);
+  if (command !== "") return "hook:" + execution.parentExecID + ":" + command;
+  return "";
+}
+
+function matchesBashRequest(request, execution) {
+  return bashRequestMatchKey(request) !== "" && bashRequestMatchKey(request) === bashExecutionMatchKey(execution);
+}
+
+function claudeWrapperCommand(execution) {
+  if (execution.binary !== "/bin/bash" || !execution.parentExecID) return "";
+  var prefix = "-c \"source /home/agent/.claude/shell-snapshots/snapshot-bash-";
+  var delimiter = ".sh 2>/dev/null || true && shopt -u extglob 2>/dev/null || true && { \\builtin unalias -- 'unsetenv'; \\builtin unset -f -- 'unsetenv'; } >/dev/null 2>&1 || true && eval '";
+  var suffix = "' < /dev/null && pwd -P >| /tmp/claude-";
+  if (execution.argv.indexOf(prefix) !== 0) return "";
+  var start = execution.argv.indexOf(delimiter, prefix.length);
+  if (start < 0) return "";
+  if (!/^[0-9]+-[a-z0-9]+$/.test(execution.argv.slice(prefix.length, start))) return "";
+  start += delimiter.length;
+  var end = execution.argv.lastIndexOf(suffix);
+  if (end < start || !/^[0-9a-f]{4}-cwd\"$/.test(execution.argv.slice(end + suffix.length))) return "";
+  var encodedCommand = execution.argv.slice(start, end);
+  var command = encodedCommand.replace(/'\"'\"'/g, "'");
+  return command.replace(/'/g, "'\"'\"'") === encodedCommand ? command : "";
+}
+
+function linkBashExecutionDescendants(execution, request, upperBound, executions, processCreations, executionExemptions, executionLinks, executionsByExecID) {
+  traverseExecutionDescendants(execution, upperBound, executions, processCreations, executionsByExecID, function (child) {
+    if (!executionExemptions.has(child.event.seq)) executionLinks.set(child.event.seq, request.event.seq);
+  });
+}
+
+function traverseExecutionDescendants(root, upperBound, executions, processCreations, executionsByExecID, visit) {
+  if (!isUniqueExecution(root, executionsByExecID) || root.pid === null) return;
+  var linkedByExecID = new Map([[root.execID, root]]);
+  var establishedCreations = new Map();
+  var changed = true;
+  while (changed) {
+    changed = false;
+    executions.forEach(function (child) {
+      if (child.index <= root.index || child.index >= upperBound || !isUniqueExecution(child, executionsByExecID) || linkedByExecID.has(child.execID)) return;
+      var parent = linkedByExecID.get(child.parentExecID);
+      if (!parent || child.parentPID !== parent.pid) return;
+      linkedByExecID.set(child.execID, child);
+      changed = true;
+    });
+    processCreations.forEach(function (creation) {
+      if (creation.index <= root.index || creation.index >= upperBound) return;
+      var parent = linkedByExecID.get(creation.parentExecID);
+      if (parent && parent.pid === creation.parentPID) {
+        if (establishedCreations.get(creation.event.seq) !== parent) {
+          establishedCreations.set(creation.event.seq, parent);
+          changed = true;
+        }
+        return;
+      }
+      var parentCreation = latestCreationForPID(
+        creation.parentPID,
+        root.index,
+        creation.index,
+        processCreations,
+      );
+      var owner = parentCreation && establishedCreations.get(parentCreation.event.seq);
+      if (!owner || establishedCreations.get(creation.event.seq) === owner) return;
+      establishedCreations.set(creation.event.seq, owner);
+      changed = true;
+    });
+    executions.forEach(function (child) {
+      if (child.index <= root.index || child.index >= upperBound || !isUniqueExecution(child, executionsByExecID) || linkedByExecID.has(child.execID)) return;
+      var parent = createdParentExecution(child, root.index, upperBound, processCreations, establishedCreations);
+      if (!parent) return;
+      linkedByExecID.set(child.execID, child);
+      changed = true;
+    });
+  }
+  executions.forEach(function (child) {
+    if (child.index <= root.index || child.index >= upperBound || !isUniqueExecution(child, executionsByExecID) ||
+        child.execID === root.execID || !linkedByExecID.has(child.execID)) return;
+    var parent = linkedByExecID.get(child.parentExecID);
+    var throughCreation = false;
+    if (!parent || child.parentPID !== parent.pid) {
+      parent = createdParentExecution(child, root.index, upperBound, processCreations, establishedCreations);
+      throughCreation = !!parent;
+    }
+    if (parent) visit(child, throughCreation, parent);
+  });
+}
+
+function latestCreationForPID(pid, lowerBound, upperBound, processCreations) {
+  var latest = null;
+  processCreations.forEach(function (creation) {
+    if (creation.index <= lowerBound || creation.index >= upperBound || creation.pid !== pid) return;
+    if (!latest || creation.index > latest.index) latest = creation;
+  });
+  return latest;
+}
+
+function createdParentExecution(child, lowerBound, upperBound, processCreations, establishedCreations) {
+  var exact = [];
+  processCreations.forEach(function (creation) {
+    if (creation.index <= lowerBound || creation.index >= upperBound || creation.index >= child.index ||
+        creation.pid !== child.pid || creation.parentPID !== child.parentPID ||
+        creation.parentExecID !== child.parentExecID) return;
+    exact.push(creation);
+  });
+  if (exact.length !== 1) return null;
+  return establishedCreations.get(exact[0].event.seq) || null;
+}
+
+function startupNoiseExemptions(executions, processCreations, requestLinks, executionsByExecID) {
+  var firstMatchedIndex = Infinity;
+  requestLinks.forEach(function (link) {
+    executions.forEach(function (execution) {
+      if (execution.event.seq === link.executionSeq && execution.index < firstMatchedIndex) firstMatchedIndex = execution.index;
+    });
+  });
+  if (firstMatchedIndex === Infinity || !executions.length) return new Map();
+  var root = executions[0];
+  if (!isClaudeStartupRoot(root) || root.index >= firstMatchedIndex) return new Map();
+  var exemptions = new Map([[root.event.seq, "claude_startup_root"]]);
+  traverseExecutionDescendants(root, firstMatchedIndex, executions, processCreations, executionsByExecID, function (child, _, parent) {
+    var reason = startupNoiseReason(child, parent);
+    if (reason) exemptions.set(child.event.seq, reason);
+  });
+  return exemptions;
+}
+
+function isClaudeStartupRoot(execution) {
+  return execution.binary === "/usr/local/bin/claude" &&
+    execution.argv === "--debug-file /home/agent/.claude/debug/claude-code.log" &&
+    execution.pid !== null && execution.parentPID === execution.pid && execution.execID !== "";
+}
+
+function startupNoiseReason(execution, parent) {
+  var gitProbes = [
+    "--no-optional-locks status --short",
+    "--no-optional-locks log --oneline -n 5",
+    "config user.name",
+    "-c core.hooksPath=/dev/null -c core.fsmonitor= remote get-url origin",
+    "-c core.hooksPath=/dev/null -c core.fsmonitor= config --get user.email",
+    "-c core.hooksPath=/dev/null -c core.fsmonitor= config --get remote.origin.url",
+    "log -n 1000 --pretty=format: --name-only --diff-filter=M",
+    "-c core.hooksPath=/dev/null -c core.fsmonitor= remote get-url --push origin",
+    "-c core.quotepath=false ls-files --recurse-submodules",
+    "-c core.quotepath=false ls-files --others --exclude-standard",
+  ];
+  if (parent && parent.binary === "/usr/local/bin/claude" &&
+      parent.argv === "--debug-file /home/agent/.claude/debug/claude-code.log") {
+    if (execution.binary === "/usr/bin/git" && gitProbes.indexOf(execution.argv) >= 0) return "claude_startup_git_probe";
+    if (execution.binary === "/usr/local/bin/claude" && [
+      "--version",
+      "--no-config --files --hidden --no-ignore --max-depth 4 --glob .orphaned_at /home/agent/.claude/plugins/cache",
+      "--no-config --files --hidden /workspace",
+    ].indexOf(execution.argv) >= 0) return "claude_startup_claude_probe";
+    if (execution.binary === "/usr/bin/dpkg" && execution.argv === "-S /usr/local/bin/claude") return "claude_startup_dpkg_probe";
+    if (isStartupIDEProbe(execution)) return "claude_startup_ide_probe";
+    if (execution.binary === "/bin/bash" && execution.argv === "-c env") return "claude_startup_env_probe";
+    if (isStartupSnapshotBuilder(execution)) return "claude_startup_snapshot_builder";
+  }
+  if (parent && parent.binary === "/usr/bin/dpkg" &&
+      execution.binary === "/usr/bin/dpkg-query" && execution.argv === "--search -- /usr/local/bin/claude") return "claude_startup_dpkg_child";
+  if (parent && isStartupIDEProbe(parent) && (
+    execution.binary === "/usr/bin/ps" && execution.argv === "aux" ||
+    execution.binary === "/usr/bin/grep" && [
+      "-v grep",
+      "-E code|cursor|windsurf|devin-desktop|idea|pycharm|webstorm|phpstorm|rubymine|clion|goland|rider|datagrip|dataspell|aqua|gateway|fleet|android-studio",
+    ].indexOf(execution.argv) >= 0
+  )) return "claude_startup_ide_child";
+  if (parent && parent.binary === "/bin/bash" && parent.argv === "-c env" &&
+      execution.binary === "/usr/bin/env" && execution.argv === "") return "claude_startup_env_child";
+  if (parent && isStartupSnapshotBuilder(parent)) {
+    if (execution.argv === "" && ["/usr/bin/locale", "/usr/bin/base64", "/usr/bin/cat"].indexOf(execution.binary) >= 0) return "claude_startup_snapshot_child";
+    if ([
+      "/usr/bin/locale-check:C.UTF-8",
+      "/usr/bin/grep:-vE ^_[^_]",
+      "/usr/bin/cut: \"-d \" -f3",
+      "/usr/bin/head:-n 1000",
+      "/usr/bin/grep:on",
+      "/usr/bin/awk: \"{print \"set -o \" $1}\"",
+      "/usr/bin/sed: \"s/^alias //g\"",
+      "/usr/bin/sed: \"s/^/alias -- /\"",
+    ].indexOf(execution.binary + ":" + execution.argv) >= 0) return "claude_startup_snapshot_child";
+  }
+  return "";
+}
+
+function isStartupIDEProbe(execution) {
+  return execution.binary === "/bin/sh" && execution.argv ===
+    "-c \"ps aux | grep -E \"code|cursor|windsurf|devin-desktop|idea|pycharm|webstorm|phpstorm|rubymine|clion|goland|rider|datagrip|dataspell|aqua|gateway|fleet|android-studio\" | grep -v grep\"";
+}
+
+var STARTUP_SNAPSHOT_BUILDER_TEMPLATE = "-c -l \"SNAPSHOT_FILE=/home/agent/.claude/shell-snapshots/snapshot-bash-<id>.sh\n      source \"/home/agent/.bashrc\" < /dev/null\n\n      # First, create/clear the snapshot file\n      echo \"# Snapshot file\" >| \"$SNAPSHOT_FILE\"\n\n      # When this file is sourced, we first unalias to avoid conflicts\n      # This is necessary because aliases get \"frozen\" inside function definitions at definition time,\n      # which can cause unexpected behavior when functions use commands that conflict with aliases\n      echo \"# Unset all aliases to avoid conflicts with functions\" >> \"$SNAPSHOT_FILE\"\n      echo \"unalias -a 2>/dev/null || true\" >> \"$SNAPSHOT_FILE\"\n\n      \n      echo \"# Functions\" >> \"$SNAPSHOT_FILE\"\n\n      # Force autoload all functions first\n      declare -f > /dev/null 2>&1\n\n      # Now get user function names - filter completion functions (single underscore prefix)\n      # but keep double-underscore helpers (e.g. __zsh_like_cd from mise, __pyenv_init)\n      declare -F | cut -d' ' -f3 | grep -vE '^_[^_]' | while read func; do\n        # Encode the function to base64, preserving all special characters\n        encoded_func=$(declare -f \"$func\" | base64 )\n        # Write the function definition to the snapshot\n        echo \"eval \\\"\\$(echo '$encoded_func' | base64 -d)\\\" > /dev/null 2>&1\" >> \"$SNAPSHOT_FILE\"\n      done\n    \n      echo \"# Shell Options\" >> \"$SNAPSHOT_FILE\"\n      shopt -p | head -n 1000 >> \"$SNAPSHOT_FILE\"\n      set -o | grep \"on\" | awk '{print \"set -o \" $1}' | head -n 1000 >> \"$SNAPSHOT_FILE\"\n      echo \"shopt -s expand_aliases\" >> \"$SNAPSHOT_FILE\"\n    \n      echo \"# Aliases\" >> \"$SNAPSHOT_FILE\"\n      # Filter out winpty aliases on Windows to avoid \"stdin is not a tty\" errors\n      # Git Bash automatically creates aliases like \"alias node='winpty node.exe'\" for\n      # programs that need Win32 Console in mintty, but winpty fails when there's no TTY\n      if [[ \"$OSTYPE\" == \"msys\" ]] || [[ \"$OSTYPE\" == \"cygwin\" ]]; then\n        alias | grep -v \"='winpty \" | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> \"$SNAPSHOT_FILE\"\n      else\n        alias | sed 's/^alias //g' | sed 's/^/alias -- /' | head -n 1000 >> \"$SNAPSHOT_FILE\"\n      fi\n  \n\n      \n      # Check for rg availability\n      echo \"# Check for rg availability\" >> \"$SNAPSHOT_FILE\"\n      echo \"if ! (unalias rg 2>/dev/null; command -v rg) >/dev/null 2>&1; then\" >> \"$SNAPSHOT_FILE\"\n  \n      cat >> \"$SNAPSHOT_FILE\" << 'RIPGREP_FUNC_END'\n  function rg {\n  local _cc_bin=\"${CLAUDE_CODE_EXECPATH:-}\"\n  [[ -x $_cc_bin ]] || _cc_bin=/home/agent/.local/bin/claude\n  if [[ ! -x $_cc_bin ]]; then command rg ${1+\"$@\"}; return; fi\n  if [[ -n ${ZSH_VERSION:-} ]]; then\n    ARGV0=rg \"$_cc_bin\" ${1+\"$@\"}\n  elif [[ \"$OSTYPE\" == \"msys\" ]] || [[ \"$OSTYPE\" == \"cygwin\" ]] || [[ \"$OSTYPE\" == \"win32\" ]]; then\n    ARGV0=rg \"$_cc_bin\" ${1+\"$@\"}\n  else\n    (exec -a rg \"$_cc_bin\" ${1+\"$@\"})\n  fi\n}\nRIPGREP_FUNC_END\n    \n      echo \"fi\" >> \"$SNAPSHOT_FILE\"\n  \n      # Shadow find/grep with embedded bfs/ugrep (ant-native only)\n      echo \"# Shadow find/grep with embedded bfs/ugrep\" >> \"$SNAPSHOT_FILE\"\n      cat >> \"$SNAPSHOT_FILE\" << 'FIND_GREP_FUNC_END'\nunalias find 2>/dev/null || true\nunalias grep 2>/dev/null || true\nfunction find {\n  local _cc_bin=\"${CLAUDE_CODE_EXECPATH:-}\"\n  [[ -x $_cc_bin ]] || _cc_bin=/home/agent/.local/bin/claude\n  if [[ ! -x $_cc_bin ]]; then command find ${1+\"$@\"}; return; fi\n  if [[ -n ${ZSH_VERSION:-} ]]; then\n    ARGV0=bfs \"$_cc_bin\" -S dfs -regextype findutils-default ${1+\"$@\"}\n  elif [[ \"$OSTYPE\" == \"msys\" ]] || [[ \"$OSTYPE\" == \"cygwin\" ]] || [[ \"$OSTYPE\" == \"win32\" ]]; then\n    ARGV0=bfs \"$_cc_bin\" -S dfs -regextype findutils-default ${1+\"$@\"}\n  else\n    (exec -a bfs \"$_cc_bin\" -S dfs -regextype findutils-default ${1+\"$@\"})\n  fi\n}\nfunction grep {\n  local _cc_a\n  for _cc_a in ${1+\"$@\"}; do\n    case \"$_cc_a\" in -*-filter*|-*-pager*|-*-view*|-*-format-open*|-*-config*|---*|-@*|-*-save-config*|-[Zz]*|-[!-]*[Zz]*|--null|--null-data) command grep ${1+\"$@\"}; return ;; esac\n  done\n  local _cc_bin=\"${CLAUDE_CODE_EXECPATH:-}\"\n  [[ -x $_cc_bin ]] || _cc_bin=/home/agent/.local/bin/claude\n  if [[ ! -x $_cc_bin ]]; then command grep ${1+\"$@\"}; return; fi\n  if [[ -n ${ZSH_VERSION:-} ]]; then\n    ARGV0=ugrep \"$_cc_bin\" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl ${1+\"$@\"}\n  elif [[ \"$OSTYPE\" == \"msys\" ]] || [[ \"$OSTYPE\" == \"cygwin\" ]] || [[ \"$OSTYPE\" == \"win32\" ]]; then\n    ARGV0=ugrep \"$_cc_bin\" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl ${1+\"$@\"}\n  else\n    (exec -a ugrep \"$_cc_bin\" -G --ignore-files --hidden -I --exclude-dir=.git --exclude-dir=.svn --exclude-dir=.hg --exclude-dir=.bzr --exclude-dir=.jj --exclude-dir=.sl ${1+\"$@\"})\n  fi\n}\nFIND_GREP_FUNC_END\n    \n      echo \"# Shadow pkill to refuse patterns matching the CLI process\" >> \"$SNAPSHOT_FILE\"\n      cat >> \"$SNAPSHOT_FILE\" << 'PKILL_FUNC_END'\nunalias pkill 2>/dev/null || true\nfunction pkill {\n  if [ -n \"${CLAUDE_PID:-}\" ] && [ -r \"/proc/${CLAUDE_PID}/comm\" ]; then\n    local _cc_skip=\"\" _cc_a\n    local -a _cc_probe=()\n    for _cc_a in ${1+\"$@\"}; do\n      if [ -n \"$_cc_skip\" ]; then _cc_skip=\"\"; continue; fi\n      case \"$_cc_a\" in\n        --signal) _cc_skip=1 ;;\n        --signal=*|-e|--echo) ;;\n        -[0-9]*) ;;\n        -[PUGOF]?*) _cc_probe+=(\"$_cc_a\") ;;\n        -[ABCDEFGHIJKLMNOPQRSTUVWXYZ][ABCDEFGHIJKLMNOPQRSTUVWXYZ0-9]*) ;;\n        *) _cc_probe+=(\"$_cc_a\") ;;\n      esac\n    done\n    if command pgrep ${_cc_probe[@]+\"${_cc_probe[@]}\"} 2>/dev/null | command grep -qx \"${CLAUDE_PID}\"; then\n      printf 'pkill: refusing to run — this pattern matches the Claude CLI process (PID %s). Narrow the pattern, or target your own children with `pkill -P $$ ...`.\\n' \"${CLAUDE_PID}\" >&2\n      return 1\n    fi\n  fi\n  command pkill ${1+\"$@\"}\n}\nPKILL_FUNC_END\n    \n\n      # Add PATH to the file\n      cat >> \"$SNAPSHOT_FILE\" << 'PATH_END_<id>'\nexport PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin\nPATH_END_<id>\n  \n\n      # Exit silently on success, only report errors\n      if [ ! -f \"$SNAPSHOT_FILE\" ]; then\n        echo \"Error: Snapshot file was not created at $SNAPSHOT_FILE\" >&2\n        exit 1\n      fi\n    \"";
+
+function isStartupSnapshotBuilder(execution) {
+  if (execution.binary !== "/bin/bash") return false;
+  var snapshotTokens = execution.argv.match(/snapshot-bash-[0-9]+-[a-z0-9]+\.sh/g) || [];
+  var pathEndTokens = execution.argv.match(/PATH_END_[a-z0-9]+/g) || [];
+  if (snapshotTokens.length !== 1 || pathEndTokens.length !== 2 ||
+      pathEndTokens[0] !== pathEndTokens[1]) return false;
+  var grammar = execution.argv
+    .replace(snapshotTokens[0], "snapshot-bash-<id>.sh")
+    .replace(/PATH_END_[a-z0-9]+/g, "PATH_END_<id>");
+  return grammar === STARTUP_SNAPSHOT_BUILDER_TEMPLATE;
+}
+function guestHookExemptionReason(execution, executionsByExecID) {
+  if (!isUniqueExecution(execution, executionsByExecID)) return "";
+  var hookName = guestHookName(execution.argv);
+  var wrapper = executionsByExecID.get(execution.parentExecID);
+  if (execution.binary === GUEST_AGENT_BINARY_PATH && hookName && wrapper &&
+      execution.parentPID === wrapper.pid && isGuestHookWrapper(wrapper, hookName, executionsByExecID)) {
+    return "boxedai_guest_agent_" + hookName;
+  }
+
+  var wrapperHookName = guestHookNameFromWrapperArgv(execution.argv);
+  if (isGuestHookWrapper(execution, wrapperHookName, executionsByExecID)) {
+    return "boxedai_guest_agent_" + wrapperHookName + "_shell_wrapper";
+  }
+
+  return "";
+}
+
+function guestHookName(argv) {
+  return argv === "agenthook" ? "agenthook" : argv === "lefthook" ? "lefthook" : argv === "righthook" ? "righthook" : "";
+}
+
+function guestHookNameFromWrapperArgv(argv) {
+  if (argv === "-c \"/usr/local/bin/boxedai-guest-agent agenthook\"") return "agenthook";
+  if (argv === "-c \"/usr/local/bin/boxedai-guest-agent lefthook\"") return "lefthook";
+  if (argv === "-c \"/usr/local/bin/boxedai-guest-agent righthook\"") return "righthook";
+  return "";
+}
+
+function isGuestHookWrapper(execution, hookName, executionsByExecID) {
+  if (!isUniqueExecution(execution, executionsByExecID) || !hookName || execution.binary !== "/bin/sh") return false;
+  if (execution.argv !== "-c \"/usr/local/bin/boxedai-guest-agent " + hookName + "\"") return false;
+  var parent = executionsByExecID.get(execution.parentExecID);
+  return isUniqueExecution(parent, executionsByExecID) && execution.parentPID === parent.pid && parent.binary === "/usr/local/bin/claude" &&
+    parent.argv === "--debug-file /home/agent/.claude/debug/claude-code.log";
+}
+
 // buildModel precomputes, once per payload load, the per-event data the filter
 // engine and renderers need so no render pass re-derives it: a lowercased
 // search corpus and a formatted clock label, as parallel arrays indexed like
@@ -676,12 +1153,22 @@ function buildModel(events) {
     tsLabel[i] = fmtClock(ev.ts);
     bySeq.set(ev.seq, i);
   }
-  return { events: events, corpus: corpus, tsLabel: tsLabel, bySeq: bySeq };
+  var bashLinks = deriveBashProcessLinks(events);
+  return {
+    events: events,
+    corpus: corpus,
+    tsLabel: tsLabel,
+    bySeq: bySeq,
+    requestLinks: bashLinks.requestLinks,
+    executionLinks: bashLinks.executionLinks,
+    executionClassification: bashLinks.executionClassification,
+    executionExemptions: bashLinks.executionExemptions,
+  };
 }
 
-// extendModel appends derived fields for newly-arrived tail events onto an
-// existing model in place (the live-refresh append-only path), avoiding a
-// full O(n) recompute of unchanged rows.
+// extendModel appends row-local fields for newly-arrived tail events, then
+// rebuilds the full derived link indexes. A new execution can resolve an older
+// request, so append-only correlation would leave the presentation stale.
 function extendModel(model, events) {
   for (var i = model.events.length; i < events.length; i++) {
     var ev = events[i];
@@ -690,6 +1177,36 @@ function extendModel(model, events) {
     model.bySeq.set(ev.seq, i);
   }
   model.events = events;
+  var bashLinks = deriveBashProcessLinks(events);
+  model.requestLinks = bashLinks.requestLinks;
+  model.executionLinks = bashLinks.executionLinks;
+  model.executionClassification = bashLinks.executionClassification;
+  model.executionExemptions = bashLinks.executionExemptions;
+}
+
+// derivedTimelineStateChanged compares only the browser-owned presentation
+// indexes for rows that already existed before a live delta. When a new
+// execution resolves or invalidates an earlier request, the tail append path
+// must yield to a full render so the existing row does not retain stale text.
+function derivedTimelineStateChanged(previous, model, priorEvents) {
+  for (var i = 0; i < priorEvents.length; i++) {
+    var seq = priorEvents[i].seq;
+    var previousLink = previous.requestLinks && previous.requestLinks.get(seq);
+    var nextLink = model.requestLinks && model.requestLinks.get(seq);
+    if (!!previousLink !== !!nextLink || previousLink &&
+        (previousLink.executionSeq !== nextLink.executionSeq ||
+         previousLink.argv !== nextLink.argv ||
+         previousLink.matchBasis !== nextLink.matchBasis)) return true;
+
+    var previousClassification = previous.executionClassification && previous.executionClassification.get(seq);
+    var nextClassification = model.executionClassification && model.executionClassification.get(seq);
+    if (previousClassification !== nextClassification) return true;
+
+    var previousExemption = previous.executionExemptions && previous.executionExemptions.get(seq);
+    var nextExemption = model.executionExemptions && model.executionExemptions.get(seq);
+    if (previousExemption !== nextExemption) return true;
+  }
+  return false;
 }
 
 // tabCounts computes the six sticky-tab live count badges directly off the
@@ -739,9 +1256,9 @@ function bump(map, key) {
 // agentActivityNames is the --agent-activity include-set served by the
 // server (payload.agent_activity_names, see ctx.agentActivityNames) so both
 // the CLI and this client-side filter derive the name list from one Go-side
-// definition (internal/view/view.go's agentActivityNames); it is a Set of
-// event names, unrelated to the per-event isGuestAgentBinaryExec predicate
-// applied alongside it below.
+// definition (internal/view/view.go's agentActivityNames); exact derived
+// noise exemptions further narrow the process-execution rows hidden by the
+// preset without relying on a generic binary or argv predicate.
 function computeTimelineFilter(model, state, agentActivityNames) {
   var events = model.events;
   var searchQ = state.search.trim().toLowerCase();
@@ -786,12 +1303,12 @@ function computeTimelineFilter(model, state, agentActivityNames) {
     if (!okClass || !okName || !okOutcome || !okProducer) continue;
 
     // agent-activity is a stronger preset than hide-noise (it implies hiding
-    // process.created/process.exited too, plus the guest agent's own hook
-    // subprocess execs), so it takes over the noise-hiding slot entirely
+    // process.created/process.exited too, plus only exact, reason-coded
+    // infrastructure executions. It takes over the noise-hiding slot entirely
     // rather than stacking with it — matching the CLI's --agent-activity,
     // which is mutually exclusive with --all/no-filter in the same spirit.
     if (state.agentActivity) {
-      if (!activityNames.has(ev.name) || isGuestAgentBinaryExec(ev)) {
+      if (!activityNames.has(ev.name) || isNoiseExemptExecution(model, ev)) {
         hiddenNoise++;
         continue;
       }
@@ -1023,14 +1540,14 @@ function timelineMoreHtml(shown, total) {
 var SUMMARY_SEP = " · ";
 
 // joinSummary drops empty/absent segments and joins the rest with the middot
-// separator, returning a raw (un-escaped) string for summaryCellHtml to esc().
+// separator, returning a raw (un-escaped) string for timelineSummaryHtml to esc().
 function joinSummary(parts) {
   return parts.filter(function (p) { return p !== "" && p != null; }).join(SUMMARY_SEP);
 }
 
 // enrichedSummaryText returns the promoted plain-text summary for the event
 // types we special-case, or "" for everything else (caller falls back to the
-// event body). The result is raw text; summaryCellHtml esc()s it.
+// event body). The result is raw text; timelineSummaryHtml esc()s it.
 function enrichedSummaryText(ev) {
   switch (ev.name) {
     case "process.executed": {
@@ -1072,10 +1589,48 @@ function enrichedSummaryText(ev) {
   }
 }
 
-// summaryCellHtml is the summary-column renderer shared by the Timeline and
-// Actions rows: the promoted readable summary when the event type has one, else
-// the plain event body — a single tier of white text, no dim attr tail.
-function summaryCellHtml(ev) {
+// timelineSummaryHtml promotes the usual readable summary and viewer-derived
+// correlation state into the Timeline summary column without changing raw
+// events, attributes, provenance, or assurance.
+function timelineSummaryHtml(model, ev) {
+  var requestLinks = model.requestLinks;
+  var link = requestLinks && requestLinks.get(ev.seq);
+  if (link) {
+    var executionIndex = model.bySeq && model.bySeq.get(link.executionSeq);
+    var execution = executionIndex === undefined ? null : model.events[executionIndex];
+    var pid = execution && attrRaw(execution, "process.pid");
+    var execID = execution && attrRaw(execution, "process.exec.id");
+    return esc(joinSummary([
+      "kernel-observed: " + link.argv,
+      "source seq " + link.executionSeq,
+      pid === undefined || pid === null || pid === "" ? "" : "pid " + pid,
+      typeof execID === "string" && execID !== "" ? "exec " + execID : "",
+    ]));
+  }
+
+  if (eligibleBashRequest(ev)) {
+    return esc(joinSummary(["no matching process execution", enrichedSummaryText(ev) || ev.body || ""]));
+  }
+
+  var classification = model.executionClassification && model.executionClassification.get(ev.seq);
+  if (classification === "matched") {
+    var requestSeq = model.executionLinks && model.executionLinks.get(ev.seq);
+    return esc(joinSummary([
+      "linked Bash request",
+      requestSeq === undefined ? "" : "request seq " + requestSeq,
+      enrichedSummaryText(ev) || ev.body || "",
+    ]));
+  }
+  if (classification === "unmatched") {
+    return esc(joinSummary(["no linked Bash request", enrichedSummaryText(ev) || ev.body || ""]));
+  }
+  if (classification === "noise-exempt") {
+    var exemption = model.executionExemptions && model.executionExemptions.get(ev.seq);
+    return esc(joinSummary([
+      "noise-exempt: " + exemption,
+      enrichedSummaryText(ev) || ev.body || "",
+    ]));
+  }
   return esc(enrichedSummaryText(ev) || ev.body || "");
 }
 
@@ -1083,7 +1638,7 @@ function timelineRowHtml(ctx, i) {
   var model = ctx.model, ev = model.events[i];
   var expanded = ctx.state.expandedSeqs.has(ev.seq);
   var outcome = ev.outcome || "";
-  var summary = summaryCellHtml(ev);
+  var summary = timelineSummaryHtml(model, ev);
   var html =
     '<tr class="clickable tl-row" data-seq="' + ev.seq + '">' +
       '<td class="mono-num">' + ev.seq + "</td>" +
@@ -1894,7 +2449,7 @@ function updateNetworkTab(ctx) {
 function actionRowHtml(ctx, i) {
   var model = ctx.model, ev = model.events[i];
   var outcome = ev.outcome || "";
-  var summary = summaryCellHtml(ev);
+  var summary = timelineSummaryHtml(model, ev);
   return "<tr>" +
     '<td class="mono-num">' + ev.seq + "</td>" +
     "<td>" + esc(model.tsLabel[i]) + "</td>" +
@@ -3218,8 +3773,13 @@ function setSessionViewPayload(ctx, payload) {
     ctx.prevEventCount = oldEvents.length;
     ctx.prevFilteredTotal = ctx.timelineFiltered ? timelineDisplayIndices(ctx.timelineFiltered, ctx.state).length : 0;
     if (isPrefix) {
+      var previousDerived = {
+        requestLinks: ctx.model.requestLinks,
+        executionClassification: ctx.model.executionClassification,
+        executionExemptions: ctx.model.executionExemptions,
+      };
       extendModel(ctx.model, newEvents);
-      appendMode = "tail";
+      if (!derivedTimelineStateChanged(previousDerived, ctx.model, oldEvents)) appendMode = "tail";
     } else {
       ctx.model = buildModel(newEvents); // not a clean prefix: rebuild, but keep filters/tab/sort/expansion
     }
