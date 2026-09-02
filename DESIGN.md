@@ -40,8 +40,8 @@ supervisor (root in VM), host broker, host recorder.
 
 ```
 cmd/boxedai            CLI entrypoint (thin main)
-internal/cli           cobra commands: setup, doctor, build-image, run, sessions, view, diff, verify, verify-record, apply, stop
-internal/setup         host preflight, corporate config, idempotent image setup
+internal/cli           cobra commands: setup, doctor, run, sessions, view, diff, verify, verify-record, apply, stop
+internal/setup         host preflight for public macOS/Lima dependencies
 internal/session       session lifecycle orchestration, IDs, session dir, state file
 internal/image         golden VM image build/resolve, manifest, digest verification
 internal/policy        profiles (review/develop/restricted), capability model   [SCAFFOLDED]
@@ -93,9 +93,12 @@ State root `~/.boxedai/` (override: env `BOXEDAI_HOME`):
                                workspace.diff and the viewer's /api/filediff
     harness-home/              guest-mounted fresh Claude/Codex home and selected global instructions
       settings.json            BoxedAi-authored Claude hook wiring (lefthook/righthook; never host-copied)
+      hooks.json               BoxedAi-authored Codex hook wiring (never host-copied)
+      config.toml              BoxedAi-authored Codex broker/OTEL routing (never host-copied)
       debug/claude-code.log    native verbose debug log
       raw-api-bodies/          untruncated Messages API request/response bodies
-    claude-telemetry/          host-only OTLP HTTP/JSON exports (Claude sessions only)
+    claude-telemetry/          host-only OTLP HTTP/JSON exports (Claude sessions)
+    codex-telemetry/           host-only OTLP HTTP/JSON exports (Codex sessions)
       logs.jsonl               opaque OTLP log batches (0600)
       metrics.jsonl            opaque OTLP metric batches (0600)
       traces.jsonl             opaque OTLP trace batches (0600)
@@ -628,13 +631,12 @@ approver does not preapprove it, so it remains fail-closed.
 
 ## Harness hook capture — lefthook / righthook
 
-Claude sessions can narrate harness tool invocations — Bash commands, file reads,
+Claude and Codex sessions can narrate harness tool invocations — Bash commands, file reads,
 edits, searches, and subagent tool calls — as workload-channel evidence independent
 of the kernel sensor (whose diagnostic procfs path can miss short-lived processes like
 `ls` and can never see shell builtins like `cd`). The controller stages a BoxedAi-authored
-`settings.json` into the session harness home (never copied from the host — the
-existing host-settings exclusion stands) wiring two Claude Code hooks, named for the
-box the agent runs in:
+`settings.json` (Claude) or `hooks.json` (Codex) into the session harness home
+(never copied from the host) wiring hooks named for the box the agent runs in:
 
 - `PreToolUse` → `boxedai-guest-agent lefthook` → emits `tool.requested`
 - `PostToolUse` → `boxedai-guest-agent righthook` → emits `tool.completed`
@@ -644,7 +646,7 @@ box the agent runs in:
 
 The Pre/PostToolUse hooks match every tool (`matcher: "*"`); the subagent hooks
 carry no matcher. The controller records the SHA-256 digest of the exact staged
-`settings.json` bytes as controller evidence. This proves which staged artifact was
+hook configuration bytes as controller evidence. This proves which staged artifact was
 measured, not that the workload ran under those settings: the harness home is
 writable by the untrusted workload. Each hook reads the harness's hook JSON on
 stdin and POSTs one event to `POST /v1/events` using `BOXEDAI_BROKER_URL` and the
@@ -665,7 +667,7 @@ the tool was denied, failed, or interrupted before completing.
 Each hook additionally records the harness-supplied `session_id`,
 `transcript_path`, `cwd`, and `hook_event_name` as bounded `harness.*`
 attributes, and — when the harness identifies the acting agent — its
-`agent_id`/`agent_type` (Claude Code sends these in every hook fired inside a
+`agent_id`/`agent_type` (Claude Code and Codex send these in hooks fired inside a
 subagent). Because that tagging is exhaustive for subagents, a tool event with no
 `agent_id` is the harness main loop's own call and is stamped with the
 controller-minted Primary's id from `BOXEDAI_AGENT_ID` — `self_reported` like all
@@ -676,7 +678,7 @@ Unattributed Workload rather than guessing.
 A subagent-spawning call additionally records its spawn narration, lifted out of the
 size-capped `harness.tool.input` excerpt because the embedded subagent prompt can
 crowd the description out of it. Claude Code names that tool `Task` in some versions
-and `Agent` in others — both are in the wild, so both are matched:
+and `Agent` in others; Codex names it `spawn_agent`; all are matched:
 
 - `harness.task.description` — the harness's one-line description of the spawn.
 - `harness.task.subagent_type` — the subagent type it asked for.
@@ -685,8 +687,9 @@ Both are `self_reported` narration used for display-only spawn pairing on the
 request side: a `tool.requested` for a spawn call names who asked and what for, but
 not which child it became.
 
-The matching `tool.completed` closes that gap, because Claude Code's spawn tool
-returns the id of the agent it created in its `tool_response`:
+The matching `tool.completed` can close that gap when the harness response exposes
+the created agent id (Claude Code and Codex v1 do; Codex v2 task-name-only results
+honestly leave the edge absent):
 
 - `agent.spawned.native_id` — the harness-native id of the agent the call produced.
 - `agent.spawned.id` — the same id under BoxedAi's deterministic child derivation,
@@ -732,9 +735,8 @@ timeline more useful, not to make it complete or strengthen the security claim �
 hook events (tool capture AND subagent `agent.*` registration) never enter the trust
 record's broker-derived activity claims or tool-transcript binding. Hooks fail open (always
 exit 0, errors to stderr → native debug log) so evidence-capture problems never
-break the workload. The `exec` harness has no hook mechanism; Codex ships a
-compatible hooks system but its adapter is deferred, so only Claude sessions stage
-hook wiring in v0.1 (gap-noted).
+break the workload. The `exec` harness has no hook mechanism; Claude and Codex both
+stage the BoxedAi-authored hook wiring.
 
 ## Agent hierarchy and attribution
 
@@ -1239,9 +1241,13 @@ debug, and authenticated OTLP HTTP/JSON logs, metrics, and beta traces. Prompt t
 assistant text, tool details/content, and untruncated raw Messages API bodies are all
 enabled; the raw bodies remain in the guest-mounted config directory while OTLP
 exports go to the host-only `claude-telemetry` sibling. Claude starts with
-`--debug-file /home/agent/.claude/debug/claude-code.log`; codex → `OPENAI_BASE_URL=...openai`,
-`OPENAI_API_KEY=<W>`, plus the same `BOXEDAI_BROKER_URL`/`BOXEDAI_WORKLOAD_TOKEN`
-pair (read by the git bridge; codex has no capture hooks); exec → runs `sh -lc <cmd>`
+`--debug-file /home/agent/.claude/debug/claude-code.log`; codex → a fresh `CODEX_HOME`
+with BoxedAi-authored `hooks.json`, `auth.json`, and `config.toml` (`openai_base_url`
+routes model requests to the broker and `[otel]` routes authenticated log/metric/trace
+exports to the host-only `codex-telemetry` sibling), `OPENAI_API_KEY=<W>` when using
+API-key mode, and the same `BOXEDAI_BROKER_URL`/`BOXEDAI_WORKLOAD_TOKEN` pair for the
+git bridge and capture hooks; Codex launches with `--dangerously-bypass-hook-trust`
+inside the isolated VM. exec → runs `sh -lc <cmd>`
 (scripted/e2e testing harness, recorded like any other).
 
 Kill switch: `boxedai stop <id>` → revoke tokens, broker returns 401s, guest agent
@@ -1571,9 +1577,8 @@ event's Timeline detail row offers a "file history" jump into that path's expans
   suppress or forge it. v0.1 only offers a one-way, non-gating PID plausibility
   check from submitted hook events to kernel observations; reverse suppression
   detection and agent/activity decomposition are deferred. Per-agent grouping is a
-  `self_reported` ceiling. The `exec` harness has no hooks; Codex ships a compatible
-  hooks system but its adapter is deferred, so only Claude sessions register
-  subagents today.
+  `self_reported` ceiling. The `exec` harness has no hooks; Claude and Codex sessions
+  register subagents through their native lifecycle hooks.
 - Subagents run in-process inside the harness (no pid ever exists for them), so the
   kernel sensor cannot see them by construction. Per-agent attribution above the
   process level is narration-derived; the observation track attributes activity to

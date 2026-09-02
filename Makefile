@@ -1,4 +1,4 @@
-GO := ./bin/go
+GO := go
 
 .PHONY: build guest test vet all clean
 

@@ -79,6 +79,20 @@ func TestClaudeTelemetryAppendsBatches(t *testing.T) {
 	}
 }
 
+func TestCodexTelemetryPersistsToSeparateDirectory(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "codex-telemetry")
+	b := mustBroker(t, Config{Emitter: &fakeEmitter{}, CodexTelemetryDir: dir})
+	srv := testServer(t, b)
+	resp := do(t, "POST", srv.URL+"/v1/telemetry/codex/logs", b.WorkloadToken(), `{"resourceLogs":[]}`)
+	drain(resp)
+	if resp.StatusCode != 200 {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	if got, err := os.ReadFile(filepath.Join(dir, "logs.jsonl")); err != nil || string(got) != "{\"resourceLogs\":[]}\n" {
+		t.Errorf("Codex telemetry = %q, err = %v", got, err)
+	}
+}
+
 func TestClaudeTelemetryRejectsUnauthenticatedAndInvalidPayloads(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "claude-telemetry")
 	b := mustBroker(t, Config{

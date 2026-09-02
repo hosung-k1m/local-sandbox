@@ -365,11 +365,8 @@ func TestGenerateLimaYAML_ParsesAndShapesMount(t *testing.T) {
 	if tmpl.Arch != "aarch64" {
 		t.Errorf("arch = %q, want aarch64 for host arm64", tmpl.Arch)
 	}
-	if len(tmpl.Images) != 1 || tmpl.Images[0].Location != cfg.ImagePath {
-		t.Errorf("images = %+v, want a single entry at cfg.ImagePath %q", tmpl.Images, cfg.ImagePath)
-	}
-	if strings.Contains(tmpl.Images[0].Location, "cloud-images.ubuntu.com") {
-		t.Errorf("session image location = %q, must not be the stock Ubuntu download", tmpl.Images[0].Location)
+	if len(tmpl.Images) != 1 || !strings.Contains(tmpl.Images[0].Location, "cloud-images.ubuntu.com") {
+		t.Errorf("images = %+v, want the official Ubuntu cloud image", tmpl.Images)
 	}
 	if len(tmpl.Mounts) != 2 {
 		t.Fatalf("mounts = %d entries, want workspace and Claude diagnostics", len(tmpl.Mounts))
@@ -461,18 +458,6 @@ func TestGenerateLimaYAML_CodexMountsSessionHome(t *testing.T) {
 	}
 }
 
-// TestGenerateLimaYAML_RequiresImagePath is the regression guard for the
-// golden-image switchover: a real session must never silently fall back to
-// booting nothing (or the stock Ubuntu image) when the caller forgot to
-// resolve a golden image path.
-func TestGenerateLimaYAML_RequiresImagePath(t *testing.T) {
-	cfg := testConfig(t, true)
-	cfg.ImagePath = ""
-	if _, err := GenerateLimaYAML(cfg); err == nil {
-		t.Errorf("expected error for empty ImagePath, got nil")
-	}
-}
-
 func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 	cfg := testConfig(t, true)
 	out, err := GenerateLimaYAML(cfg)
@@ -521,16 +506,8 @@ func TestGenerateLimaYAML_ProvisioningStepsPresent(t *testing.T) {
 		}
 	}
 
-	// Session provisioning must never apt-get/npm/curl-install anything: all
-	// binaries and packages are baked into the golden image once. Restarting
-	// the baked Tetragon service above is session initialization, not install.
+	// Company-specific certificate and registry overrides are never emitted.
 	for _, banned := range []string{
-		"apt-get install",
-		"npm install",
-		"nodesource",
-		"nodejs",
-		"@anthropic-ai/claude-code",
-		"@openai/codex",
 		"BOXEDAI_CA_EOF",
 		"NODE_EXTRA_CA_CERTS",
 	} {
@@ -599,9 +576,9 @@ func TestProvisionScripts_SessionNeverInstallsRegardlessOfHarness(t *testing.T) 
 
 	for _, harness := range []string{"claude", "codex", "exec"} {
 		got := render(harness)
-		for _, banned := range []string{"@anthropic-ai/claude-code", "@openai/codex", "nodesource", "nodejs", "npm install"} {
-			if strings.Contains(got, banned) {
-				t.Errorf("harness %q session provisioning should not contain %q", harness, banned)
+		for _, required := range []string{"@anthropic-ai/claude-code", "@openai/codex", "npm install"} {
+			if !strings.Contains(got, required) {
+				t.Errorf("harness %q session provisioning missing %q", harness, required)
 			}
 		}
 	}
@@ -643,6 +620,43 @@ func TestWriteLimaYAML_WritesToVMDir(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o700 {
 		t.Errorf("Claude raw API body directory mode = %o, want 700", info.Mode().Perm())
+	}
+}
+
+func TestWriteLimaYAML_SeedsCodexSessionAuth(t *testing.T) {
+	cfg := testConfig(t, true)
+	cfg.Harness = "codex"
+	if _, err := WriteLimaYAML(cfg); err != nil {
+		t.Fatalf("WriteLimaYAML: %v", err)
+	}
+
+	authPath := filepath.Join(cfg.SessionDir, codexArtifactsDirName, "auth.json")
+	b, err := os.ReadFile(authPath)
+	if err != nil {
+		t.Fatalf("Codex auth file not written: %v", err)
+	}
+	if got := string(b); got != `{"auth_mode":"apikey","OPENAI_API_KEY":"workload-token"}` {
+		t.Errorf("Codex auth file = %s", got)
+	}
+	info, err := os.Stat(authPath)
+	if err != nil {
+		t.Fatalf("stat Codex auth file: %v", err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Errorf("Codex auth file mode = %o, want 600", info.Mode().Perm())
+	}
+	configPath := filepath.Join(cfg.SessionDir, codexArtifactsDirName, "config.toml")
+	config, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatalf("Codex config file not written: %v", err)
+	}
+	if !strings.Contains(string(config), `openai_base_url = "http://host.lima.internal:41830/v1/model/openai"`) {
+		t.Errorf("Codex config = %s, want broker endpoint", config)
+	}
+	for _, want := range []string{`[otel]`, `exporter = { otlp-http = { endpoint = "http://host.lima.internal:41830/v1/telemetry/codex/logs"`, `metrics_exporter = { otlp-http = { endpoint = "http://host.lima.internal:41830/v1/telemetry/codex/metrics"`, `trace_exporter = { otlp-http = { endpoint = "http://host.lima.internal:41830/v1/telemetry/codex/traces"`, `Authorization = "Bearer workload-token"`, `log_user_prompt = true`} {
+		if !strings.Contains(string(config), want) {
+			t.Errorf("Codex config missing %q: %s", want, config)
+		}
 	}
 }
 
@@ -1027,6 +1041,15 @@ func TestHarnessEnv_Codex(t *testing.T) {
 		"CODEX_HOME=/home/agent/.codex",
 		"BOXEDAI_BROKER_URL=http://host.lima.internal:41830",
 		"BOXEDAI_WORKLOAD_TOKEN=workload-token",
+		"BOXEDAI_HARNESS=codex",
+		"BOXEDAI_SESSION_ID=" + cfg.SessionID,
+		"BOXEDAI_AGENT_ID=" + cfg.AgentID,
+		"OTEL_METRICS_EXPORTER=otlp",
+		"OTEL_LOGS_EXPORTER=otlp",
+		"OTEL_TRACES_EXPORTER=otlp",
+		"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=http://host.lima.internal:41830/v1/telemetry/codex/metrics",
+		"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=http://host.lima.internal:41830/v1/telemetry/codex/logs",
+		"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=http://host.lima.internal:41830/v1/telemetry/codex/traces",
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("codex env missing %q, got %v", want, env)
@@ -1081,6 +1104,26 @@ func TestHarnessArgv_Claude(t *testing.T) {
 	} {
 		if !strings.Contains(joined, want) {
 			t.Errorf("argv missing %q, got: %v", want, argv)
+		}
+	}
+}
+
+func TestHarnessArgv_CodexBypassesHookTrust(t *testing.T) {
+	cfg := testConfig(t, true)
+	cfg.Harness = "codex"
+	cfg.HarnessArgs = []string{"exec", "ping"}
+	argv, err := (&VM{Cfg: cfg}).harnessArgv(true)
+	if err != nil {
+		t.Fatalf("harnessArgv: %v", err)
+	}
+	if len(argv) < 4 {
+		t.Fatalf("argv too short: %v", argv)
+	}
+	tail := argv[len(argv)-4:]
+	want := []string{"codex", "--dangerously-bypass-hook-trust", "exec", "ping"}
+	for i := range want {
+		if tail[i] != want[i] {
+			t.Errorf("argv tail = %v, want %v", tail, want)
 		}
 	}
 }

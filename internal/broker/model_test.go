@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"boxedai/internal/evidence"
@@ -213,6 +214,60 @@ func TestModelProxyClaimedAgentHeaders(t *testing.T) {
 		if got := attrs[k]; got != want {
 			t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
 		}
+	}
+}
+
+func TestModelProxyCodexClaimedAgentMetadataIsPreservedUpstream(t *testing.T) {
+	var got http.Header
+	backend := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"response_1"}`))
+	}))
+	t.Cleanup(backend.Close)
+	fe := &fakeEmitter{}
+	b := mustBroker(t, Config{Emitter: fe, OpenAI: Upstream{BaseURL: backend.URL, Key: "real-key"}})
+	srv := testServer(t, b)
+	req, err := http.NewRequest(http.MethodPost, srv.URL+"/v1/model/openai/v1/responses", bytes.NewReader([]byte(`{"model":"gpt-test"}`)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+b.WorkloadToken())
+	req.Header.Set(codexTurnMetadataHeader, `{"session_id":"codex-session","thread_id":"child-thread","parent_thread_id":"primary-thread"}`)
+	req.Header.Set(codexParentThreadIDHeader, "fallback-parent")
+	req.Header.Set(codexSubagentHeader, "explore")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drain(resp)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	if got.Get(codexTurnMetadataHeader) == "" || got.Get(codexParentThreadIDHeader) == "" || got.Get(codexSubagentHeader) == "" {
+		t.Errorf("Codex identity headers must remain upstream: %v", got)
+	}
+	attrs := fe.byName(evidence.EventModelRequested)[0].ev.Attrs
+	for k, want := range map[string]any{attrClaimedAgentID: "child-thread", attrClaimedParentAgentID: "primary-thread", attrClaimedSessionID: "codex-session"} {
+		if got := attrs[k]; got != want {
+			t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+		}
+	}
+}
+
+func TestClaimedCodexMetadataMalformedAndBounded(t *testing.T) {
+	attrs := map[string]any{}
+	h := make(http.Header)
+	h.Set(codexTurnMetadataHeader, "not-json")
+	addClaimedAgentAttrs(attrs, h)
+	if len(attrs) != 0 {
+		t.Errorf("malformed attrs = %v, want empty", attrs)
+	}
+	attrs = map[string]any{}
+	h.Set(codexTurnMetadataHeader, `{"thread_id":"`+strings.Repeat("a", maxClaimedHeaderChars+3)+`"}`)
+	addClaimedAgentAttrs(attrs, h)
+	if got := attrs[attrClaimedAgentID]; got != strings.Repeat("a", maxClaimedHeaderChars) {
+		t.Errorf("bounded claim length/value = %v", got)
 	}
 }
 

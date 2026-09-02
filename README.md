@@ -1,186 +1,260 @@
 # BoxedAi
 
-BoxedAi launches Claude Code or Codex inside a disposable Lima Linux VM on macOS and
-produces independently verifiable, human-readable audit evidence: which session ran,
-under which policy and VM image, which processes executed, which workspace files
-changed, which network egress was attempted or denied, which internal tools were
-invoked, and whether the host-side evidence was altered after it was sealed.
+BoxedAi runs Claude Code, Codex, or a shell command in a disposable Linux VM
+and turns the session into independently verifiable audit evidence. It is a
+local control plane for agentic development: agents get a useful workspace and
+approved tools, while operators get isolation, explicit policy, a timeline of
+what happened, and a reviewable diff.
 
-The binding architecture contract is [`DESIGN.md`](DESIGN.md). Read it before changing code.
+The project is designed to make trustworthy agent workflows practical—and to
+give contributors clear seams for improving sensors, policy, adapters, the
+viewer, and verification.
 
-## Status
+## Why BoxedAi is interesting
 
-v0.1 vertical slice (threat-model tiers 1–3 plus signed evidence and an offline
-verifier). Assurance ceiling is `LOCAL_ONLY`: evidence is COSE-signed so it cannot be
-altered after sealing, but there is no external transparency witness yet, so a malicious
-host administrator could discard evidence before it is sealed. `VERIFIED` requires the
-external witnessing planned for a later phase. See `DESIGN.md` "Known gaps".
+- Disposable Lima VMs on macOS, with a pre-baked Ubuntu image and no host
+  workspace mounted into the guest except the session clone.
+- Kernel-observed process lifecycle evidence from Tetragon's eBPF sensors,
+  including fork, exec, and exit events. If eBPF/BTF support is unavailable,
+  the guest supervisor degrades to explicitly labelled procfs coverage and the
+  verifier reports the loss honestly.
+- Default-deny networking enforced inside the guest with nftables. Direct
+  egress—including DNS—is denied and logged; model traffic, internal tools,
+  and approved effects travel through the authenticated host broker.
+- Append-only OTLP evidence segments with monotonically assigned sequence
+  numbers, SHA-256 segment digests, a previous-segment digest, and COSE Sign1
+  signatures using Ed25519. Sealed manifests form a tamper-evident,
+  hash-chained log that can be checked offline.
+- A portable, signed session trust record that binds the policy, VM image,
+  evidence chain, workspace manifests, sensor status, and verification facets.
+- An independent offline verifier that checks signatures, exact bytes,
+  sequence continuity, lifecycle invariants, authorization gates, sensor
+  coverage, and captured content. It distinguishes `LOCAL_ONLY`,
+  `INCOMPLETE`, `BYPASS_DETECTED`, and `TAMPER_SUSPECTED`.
+- Three capability-oriented profiles: `review` (read-only workspace),
+  `develop` (writable workspace and approval-gated GitHub push), and
+  `restricted` (model-only access).
+- A host-side broker that proxies Anthropic/OpenAI traffic without placing
+  provider credentials in the VM, exposes allowlisted internal read tools,
+  and mediates external effects with action digests and approvals.
+- Git transport isolation for the exact repository, while host SSH
+  credentials remain with `/usr/bin/ssh` and never enter the guest or broker
+  payloads.
+- Harness-aware capture for Claude Code hooks, model/tool/effect events,
+  subagent lifecycle and attribution, process observations, network denials,
+  file changes, workspace manifests, and GitHub activity.
+- Content-aware workspace auditing: policy-controlled capped SHA-256 file
+  digests, secret globs, excluded directories, optional host-side blobs, and
+  an authoritative input/output manifest plus unified diff.
+- Crash-safe teardown and a kill switch that revokes broker tokens, freezes
+  the workload, drains sensors, seals evidence, and destroys the VM.
+- A CLI timeline, web dashboard, session diff, evidence verification, and
+  apply workflow for reviewing and selectively bringing changes back to the
+  original repository.
 
-## Prerequisites
+## Architecture at a glance
 
-- macOS on Apple Silicon or Intel.
-- Toolchain is managed by Hermit and pinned in this repo: `./bin/go` (Go 1.26) and
-  `./bin/limactl` (Lima 2.2). No global installs needed.
-- For brokered internal tools (codesearch), the host `sq` CLI must be authenticated.
-
-## Build
-
+```text
+macOS host / controller
+┌─────────────────────────────────────────────────────────────────────────┐
+│ boxedai CLI → session orchestrator → Lima VM lifecycle                  │
+│      │                    │                                             │
+│      ├── policy + snapshot + image manifest                             │
+│      ├── host broker ─────┼── model proxy / tools / effects / Git bridge  │
+│      ├── recorder         │                                             │
+│      │   OTLP WAL → SHA-256 manifests → COSE Sign1 chain                 │
+│      ├── verifier + trust record                                         │
+│      └── viewer / diff / apply                                           │
+└───────────────┬─────────────────────────────────────────────────────────┘
+                │ authenticated broker and supervisor channels
+                ▼
+guest: disposable Ubuntu Lima VM
+┌─────────────────────────────────────────────────────────────────────────┐
+│ nftables default-deny egress + rsyslog                                  │
+│ Tetragon eBPF process sensor → guest supervisor → ordered event batches  │
+│ periodic workspace scanner → file digests                               │
+│ agent user (uid 4242) → Claude Code / Codex / exec                       │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
-make        # builds dist/boxedai and the cross-compiled guest agent
-make test   # runs the full test suite
+
+The workload is unprivileged and runs under systemd resource and filesystem
+hardening. The root guest supervisor owns sensor setup, authenticated event
+forwarding, health monitoring, bounded draining, and the kill path. The host
+recorder is the sole authority for event sequence numbers and evidence class;
+workload narration cannot label its own events as kernel-observed or trusted.
+
+## Session lifecycle
+
+1. Resolve and verify the golden VM image by its local disk digest.
+2. Resolve the profile and capture policy, create the session grant, and start
+   the recorder.
+3. Snapshot the repository and create an input manifest. The VM receives the
+   session clone, not the host checkout.
+4. Start the per-session broker and mint short-lived workload and supervisor
+   bearer tokens. Provider credentials stay host-side.
+5. Boot the Lima VM from the pre-baked image. Session-time provisioning
+   installs the guest agent, applies nftables lockdown, and establishes fresh
+   sensor boundaries before launching the workload.
+6. Wait for process-sensor readiness, then launch the selected harness inside a
+   bounded systemd unit. Claude Code and Codex reach their providers only via
+   the broker.
+7. Capture kernel/process events, hook events, file digests, network denials,
+   model calls, tool calls, approvals, effects, and agent lifecycle events.
+8. On exit or `boxedai stop`, drain the guest, revoke credentials, create the
+   output manifest and diff, seal all evidence segments, write the signed trust
+   record, and delete the VM.
+
+## Evidence and integrity model
+
+Every event is represented as an OTLP `LogRecord` with a recorder-assigned
+session sequence, event ID, policy digest, producer identity, evidence class,
+outcome, and correlation metadata. Events are written to a length-delimited
+write-ahead log. When a segment is sealed, BoxedAi:
+
+1. hashes the exact segment bytes with SHA-256;
+2. records the digest and the prior segment digest in a canonical manifest;
+3. signs the exact manifest bytes with COSE Sign1 / Ed25519; and
+4. fsyncs the segment, sidecars, and directory before reporting the seal.
+
+The result is an append-only, hash-chained, signed evidence set. “Immutable”
+here means sealed history cannot be changed without breaking its signature,
+digest, or chain. In v0.1 this is local assurance: a host administrator could
+still delete evidence before sealing, so there is no claim of external
+transparency or host-root resistance.
+
+The offline verifier independently reads the raw segments and checks:
+
+- COSE signatures and the Ed25519 trust root;
+- exact segment bytes, previous-digest links, and physical sequence order;
+- session grant, policy, lifecycle, workspace, and trust-record bindings;
+- sensor readiness, loss, restart, and process coverage;
+- approval-before-dispatch rules for tools and external effects; and
+- content-addressed captured blobs against the signed file digest.
+
+Signed evidence defaults to metadata and digests. Explicitly captured file
+bytes live in a separate per-session content-addressed store and are never
+written into signed OTLP segments.
+
+## Networking and broker boundaries
+
+The guest's nftables ruleset is installed at session startup after the broker
+address is known. It permits only the paths needed for the authenticated
+session broker and drops all other egress, including DNS. Kernel log lines for
+denials are tailed by the guest agent and become `network.denied` evidence.
+
+The broker provides separate authenticated routes for:
+
+- Anthropic and OpenAI-compatible model requests, recording request/response
+  digests, model identity, and token usage;
+- configuration-driven internal read tools with strict argv substitution,
+  timeouts, output limits, and capability checks;
+- external effects such as GitHub operations, normalized and approval-gated by
+  action digest;
+- exact-repository Git upload-pack and receive-pack streams; and
+- guest supervisor event ingest and Claude telemetry forwarding.
+
+No provider key, GitHub token, or private key is copied into the guest. A
+failed authorization is itself recorded, and an effect cannot dispatch without
+the matching successful approval.
+
+## Repository map
+
+| Package | Responsibility |
+| --- | --- |
+| `internal/cli` | User-facing commands: setup, run, view, verify, diff, apply, stop |
+| `internal/session` | Session lifecycle, grants, snapshots, teardown, orchestration |
+| `internal/vm` | Lima configuration, image boot, provisioning, guest hardening |
+| `internal/image` | Golden image build, manifest, and disk digest checks |
+| `internal/policy` | Profiles, capabilities, resource limits, capture rules |
+| `internal/broker` | Model proxy, internal tools, effects, Git bridge, event ingest |
+| `internal/evidence` | Event schema, catalog, attributes, and emitter contract |
+| `internal/recorder` | Ordered OTLP WAL, segment manifests, COSE signing, keys |
+| `internal/verify` | Independent offline verification and verdict facets |
+| `internal/trustrecord` | Signed portable session summary and cross-derivation |
+| `internal/blobstore` | Per-session content-addressed captured file bytes |
+| `internal/view` | SQLite projection, CLI timeline, embedded web dashboard |
+| `guest/agent` | Root supervisor, Tetragon/procfs watcher, nftables watcher, scanner, hooks |
+
+See [DESIGN.md](DESIGN.md) for the binding component contract, event catalog,
+threat model, failure behavior, and known gaps.
+
+## Requirements
+
+- macOS on Apple Silicon or Intel
+- Go 1.25 or newer
+- [Lima](https://lima-vm.io/) (`limactl` on `PATH`)
+- Git and SSH
+- GitHub CLI (`gh`) when using `--repo` or GitHub integration
+- Internet access for the Ubuntu image and VM dependencies
+
+BoxedAi uses the official Ubuntu cloud image and public package registries. It
+does not require a company VPN, proxy, certificate, private registry, or
+prebuilt image.
+
+## Setup and run
+
+Build the CLI and guest agent:
+
+```sh
+make
 ```
 
-On a fresh Block workstation, configure and build everything needed for sandbox
-sessions with one command:
+Run the read-only preflight or friendly setup command:
 
-```
+```sh
+dist/boxedai doctor
 dist/boxedai setup
 ```
 
-`setup` checks the macOS host, pinned Lima tool, required host commands, network and
-disk readiness, and the Cloudflare Gateway CA in the macOS keychains. It preserves
-existing `config.json` fields while writing the CA and Block npm registry at mode 0600,
-then builds and verifies the golden image. Re-running it is idempotent and skips an
-already-valid image built with the same corporate configuration. If WARP, a command,
-network access, or disk space needs user action, setup reports the exact gate instead
-of starting a partial build. `dist/boxedai doctor` performs the corresponding
-read-only readiness check.
+Build the golden image before the first run when setup has not done so:
 
-For integrations, `setup --json` emits `boxedai.setup/v1` NDJSON stage events and one
-final result; `doctor --json` emits one result. Exit code 0 means ready, 2 means user
-action is required, and 1 means setup failed. Machine-readable stdout never includes
-the CA PEM or credentials; image provisioning logs go to stderr.
-
-`make guest` cross-compiles the Linux guest supervisor for both arm64 and amd64 into
-`dist/guest/`; `boxedai run` serves the matching binary to the VM over the broker.
-
-## Run
-
-`setup` builds the golden VM image on first use and rebuilds it when its corporate
-inputs are stale. To force a direct image rebuild without the host preflight, use:
-
-```
-dist/boxedai build-image                              # bakes Node, Claude Code, Codex,
-                                                        # and Tetragon into a golden disk
+```sh
+dist/boxedai build-image
 ```
 
-`build-image` boots a throwaway VM, installs Node plus both `@anthropic-ai/claude-code`
-and `@openai/codex` (the image is harness-agnostic) and Tetragon into it, and saves the
-resulting disk under `~/.boxedai/images/<arch>/`. `boxedai run` boots directly from that
-disk instead of provisioning a fresh Ubuntu image every session, and fails fast with a
-clear error if the image is missing.
+Run an agent or command:
 
-```
-dist/boxedai run claude .                             # interactive Claude Code in a sandbox
-dist/boxedai run codex .                               # interactive Codex
-dist/boxedai run exec . --cmd 'go test ./...'          # scripted, non-interactive
-dist/boxedai run claude . -- -p 'explain this repo'    # non-interactive, passthrough argv
-dist/boxedai run codex . -- exec 'go test ./...'       # same, for codex
-dist/boxedai run codex --repo org-49461806@github.com:squareup/repo.git --branch feature
+```sh
+dist/boxedai run claude .
+dist/boxedai run codex .
+dist/boxedai run exec . --cmd 'go test ./...'
+dist/boxedai run claude . -- -p 'explain this repository'
 ```
 
-`--repo` is mutually exclusive with the local `[path]`. It creates a fresh,
-single-branch clone and records the remote, branch, and commit in `session.json`.
+The default `develop` profile uses a writable workspace. Use
+`--profile review` for a read-only workspace or `--profile restricted` for
+model-only access. For a fresh GitHub clone:
 
-If you're logged into Claude Code (or Codex) on the host, `boxedai run claude`/`codex`
-just works: the broker picks up your device login automatically (Claude Code's Keychain
-credential, or `~/.codex/auth.json` for Codex — see `DESIGN.md` "Broker" for the full
-resolution order and the ChatGPT-mode caveat). An explicit `ANTHROPIC_API_KEY` /
-`OPENAI_API_KEY` (or host config key) always overrides the device login.
-
-For Claude and Codex sessions started from a GitHub repository, BoxedAi asks the host `gh` CLI
-for that repository's canonical name and SSH URL, then exposes only that repository
-through the broker. Git inside the VM can fetch and pull normally. The default
-`develop` profile makes push grantable, with one session-scoped approval on the host TTY before
-the broker or VM starts. That approval is cached only for `github/push` against the
-exact current repository; no approval prompt reads stdin while Claude is running, and
-all other effects remain denied. Non-interactive sessions auto-deny the push. The
-harness rewrites that repository's exact and canonical GitHub URLs to an
-authenticated guest bridge; the host broker runs `/usr/bin/ssh` with the host's
-existing GitHub SSH identity. No GitHub token or SSH key enters the broker or VM, and
-the VM still has no direct GitHub egress. Configure the host with `gh auth login`
-first and ensure its GitHub SSH URL works noninteractively.
-
-Anything after a literal `--` is passed through as argv to the claude/codex CLI inside
-the guest, so the harness can be driven non-interactively.
-
-Harnesses use `~/.boxedai/sessions/<session>/harness-home/`. BoxedAi copies only
-conventional host-global `CLAUDE*.md` or `AGENTS*.md` instruction files into that
-session-scoped home as regular 0600 files; it never mounts complete host config
-directories. Repository-local instructions remain in the workspace. Claude Code's
-verbose native debug log is `debug/claude-code.log`, conversation transcripts are
-under `projects/`, and untruncated Messages API request/response bodies are under
-`raw-api-bodies/`. Claude Code also exports complete OTLP HTTP/JSON logs, metrics, and
-beta traces through the authenticated broker into the host-only sibling directory
-`~/.boxedai/sessions/<session>/claude-telemetry/` as `logs.jsonl`, `metrics.jsonl`,
-and `traces.jsonl` (0600). These files can contain prompts, responses, tool inputs,
-tool output, source, and account metadata, so treat the entire session directory as
-sensitive. They are diagnostic artifacts, not signed evidence segments. The host's
-complete `~/.claude` directory and credential never enter the VM; model authentication
-remains behind the broker.
-
-Flags: `--profile develop|review|restricted` (default `develop`), `--repo <remote>`,
-`--branch <branch>`, `--cap external-write:github` (repeatable), `--keep-vm`.
-
-Profiles: `develop` (writable overlay, model + brokered internal reads — the default),
-`review` (read-only snapshot), `restricted` (model only, no internal tools). No
-host credentials enter the VM and egress is default-deny except the host broker.
-
-## Inspect and verify
-
-```
-dist/boxedai --web                 # global local dashboard for live and historical sessions
-dist/boxedai sessions              # list recorded sessions and their state
-dist/boxedai view <session>        # evidence timeline (each event shows its class)
-dist/boxedai view <session> --web  # local web viewer
-dist/boxedai diff <session>        # workspace changes (input -> output)
-dist/boxedai verify <session>      # offline verifier: verdict + per-check facets
-dist/boxedai verify-record <trust-record.json> --public-key <recorder-public-key.pem>
-                                    # portable trust-record signature and claims
-dist/boxedai verify-record <trust-record.json> --public-key <recorder-public-key.pem> --json
-dist/boxedai apply <session>       # apply the workspace diff back to the repo (confirms first)
-dist/boxedai stop <session>        # kill switch: freeze, seal, destroy
+```sh
+gh auth login
+dist/boxedai run codex --repo owner/project.git --branch feature
 ```
 
-Claude sessions record every harness tool invocation — each Bash command, file read,
-edit, and subagent tool call — as `tool.requested`/`tool.completed` timeline events.
-BoxedAi stages Claude Code hooks (`lefthook` for PreToolUse, `righthook` for
-PostToolUse, both served by the guest agent) into the session harness home; the
-events are honestly labeled `harness_observed` since they are reported from inside
-the sandbox. `model.completed` events carry the provider-reported token usage
-(`llm.usage.*`), parsed from streaming and non-streaming responses alike, and the
-session trust record aggregates per-model totals.
+Anything after `--` is passed to Claude Code or Codex. Use `--keep-vm` while
+debugging guest behavior.
 
-Claude's `SubagentStart`/`SubagentStop` hooks narrate a self-reported agent
-hierarchy in the viewer. The Agents view puts unregistered or untagged activity in
-Unattributed Workload rather than presenting it as independently verified.
+## Inspect, verify, and contribute
 
-Every displayed event carries an evidence class distinguishing what was self-reported by
-the harness from what was independently observed by the guest kernel witness, mediated by
-the broker, or confirmed by a target. Timeline rows show event bodies and curated
-details. The verifier explicitly reports SHA-256, COSE Sign1, EdDSA/Ed25519, the
-public-key fingerprint, and segment/chain outcomes while re-deriving signatures, digests, the
-segment hash chain, sequence continuity, lifecycle ordering, and request→approval→dispatch
-flow invariants entirely offline, and reports one of `LOCAL_ONLY`, `INCOMPLETE`,
-`BYPASS_DETECTED`, or `TAMPER_SUSPECTED`.
+```sh
+dist/boxedai sessions
+dist/boxedai view <session>
+dist/boxedai diff <session>
+dist/boxedai verify <session>
+dist/boxedai apply <session>
+dist/boxedai stop <session>
+dist/boxedai --web
+make test
+```
 
-State lives under `~/.boxedai/` (override with `BOXEDAI_HOME`). Raw signed evidence
-segments are authoritative; the SQLite/web projections are rebuilt from them on demand.
-The global dashboard binds to `127.0.0.1` by default, prints the reachable URL, polls
-for session and timeline updates, and marks active open-segment evidence as
-provisional until that segment has a manifest and COSE Sign1 signature. Its session
-list uses session and segment-manifest metadata, with an in-memory cache for sealed
-historical sessions; those rows are labeled as unverified summaries and expose the
-manifest-declared segment digest as `declared_segment_digest`. Selecting a session
-runs the full projection and verifier, including recomputed hashes, chain checks,
-verdict, and recorder fingerprint.
+State and evidence live under `~/.boxedai`; set `BOXEDAI_HOME` to relocate it.
+Session directories are sensitive because optional diagnostics can include
+prompts, responses, tool inputs, and source content.
 
-`verify-record` verifies a portable `boxedai.trust-record/v1` envelope without a
-session directory or network access. Its mandatory `--public-key` flag supplies the
-recorder's external PKIX PEM Ed25519 public key (normally
-`~/.boxedai/keys/recorder.pub`). It checks the profile, schema, key binding, RFC 8785
-signature, and Level 0 software-only assurance, then reports evidence counts, chain
-tip, model/tool activity, and the tool-transcript digest. `--json` emits the same
-report as one machine-readable object. The command validates the envelope only; use
-`boxedai verify <session>` when the raw session evidence must also be independently
-re-derived and checked against the trust record.
+Contributions are especially welcome in the areas that make agent execution
+more observable and collaborative: new evidence producers and sensors,
+policy profiles and adapters, verifier invariants, dashboard views, image and
+Lima portability, harness integrations, performance, tests, and documentation.
+Start with [DESIGN.md](DESIGN.md), keep security claims aligned with the
+verifier's actual checks, add focused tests, and run `make test` before opening
+a pull request. For changes that affect the evidence contract, update the
+design contract first and include the corresponding verification coverage.

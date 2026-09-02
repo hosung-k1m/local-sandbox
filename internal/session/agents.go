@@ -72,11 +72,12 @@ func primaryAgentCapabilities(harness string) map[string]evidence.AttributionStr
 		evidence.CategoryFile:    evidence.StrengthNone,
 		evidence.CategoryNetwork: evidence.StrengthNone,
 	}
-	// Only the Claude adapter wires per-tool hooks (agent_id) and records model
-	// agent-label headers in v0.1; both are self_reported. Codex and exec have
-	// neither, so their tool/model stay unattributed.
-	if harness == "claude" {
+	// Claude and Codex wire tool hooks; their tool attribution is self-reported.
+	// Both harnesses provide model identity as a workload claim.
+	if harness == "claude" || harness == "codex" {
 		caps[evidence.CategoryTool] = evidence.StrengthSelfReported
+	}
+	if harness == "claude" || harness == "codex" {
 		caps[evidence.CategoryModel] = evidence.StrengthSelfReported
 	}
 	return caps

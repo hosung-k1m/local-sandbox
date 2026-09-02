@@ -11,6 +11,13 @@ import (
 	boxedsetup "boxedai/internal/setup"
 )
 
+func validateArch(arch string) error {
+	if arch != "arm64" && arch != "amd64" {
+		return fmt.Errorf("cli: unknown arch %q (want arm64|amd64)", arch)
+	}
+	return nil
+}
+
 var (
 	doctorHost = boxedsetup.Doctor
 	setupHost  = boxedsetup.Run

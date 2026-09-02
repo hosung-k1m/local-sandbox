@@ -87,13 +87,16 @@ func TestAgentCompletedEvent(t *testing.T) {
 	}
 }
 
-// TestHarnessSettingsDigest asserts only Claude (the sole hook-wiring harness)
-// yields a digest, and it is the digest of the exact staged settings bytes.
+// TestHarnessSettingsDigest asserts hook-wiring harnesses yield the digest of
+// their exact staged config bytes.
 func TestHarnessSettingsDigest(t *testing.T) {
 	if got, want := harnessSettingsDigest("claude"), evidence.SHA256Hex([]byte(claudeHooksSettingsJSON)); got != want {
 		t.Errorf("claude settings digest = %q, want %q", got, want)
 	}
-	for _, h := range []string{"codex", "exec", "unknown"} {
+	if got, want := harnessSettingsDigest("codex"), evidence.SHA256Hex([]byte(codexHooksJSON)); got != want {
+		t.Errorf("codex settings digest = %q, want %q", got, want)
+	}
+	for _, h := range []string{"exec", "unknown"} {
 		if got := harnessSettingsDigest(h); got != "" {
 			t.Errorf("%s settings digest = %q, want empty", h, got)
 		}
@@ -101,14 +104,18 @@ func TestHarnessSettingsDigest(t *testing.T) {
 }
 
 // TestPrimaryAgentCapabilities locks the per-harness attribution ceiling: process
-// is always lineage-to-session; only Claude self-reports tool and model; file and
+// is always lineage-to-session; Claude and Codex self-report tool attribution,
+// and model identity; file and
 // network never carry a per-agent actor.
 func TestPrimaryAgentCapabilities(t *testing.T) {
 	claude := primaryAgentCapabilities("claude")
 	if claude[evidence.CategoryTool] != evidence.StrengthSelfReported || claude[evidence.CategoryModel] != evidence.StrengthSelfReported {
 		t.Errorf("claude tool/model = %q/%q, want self_reported", claude[evidence.CategoryTool], claude[evidence.CategoryModel])
 	}
-	for _, h := range []string{"codex", "exec"} {
+	if caps := primaryAgentCapabilities("codex"); caps[evidence.CategoryTool] != evidence.StrengthSelfReported || caps[evidence.CategoryModel] != evidence.StrengthSelfReported {
+		t.Errorf("codex tool/model = %q/%q, want self_reported/self_reported", caps[evidence.CategoryTool], caps[evidence.CategoryModel])
+	}
+	for _, h := range []string{"exec"} {
 		caps := primaryAgentCapabilities(h)
 		if caps[evidence.CategoryTool] != evidence.StrengthNone || caps[evidence.CategoryModel] != evidence.StrengthNone {
 			t.Errorf("%s tool/model = %q/%q, want none", h, caps[evidence.CategoryTool], caps[evidence.CategoryModel])

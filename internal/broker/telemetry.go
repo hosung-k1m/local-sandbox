@@ -31,9 +31,17 @@ func prepareClaudeTelemetry(dir string) error {
 // as one compact JSONL record. The payload is intentionally opaque: BoxedAi
 // validates JSON framing but does not reimplement the OTLP schema.
 func (b *Broker) handleClaudeTelemetry(w http.ResponseWriter, r *http.Request, _ authKind) {
+	b.handleTelemetry(w, r, b.cfg.ClaudeTelemetryDir, "Claude")
+}
+
+func (b *Broker) handleCodexTelemetry(w http.ResponseWriter, r *http.Request, _ authKind) {
+	b.handleTelemetry(w, r, b.cfg.CodexTelemetryDir, "Codex")
+}
+
+func (b *Broker) handleTelemetry(w http.ResponseWriter, r *http.Request, dir, harness string) {
 	fileName, ok := claudeTelemetryFileName(r.PathValue("signal"))
-	if !ok || b.cfg.ClaudeTelemetryDir == "" {
-		writeErr(w, http.StatusNotFound, "unknown Claude telemetry signal")
+	if !ok || dir == "" {
+		writeErr(w, http.StatusNotFound, "unknown "+harness+" telemetry signal")
 		return
 	}
 	body, err := readBody(r, maxTelemetryBody)
@@ -53,10 +61,10 @@ func (b *Broker) handleClaudeTelemetry(w http.ResponseWriter, r *http.Request, _
 	compact.WriteByte('\n')
 
 	b.telemetryMu.Lock()
-	err = appendTelemetry(filepath.Join(b.cfg.ClaudeTelemetryDir, fileName), compact.Bytes())
+	err = appendTelemetry(filepath.Join(dir, fileName), compact.Bytes())
 	b.telemetryMu.Unlock()
 	if err != nil {
-		writeErr(w, http.StatusInternalServerError, "persist Claude telemetry failed")
+		writeErr(w, http.StatusInternalServerError, "persist "+harness+" telemetry failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{})

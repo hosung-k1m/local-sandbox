@@ -602,80 +602,6 @@ func TestRunVMDeleteFailurePersistsOnlyFinalIncompleteState(t *testing.T) {
 	}
 }
 
-// TestRunAbortsOnImageResolveFailure asserts that a resolveImage failure
-// aborts Run fail-closed before any VM boot: the fake vmFactory must never be
-// invoked (mirroring how TestRunOrchestration asserts the fake VM's lifecycle
-// calls), and the error Run returns must wrap resolveImage's error.
-func TestRunAbortsOnImageResolveFailure(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("BOXEDAI_HOME", home)
-	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
-	t.Setenv("OPENAI_API_KEY", "test-openai-key")
-
-	wantErr := errors.New("no golden image for arch")
-	withResolveImage(t, func(arch string) (image.Manifest, error) { return image.Manifest{}, wantErr })
-
-	var factoryCalled bool
-	r := &Runner{newVM: func(cfg vm.Config) vmController {
-		factoryCalled = true
-		return &fakeVM{cfg: cfg}
-	}}
-
-	res, err := r.Run(context.Background(), RunOptions{
-		Harness:  "exec",
-		RepoPath: t.TempDir(),
-		Profile:  policy.ProfileDevelop,
-		Cmd:      "true",
-	})
-	if err == nil {
-		t.Fatal("want error, got nil")
-	}
-	if !errors.Is(err, wantErr) {
-		t.Errorf("Run error = %v, want it to wrap %v", err, wantErr)
-	}
-	if !strings.Contains(err.Error(), "session:") {
-		t.Errorf("Run error = %q, want it wrapped in the session: ... convention", err.Error())
-	}
-	if factoryCalled {
-		t.Error("vmFactory was invoked despite resolveImage failing; Run must abort before VM boot")
-	}
-	if res.State == StateSealed {
-		t.Errorf("State = %q, want anything but sealed on an aborted session", res.State)
-	}
-}
-
-// TestRunThreadsImagePath asserts that a resolved manifest's DiskPath reaches
-// the vm.Config the VM factory is built with, the same way the workspace path
-// and tokens do.
-func TestRunThreadsImagePath(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("BOXEDAI_HOME", home)
-	t.Setenv("ANTHROPIC_API_KEY", "test-anthropic-key")
-	t.Setenv("OPENAI_API_KEY", "test-openai-key")
-	withResolveImage(t, func(arch string) (image.Manifest, error) { return fakeManifest, nil })
-
-	var fake *fakeVM
-	r := &Runner{newVM: func(cfg vm.Config) vmController {
-		fake = &fakeVM{cfg: cfg}
-		return fake
-	}}
-
-	if _, err := r.Run(context.Background(), RunOptions{
-		Harness:  "exec",
-		RepoPath: t.TempDir(),
-		Profile:  policy.ProfileDevelop,
-		Cmd:      "true",
-	}); err != nil {
-		t.Fatalf("Run: %v", err)
-	}
-	if fake == nil {
-		t.Fatal("injected VM factory was never called")
-	}
-	if fake.cfg.ImagePath != fakeManifest.DiskPath {
-		t.Errorf("vm.Config.ImagePath = %q, want %q", fake.cfg.ImagePath, fakeManifest.DiskPath)
-	}
-}
-
 func TestRunPreapprovesGitHubPushBeforeVMStartup(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("BOXEDAI_HOME", home)
@@ -768,6 +694,12 @@ func TestClaudeTelemetryDirIsHostOnlySibling(t *testing.T) {
 	}
 	if got := claudeTelemetryDir(sessionDir, "codex"); got != "" {
 		t.Errorf("Codex telemetry dir = %q, want disabled", got)
+	}
+	if got, want := codexTelemetryDir(sessionDir, "codex"), filepath.Join(sessionDir, "codex-telemetry"); got != want {
+		t.Errorf("codex telemetry dir = %q, want %q", got, want)
+	}
+	if got := codexTelemetryDir(sessionDir, "claude"); got != "" {
+		t.Errorf("claude Codex telemetry dir = %q, want empty", got)
 	}
 }
 

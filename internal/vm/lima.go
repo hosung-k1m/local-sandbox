@@ -1,9 +1,11 @@
 package vm
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"gopkg.in/yaml.v3"
 )
@@ -103,9 +105,6 @@ type limaProvision struct {
 // session-only provisioning with the nftables lockdown. It does not touch
 // disk; see WriteLimaYAML.
 func GenerateLimaYAML(cfg Config) (string, error) {
-	if cfg.ImagePath == "" {
-		return "", fmt.Errorf("vm: ImagePath is required")
-	}
 	arch, err := limaArch(cfg.Arch)
 	if err != nil {
 		return "", err
@@ -130,10 +129,16 @@ func GenerateLimaYAML(cfg Config) (string, error) {
 			Writable:   true,
 		})
 	}
+	imageLocation := ubuntuImageURL(cfg.Arch)
+	if cfg.ImagePath != "" {
+		if _, err := os.Stat(cfg.ImagePath); err == nil {
+			imageLocation = cfg.ImagePath
+		}
+	}
 	tmpl := limaTemplate{
 		VMType: "vz",
 		Arch:   arch,
-		Images: []limaImage{{Location: cfg.ImagePath, Arch: arch}},
+		Images: []limaImage{{Location: imageLocation, Arch: arch}},
 		Mounts: mounts,
 		// No other host directory is mounted, and reverse-sshfs (which
 		// would otherwise let the guest reach back into the host FS) is
@@ -169,6 +174,14 @@ func WriteLimaYAML(cfg Config) (string, error) {
 			return "", fmt.Errorf("vm: create Claude raw API body dir: %w", err)
 		}
 	}
+	if cfg.Harness == "codex" {
+		if err := writeCodexAuth(cfg); err != nil {
+			return "", err
+		}
+		if err := writeCodexConfig(cfg); err != nil {
+			return "", err
+		}
+	}
 	dir := filepath.Join(cfg.SessionDir, "vm")
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", fmt.Errorf("vm: create vm dir: %w", err)
@@ -178,6 +191,57 @@ func WriteLimaYAML(cfg Config) (string, error) {
 		return "", fmt.Errorf("vm: write lima.yaml: %w", err)
 	}
 	return path, nil
+}
+
+// writeCodexConfig supplies the broker endpoint through Codex's native
+// config key. Current Codex does not use OPENAI_BASE_URL for its core provider;
+// hooks.json and auth.json are deliberately left untouched.
+func writeCodexConfig(cfg Config) error {
+	endpoint := fmt.Sprintf("http://%s:%d/v1/model/openai", cfg.BrokerHost, cfg.BrokerPort)
+	otlp := func(signal string) string {
+		return "{ otlp-http = { endpoint = " + strconv.Quote("http://"+cfg.BrokerHost+":"+strconv.Itoa(cfg.BrokerPort)+"/v1/telemetry/codex/"+signal) + ", protocol = \"json\", headers = { Authorization = " + strconv.Quote("Bearer "+cfg.WorkloadToken) + " } } }"
+	}
+	content := "# BoxedAi session routing; auth and hooks are separate files.\n" +
+		"openai_base_url = " + strconv.Quote(endpoint) + "\n\n" +
+		"[otel]\nexporter = " + otlp("logs") + "\nmetrics_exporter = " + otlp("metrics") + "\ntrace_exporter = " + otlp("traces") + "\nlog_user_prompt = true\n"
+	path := filepath.Join(harnessHomePath(cfg), "config.toml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return fmt.Errorf("vm: write Codex config: %w", err)
+	}
+	return nil
+}
+
+// writeCodexAuth seeds the fresh, session-scoped CODEX_HOME used by the guest.
+// Codex's interactive TUI can otherwise enter its onboarding flow before it
+// makes a request, even when OPENAI_API_KEY is present in the process
+// environment. This file contains only the BoxedAi workload token; the real
+// provider credential remains in the host broker and is injected on proxying.
+func writeCodexAuth(cfg Config) error {
+	dir := harnessHomePath(cfg)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("vm: create Codex home: %w", err)
+	}
+	if cfg.CodexAuthJSON != "" {
+		if err := os.WriteFile(filepath.Join(dir, "auth.json"), []byte(cfg.CodexAuthJSON), 0o600); err != nil {
+			return fmt.Errorf("vm: write Codex host login: %w", err)
+		}
+		return nil
+	}
+	b, err := json.Marshal(struct {
+		AuthMode     string `json:"auth_mode"`
+		OpenAIAPIKey string `json:"OPENAI_API_KEY"`
+	}{
+		AuthMode:     "apikey",
+		OpenAIAPIKey: cfg.WorkloadToken,
+	})
+	if err != nil {
+		return fmt.Errorf("vm: marshal Codex session credentials: %w", err)
+	}
+	path := filepath.Join(dir, "auth.json")
+	if err := os.WriteFile(path, b, 0o600); err != nil {
+		return fmt.Errorf("vm: write Codex session credentials: %w", err)
+	}
+	return nil
 }
 
 func harnessHomePath(cfg Config) string {

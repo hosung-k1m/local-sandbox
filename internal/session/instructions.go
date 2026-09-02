@@ -13,6 +13,7 @@ const (
 	harnessHomeDirName     = "harness-home"
 	maxInstructionFileSize = 1 << 20
 	claudeSettingsFileName = "settings.json"
+	codexHooksFileName     = "hooks.json"
 )
 
 // claudeHooksSettingsJSON is the BoxedAi-authored Claude Code settings.json
@@ -41,16 +42,37 @@ const claudeHooksSettingsJSON = `{
 }
 `
 
-// harnessSettingsDigest is the SHA-256 of the exact staged hook settings.json
-// bytes, or "" for harnesses that stage no hooks. stageHarnessInstructions
-// writes []byte(claudeHooksSettingsJSON) verbatim, so digesting the constant
-// matches the on-disk file; the controller stamps this on the Primary Agent's
-// agent.started as attestable hook-wiring provenance.
+// codexHooksJSON is the BoxedAi-authored Codex hook configuration. Codex reads
+// it from CODEX_HOME alongside AGENTS.md; it deliberately contains only the
+// capture wiring, never host authentication or user configuration.
+const codexHooksJSON = `{
+  "hooks": {
+    "PreToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent lefthook", "timeout": 15}]}
+    ],
+    "PostToolUse": [
+      {"matcher": "*", "hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent righthook", "timeout": 15}]}
+    ],
+    "SubagentStart": [
+      {"hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent agenthook", "timeout": 15}]}
+    ],
+    "SubagentStop": [
+      {"hooks": [{"type": "command", "command": "/usr/local/bin/boxedai-guest-agent agenthook", "timeout": 15}]}
+    ]
+  }
+}
+`
+
+// harnessSettingsDigest is the SHA-256 of the exact staged hook configuration.
 func harnessSettingsDigest(harness string) string {
-	if harness != "claude" {
+	switch harness {
+	case "claude":
+		return evidence.SHA256Hex([]byte(claudeHooksSettingsJSON))
+	case "codex":
+		return evidence.SHA256Hex([]byte(codexHooksJSON))
+	default:
 		return ""
 	}
-	return evidence.SHA256Hex([]byte(claudeHooksSettingsJSON))
 }
 
 var hostUserHomeDir = os.UserHomeDir
@@ -114,12 +136,17 @@ func stageHarnessInstructions(sessionDir, harness string) (string, error) {
 			return "", err
 		}
 	}
-	// Claude-only: stage the BoxedAi-authored hook wiring (never the host's
-	// own settings.json — codex/exec get no hook mechanism in v0.1).
+	// Stage only BoxedAi-authored hook wiring; no host settings/configuration
+	// is copied into the isolated harness home.
 	if harness == "claude" {
 		settingsTarget := filepath.Join(destination, claudeSettingsFileName)
 		if err := os.WriteFile(settingsTarget, []byte(claudeHooksSettingsJSON), 0o600); err != nil {
 			return "", fmt.Errorf("session: write claude hooks settings: %w", err)
+		}
+	} else if harness == "codex" {
+		hooksTarget := filepath.Join(destination, codexHooksFileName)
+		if err := os.WriteFile(hooksTarget, []byte(codexHooksJSON), 0o600); err != nil {
+			return "", fmt.Errorf("session: write codex hooks: %w", err)
 		}
 	}
 	return destination, nil

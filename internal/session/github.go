@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -21,6 +22,10 @@ var lookupGitRemote = func(ctx context.Context, repoPath string) ([]byte, error)
 var lookupGitHubRepository = func(ctx context.Context, repoPath string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, "gh", "repo", "view", "--json", "nameWithOwner,sshUrl")
 	cmd.Dir = repoPath
+	// Repository discovery must never enter gh's interactive auth flow. Setup
+	// and session startup are non-authenticating operations; if gh is not
+	// already logged in, return its error and let the caller fail closed.
+	cmd.Env = append(os.Environ(), "GH_PROMPT_DISABLED=1")
 	return cmd.Output()
 }
 

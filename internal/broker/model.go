@@ -46,6 +46,12 @@ const (
 	claudeAgentIDHeader       = "X-Claude-Code-Agent-Id"
 	claudeParentAgentIDHeader = "X-Claude-Code-Parent-Agent-Id"
 	claudeSessionIDHeader     = "X-Claude-Code-Session-Id"
+	// Codex carries equivalent self-reported lifecycle identity in the Responses
+	// request metadata. These must remain upstream because Codex's backend may
+	// consume them.
+	codexTurnMetadataHeader   = "X-Codex-Turn-Metadata"
+	codexParentThreadIDHeader = "X-Codex-Parent-Thread-Id"
+	codexSubagentHeader       = "X-OpenAI-Subagent"
 	// maxClaimedHeaderChars bounds the workload-controlled header values stored.
 	maxClaimedHeaderChars = 256
 )
@@ -279,6 +285,29 @@ func addClaimedAgentAttrs(attrs map[string]any, h http.Header) {
 	} {
 		if v := h.Get(header); v != "" {
 			attrs[key] = capRunes(v, maxClaimedHeaderChars)
+		}
+	}
+	var metadata struct {
+		SessionID      string `json:"session_id"`
+		ThreadID       string `json:"thread_id"`
+		ParentThreadID string `json:"parent_thread_id"`
+	}
+	if raw := h.Get(codexTurnMetadataHeader); raw != "" && json.Unmarshal([]byte(raw), &metadata) == nil {
+		if metadata.ThreadID != "" {
+			attrs[attrClaimedAgentID] = capRunes(metadata.ThreadID, maxClaimedHeaderChars)
+		}
+		if metadata.ParentThreadID != "" {
+			attrs[attrClaimedParentAgentID] = capRunes(metadata.ParentThreadID, maxClaimedHeaderChars)
+		}
+		if metadata.SessionID != "" {
+			attrs[attrClaimedSessionID] = capRunes(metadata.SessionID, maxClaimedHeaderChars)
+		}
+	}
+	// Some Codex versions carry the parent outside metadata. It is still just a
+	// claim and only fills a missing metadata field.
+	if _, ok := attrs[attrClaimedParentAgentID]; !ok {
+		if v := h.Get(codexParentThreadIDHeader); v != "" {
+			attrs[attrClaimedParentAgentID] = capRunes(v, maxClaimedHeaderChars)
 		}
 	}
 }

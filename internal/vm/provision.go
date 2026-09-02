@@ -276,12 +276,18 @@ if [ -z "$BROKER_IP" ]; then
   echo "boxedai: could not resolve broker host {{.BrokerHost}}" >&2
   exit 1
 fi
+CHATGPT_IP=$(getent hosts chatgpt.com | awk '{print $1}' | head -n1)
+if [ -z "$CHATGPT_IP" ]; then
+  echo "boxedai: could not resolve chatgpt.com" >&2
+  exit 1
+fi
 # The golden image carries the bake boot's hostname in /etc/hosts, so this VM's own
 # name resolves nowhere. sudo looks its host name up on every single invocation, and
 # once resolved is stopped and the ruleset below drops DNS that lookup can only time
 # out: "sudo: unable to resolve host lima-bx-..." on every sudo and systemd-run,
 # including the teardown ones racing the kill-switch grace. Pin it locally.
 printf '127.0.1.1 %s\n' "$(hostname)" >> /etc/hosts
+printf '%s chatgpt.com\n' "$CHATGPT_IP" >> /etc/hosts
 # Pin resolv.conf directly at the upstream nameserver and disable the
 # systemd-resolved stub. Otherwise the workload's DNS goes to 127.0.0.53
 # (loopback, allowed) and systemd-resolved makes the real upstream query under
@@ -306,6 +312,10 @@ table inet boxedai {
     oif lo accept
     ct state established,related accept
     ip daddr ${BROKER_IP} tcp dport {{.BrokerPort}} accept
+    # ChatGPT-mode Codex uses the provider's HTTPS/WebSocket endpoint directly.
+    # Pin the resolved address above, permit only 443, and let every other
+    # destination fall through to the workload-scoped log+drop rule.
+    ip daddr ${CHATGPT_IP} tcp dport 443 accept
     # The workload's own DNS to the configured upstream resolver (${UPSTREAM_DNS})
     # is a dead path — there is no DNS egress by design, so the harness tooling
     # retries it constantly. Drop it silently (like the daemon noise below) so it
@@ -386,6 +396,11 @@ type provisionData struct {
 	// TetragonExecStart re-pins the baked unit's command line for this session
 	// (see tetragonExecStart).
 	TetragonExecStart string
+	ClaudeNativeArch  string
+	ExtraCAPEM        string
+	HasExtraCA        bool
+	NPMRegistry       string
+	HasNPMRegistry    bool
 }
 
 // bakeProvisionData is the template data for bake provisioning (see
@@ -446,11 +461,10 @@ func claudeNativePackageArch(goArch string) (string, error) {
 	}
 }
 
-// provisionScripts renders the session-only provisioning steps (idempotent
-// user guard, guest agent fetch + config, nftables ruleset, guest agent
-// enable) as Lima "system" mode provision entries. It never runs apt-get or
-// npm: those packages and CLIs are already present in the golden image
-// cfg.ImagePath boots from (see bakeProvisionScripts).
+// provisionScripts renders all session provisioning steps. Each disposable VM
+// starts from the official Ubuntu image, installs runtime dependencies and
+// harness CLIs, installs the guest sensors, and then applies the network
+// lockdown before the workload starts.
 func provisionScripts(cfg Config) ([]limaProvision, error) {
 	agentCfg := guestAgentConfig{
 		SessionID:       cfg.SessionID,
@@ -477,9 +491,16 @@ func provisionScripts(cfg Config) ([]limaProvision, error) {
 		TetragonLog:       guestTetragonLog,
 		TetragonExecStart: tetragonExecStart,
 	}
+	data.ClaudeNativeArch, err = claudeNativePackageArch(cfg.Arch)
+	if err != nil {
+		return nil, err
+	}
 
 	steps := []*template.Template{
 		stepCreateUserTmpl,
+		stepBakeRuntimeDepsTmpl,
+		stepBakeTetragonTmpl,
+		stepBakePackagesTmpl,
 		stepGuestAgentTmpl,
 		stepNftablesRulesetTmpl,
 		stepEnableAgentTmpl,

@@ -108,6 +108,9 @@ type Config struct {
 	// ClaudeTelemetryDir, when non-empty, receives authenticated OTLP
 	// HTTP/JSON logs, metrics, and traces from Claude Code.
 	ClaudeTelemetryDir string
+	// CodexTelemetryDir, when non-empty, receives the corresponding Codex OTLP
+	// exports. It is separate from both the guest-writable CODEX_HOME and Claude.
+	CodexTelemetryDir string
 
 	// Tools maps internal read tool -> op -> argv template ({{name}} placeholders).
 	Tools map[string]map[string][]string
@@ -167,6 +170,9 @@ func New(cfg Config) (*Broker, error) {
 	}
 	b.runGitHubSSH = runGitHubSSH
 	if err := prepareClaudeTelemetry(cfg.ClaudeTelemetryDir); err != nil {
+		return nil, err
+	}
+	if err := prepareClaudeTelemetry(cfg.CodexTelemetryDir); err != nil {
 		return nil, err
 	}
 	b.srv = &http.Server{Handler: b.routes()}
@@ -247,11 +253,12 @@ func (b *Broker) routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v1/healthz", handleHealthz)
 	mux.HandleFunc("POST /v1/model/anthropic/{path...}", b.auth(true, false, b.serveModel(providerAnthropic, b.anthropicProxy)))
-	mux.HandleFunc("POST /v1/model/openai/{path...}", b.auth(true, false, b.serveModel(providerOpenAI, b.openaiProxy)))
+	mux.HandleFunc("POST /v1/model/openai/{path...}", b.modelAuth(providerOpenAI, b.serveModel(providerOpenAI, b.openaiProxy)))
 	mux.HandleFunc("POST /v1/tools/{tool}/{op}", b.auth(true, false, b.handleTool))
 	mux.HandleFunc("POST /v1/effects/{adapter}/{op}", b.auth(true, false, b.handleEffect))
 	mux.HandleFunc("POST /v1/git/{service}", enableGitFullDuplex(b.auth(true, false, b.handleGitBridge)))
 	mux.HandleFunc("POST /v1/telemetry/claude/{signal}", b.auth(true, false, b.handleClaudeTelemetry))
+	mux.HandleFunc("POST /v1/telemetry/codex/{signal}", b.auth(true, false, b.handleCodexTelemetry))
 	mux.HandleFunc("POST /v1/events", b.auth(true, true, b.handleEvents))
 	mux.HandleFunc("GET /v1/guest/agent-binary", b.auth(false, true, b.handleAgentBinary))
 	return mux

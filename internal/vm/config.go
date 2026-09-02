@@ -30,6 +30,9 @@ type Config struct {
 	BrokerPort int
 	// WorkloadToken (W) is injected into the harness environment.
 	WorkloadToken string
+	// CodexAuthJSON is the host's Codex login state for ChatGPT-mode sessions.
+	// It is copied into the session-scoped CODEX_HOME only when supplied.
+	CodexAuthJSON string
 	// GitHubRepository is the single owner/name repository the host broker
 	// exposes through its Git SSH bridge. Empty disables guest GitHub access.
 	GitHubRepository string
@@ -51,14 +54,12 @@ type Config struct {
 	HarnessArgs []string
 	// Limits are the systemd-run resource properties for the harness unit.
 	Limits policy.Limits
-	// ImagePath is the host filesystem path to the pre-baked golden Lima disk
-	// image (see internal/image), used as the Lima `images:` location instead
-	// of downloading the stock Ubuntu cloud image on every session boot.
-	ImagePath string
 	// Arch is the host's GOARCH ("arm64" or "amd64"); it selects the Lima
 	// arch string and the guest-agent binary the broker serves during
 	// provisioning.
 	Arch string
+	// ImagePath is the verified golden disk image used by the session VM.
+	ImagePath string
 }
 
 // BakeConfig is everything GenerateBakeLimaYAML and bakeProvisionScripts need

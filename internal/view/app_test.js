@@ -81,6 +81,37 @@ function event(seq, body) {
   };
 }
 
+test("Codex canonical hook events populate generic Agent list, log, and graph groups", function () {
+  const loaded = loadClient();
+  const events = [
+    { seq: 1, name: "agent.started", producer: "controller", attrs: { "agent.id": "primary", "agent.role": "primary", "agent.harness": "codex", "agent.attribution.strength": "strong" } },
+    { seq: 2, name: "agent.started", producer: "workload", attrs: { "agent.id": "child", "agent.role": "child", "agent.parent.id": "primary", "agent.type": "explore", "agent.harness": "codex", "agent.attribution.strength": "self_reported" } },
+    { seq: 3, name: "tool.requested", producer: "workload", body: "bash: rg hooks", attrs: { "agent.id": "primary", "tool.name": "shell", "harness.tool.input": '{"command":"rg hooks"}' } },
+    { seq: 4, name: "tool.requested", producer: "workload", body: "bash: apply patch", attrs: { "agent.id": "child", "tool.name": "apply_patch", "harness.tool.input": '{"command":"*** Begin Patch"}' } },
+    { seq: 5, name: "tool.completed", producer: "workload", attrs: { "agent.id": "child", "tool.name": "spawn_agent", "agent.spawned.id": "grandchild" } },
+    { seq: 6, name: "agent.completed", producer: "workload", attrs: { "agent.id": "child", "agent.outcome": "success" } },
+  ];
+  const model = { events: events, tsLabel: events.map(function () { return "12:00"; }) };
+  const ctx = { model: model, payload: { state: "running", events: events }, state: loaded.client.defaultState() };
+  const indices = loaded.client.toolRequestedIndices(model);
+  assert.deepEqual(plain(indices), [2, 3]);
+  assert.equal(loaded.client.tabCounts(ctx.payload).agents, 2);
+  const info = loaded.client.computeAgentGroups(ctx, indices, true);
+  assert.equal(info.agentCount, 2);
+  assert.deepEqual(Array.from(info.meta.keys()), ["primary", "child"]);
+  assert.equal(info.meta.get("child").completed, true);
+  assert.equal(info.meta.get("child").type, "explore");
+  assert.deepEqual(plain(info.agentGroups.map(function (entry) { return [entry.group.key, entry.depth, entry.group.members]; })), [["primary", 0, [2]], ["child", 1, [3]]]);
+  const primaryBlock = loaded.client.agentBlockHtml(ctx, info.agentGroups[0].group, info.meta, 0, info.sessionEnded);
+  const childBlock = loaded.client.agentBlockHtml(ctx, info.agentGroups[1].group, info.meta, 1, info.sessionEnded);
+  assert.match(primaryBlock, /shell/);
+  assert.match(primaryBlock, /rg hooks/);
+  assert.match(childBlock, /apply_patch/);
+  assert.match(childBlock, /Child Agent 1 · explore/);
+  // The same precomputed groups are the Agent graph renderer's contract.
+  assert.deepEqual(plain(info.agentGroups.map(function (entry) { return entry.group.key; })), ["primary", "child"]);
+});
+
 test("event source owner fences superseded callbacks and closes every source", function () {
   const loaded = loadClient();
   const states = [];

@@ -13,6 +13,7 @@ const (
 	authNone authKind = iota
 	authWorkload
 	authSupervisor
+	authOpenAI
 )
 
 // authenticate resolves the presented bearer to a token identity, or authNone if the
@@ -30,8 +31,22 @@ func (b *Broker) authenticate(r *http.Request) authKind {
 		return authWorkload
 	case tokenMatch(tok, b.supervisorToken):
 		return authSupervisor
+	case b.cfg.OpenAI.ChatGPTAccountID != "" && tokenMatch(tok, b.cfg.OpenAI.Key):
+		return authOpenAI
 	default:
 		return authNone
+	}
+}
+
+func (b *Broker) modelAuth(provider string, h func(http.ResponseWriter, *http.Request, authKind)) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		kind := b.authenticate(r)
+		if kind != authWorkload && !(provider == providerOpenAI && kind == authOpenAI) {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			writeErr(w, http.StatusUnauthorized, "unauthorized")
+			return
+		}
+		h(w, r, kind)
 	}
 }
 

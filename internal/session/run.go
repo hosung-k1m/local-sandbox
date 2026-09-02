@@ -35,6 +35,7 @@ const (
 	workspaceDirName       = "workspace"
 	workspaceOrigDirName   = "workspace.orig"
 	claudeTelemetryDirName = "claude-telemetry"
+	codexTelemetryDirName  = "codex-telemetry"
 )
 
 const (
@@ -220,7 +221,6 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err != nil {
 		return Result{}, fmt.Errorf("session: resolve golden image: %w", err)
 	}
-
 	// --- Create the session directory and record the resolved policy. ---
 	now := time.Now()
 	sessionID, err := newSessionID(now)
@@ -530,6 +530,16 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 	if err != nil {
 		return result, err
 	}
+	var codexAuthJSON string
+	if opts.Harness == "codex" && openaiUpstream.ChatGPTAccountID != "" {
+		codexAuthJSON, err = loadCodexAuthJSON()
+		if err != nil {
+			return result, err
+		}
+		if codexAuthJSON == "" {
+			return result, errors.New("session: ChatGPT Codex login is missing a usable access token and account id")
+		}
+	}
 	var githubConfig broker.GitHubConfig
 	var githubRemote string
 	if opts.Harness == "claude" || opts.Harness == "codex" {
@@ -559,6 +569,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		OpenAI:             openaiUpstream,
 		GitHub:             githubConfig,
 		ClaudeTelemetryDir: claudeTelemetryDir(sessionDir, opts.Harness),
+		CodexTelemetryDir:  codexTelemetryDir(sessionDir, opts.Harness),
 		Tools:              hc.Tools,
 		Effects:            hc.Effects,
 		Approver:           approver,
@@ -590,6 +601,7 @@ func (r *Runner) Run(ctx context.Context, opts RunOptions) (result Result, runEr
 		BrokerHost:       brokerHost,
 		BrokerPort:       port,
 		WorkloadToken:    br.WorkloadToken(),
+		CodexAuthJSON:    codexAuthJSON,
 		SupervisorToken:  br.SupervisorToken(),
 		GitHubRepository: githubConfig.Repository,
 		GitHubSSHURL:     githubConfig.SSHURL,
@@ -657,6 +669,13 @@ func claudeTelemetryDir(sessionDir, harness string) string {
 		return ""
 	}
 	return filepath.Join(sessionDir, claudeTelemetryDirName)
+}
+
+func codexTelemetryDir(sessionDir, harness string) string {
+	if harness != "codex" {
+		return ""
+	}
+	return filepath.Join(sessionDir, codexTelemetryDirName)
 }
 
 // sessionGrant is the session.json grant written before VM boot (DESIGN.md

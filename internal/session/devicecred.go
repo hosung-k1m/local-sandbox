@@ -166,6 +166,30 @@ func resolveOpenAIDeviceCredential() (codexDeviceCredential, error) {
 	return codexDeviceCredential{}, nil
 }
 
+// loadCodexAuthJSON returns the host Codex login file for the guest's
+// session-scoped CODEX_HOME. The file is never logged.
+func loadCodexAuthJSON() (string, error) {
+	path, err := codexAuthPath()
+	if err != nil {
+		return "", err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("session: read codex auth.json: %w", err)
+	}
+	var auth codexAuthFile
+	if err := json.Unmarshal(b, &auth); err != nil {
+		return "", fmt.Errorf("session: parse codex auth.json: %w", err)
+	}
+	if auth.Tokens.AccessToken == "" || auth.Tokens.AccountID == "" {
+		return "", nil
+	}
+	return string(b), nil
+}
+
 // resolveUpstreams builds the two model upstreams Run hands to the broker:
 // explicit host config/env credentials first (ProviderConfig.resolveKey), falling
 // back to the host's device logins (Claude Code Keychain / CLAUDE_CODE_OAUTH_TOKEN;

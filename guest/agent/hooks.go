@@ -35,13 +35,13 @@ const (
 	attrHarnessHookEvent      = "harness.hook_event_name"
 )
 
-// Claude Code hook_event_name values the agenthook dispatches on.
+// Hook lifecycle values shared by Claude Code and Codex.
 const (
 	hookSubagentStart = "SubagentStart"
 	hookSubagentStop  = "SubagentStop"
 )
 
-// hookInput is the JSON Claude Code writes to a hook's stdin. Only the fields
+// hookInput is the JSON a supported harness writes to a hook's stdin. Only the fields
 // BoxedAi records are declared here; encoding/json ignores the rest, and every
 // field is itself optional so a harness version skew never breaks capture.
 // ToolResponse is only ever populated on PostToolUse (righthook); AgentID/
@@ -90,7 +90,7 @@ func runHook(mode string, stdin io.Reader) int {
 		return 0
 	}
 
-	ev := newHookEvent(mode == "righthook", in, os.Getenv(sessionIDEnv), os.Getenv(agentIDEnv))
+	ev := newHookEvent(mode == "righthook", in, os.Getenv(sessionIDEnv), os.Getenv(agentIDEnv), hookHarness())
 	if err := NewEventClient(brokerURL, token).Submit([]evidence.Event{ev}); err != nil {
 		fmt.Fprintf(os.Stderr, "agent: %s: submit event: %v\n", mode, err)
 		return 0
@@ -127,7 +127,7 @@ func runAgentHook(stdin io.Reader) int {
 		return 0
 	}
 
-	ev, ok := newAgentEvent(in, os.Getenv(sessionIDEnv), os.Getenv(agentIDEnv))
+	ev, ok := newAgentEvent(in, os.Getenv(sessionIDEnv), os.Getenv(agentIDEnv), hookHarness())
 	if !ok {
 		fmt.Fprintf(os.Stderr, "agent: agenthook: unhandled hook_event_name %q; skipping\n", in.HookEventName)
 		return 0
@@ -147,7 +147,7 @@ func runAgentHook(stdin io.Reader) int {
 // BoxedAi id from its harness-native agent_id; primaryID is the
 // controller-minted Primary Agent id (BOXEDAI_AGENT_ID) that owns the harness
 // main loop.
-func newHookEvent(completed bool, in hookInput, bxSessionID, primaryID string) evidence.Event {
+func newHookEvent(completed bool, in hookInput, bxSessionID, primaryID, harness string) evidence.Event {
 	name := evidence.EventToolRequested
 	if completed {
 		name = evidence.EventToolCompleted
@@ -242,7 +242,7 @@ func newHookEvent(completed bool, in hookInput, bxSessionID, primaryID string) e
 // Primary — a documented self_reported limitation). The event is class
 // harness_observed on the workload channel, so the recorder stamps
 // native_harness/self_reported; nothing here can present as controller/strong.
-func newAgentEvent(in hookInput, bxSessionID, primaryID string) (evidence.Event, bool) {
+func newAgentEvent(in hookInput, bxSessionID, primaryID, harness string) (evidence.Event, bool) {
 	childID := evidence.ChildAgentID(bxSessionID, in.AgentID)
 	switch in.HookEventName {
 	case hookSubagentStart:
@@ -251,7 +251,7 @@ func newAgentEvent(in hookInput, bxSessionID, primaryID string) (evidence.Event,
 			evidence.AttrAgentNativeID: in.AgentID,
 			evidence.AttrAgentParentID: primaryID,
 			evidence.AttrAgentRole:     string(evidence.AgentRoleChild),
-			evidence.AttrAgentHarness:  "claude",
+			evidence.AttrAgentHarness:  harness,
 		}
 		if in.AgentType != "" {
 			attrs[evidence.AttrAgentType] = in.AgentType
@@ -316,7 +316,7 @@ func addCommonHookAttrs(attrs map[string]any, in hookInput) {
 // DESIGN.md), a Task spawn shows the description the harness wrote for it;
 // every other tool gets a generic summary naming the tool.
 func hookBody(completed bool, toolName string, toolInput json.RawMessage) string {
-	if toolName == "Bash" {
+	if isCommandTool(toolName) {
 		if cmd, ok := bashCommand(toolInput); ok {
 			return "bash: " + truncateRunes(cmd, maxBashCommandChars)
 		}
@@ -347,10 +347,8 @@ func bashCommand(toolInput json.RawMessage) (string, bool) {
 	return *decoded.Command, true
 }
 
-// taskSpawn extracts the spawn tool's narration — the short description the
-// harness wrote for the subagent and the subagent type it asked for. Claude Code
-// names that tool "Task" in some versions and "Agent" in others, and both are in
-// the wild, so both are accepted. Any other tool, malformed tool_input, or absent
+// taskSpawn extracts the spawn tool's narration. Claude names its tool Task/Agent;
+// Codex names it spawn_agent and supplies task_name/message instead. Any other tool, malformed input, or absent
 // fields yields empty strings, which callers skip silently (hooks fail open, so
 // a harness shape change drops the attribute rather than the event).
 func taskSpawn(toolName string, toolInput json.RawMessage) (description, subagentType string) {
@@ -360,9 +358,21 @@ func taskSpawn(toolName string, toolInput json.RawMessage) (description, subagen
 	var decoded struct {
 		Description  string `json:"description"`
 		SubagentType string `json:"subagent_type"`
+		AgentType    string `json:"agent_type"`
+		TaskName     string `json:"task_name"`
+		Message      string `json:"message"`
 	}
 	if err := json.Unmarshal(toolInput, &decoded); err != nil {
 		return "", ""
+	}
+	if decoded.Description == "" {
+		decoded.Description = decoded.Message
+	}
+	if decoded.Description == "" {
+		decoded.Description = decoded.TaskName
+	}
+	if decoded.SubagentType == "" {
+		decoded.SubagentType = decoded.AgentType
 	}
 	return decoded.Description, decoded.SubagentType
 }
@@ -379,19 +389,48 @@ func spawnedAgentID(toolName string, toolResponse json.RawMessage) string {
 	if !isSpawnTool(toolName) || len(toolResponse) == 0 {
 		return ""
 	}
-	var decoded struct {
-		AgentID string `json:"agentId"`
-	}
+	var decoded any
 	if err := json.Unmarshal(toolResponse, &decoded); err != nil {
 		return ""
 	}
-	return truncateRunes(decoded.AgentID, maxHookFieldChars)
+	// Codex v1 places its result object in a JSON string. Unwrap once; v2's
+	// string only includes task_name, which is intentionally not an agent id.
+	if encoded, ok := decoded.(string); ok {
+		if err := json.Unmarshal([]byte(encoded), &decoded); err != nil {
+			return ""
+		}
+	}
+	object, ok := decoded.(map[string]any)
+	if !ok {
+		return ""
+	}
+	// Codex hook payload versions have used snake_case ids; accept the
+	// documented and common result shapes without claiming an edge when absent.
+	for _, key := range []string{"agentId", "agent_id"} {
+		if id, ok := object[key].(string); ok {
+			return truncateRunes(id, maxHookFieldChars)
+		}
+	}
+	return ""
 }
 
-// isSpawnTool reports whether toolName is Claude Code's subagent-spawning tool.
-// The CLI has shipped it under both names, so a recording can carry either.
+// isSpawnTool reports whether toolName is a supported harness subagent-spawning
+// tool. Claude has shipped both Task and Agent; Codex uses spawn_agent.
 func isSpawnTool(toolName string) bool {
-	return toolName == "Task" || toolName == "Agent"
+	return toolName == "Task" || toolName == "Agent" || toolName == "spawn_agent"
+}
+
+func isCommandTool(toolName string) bool {
+	return toolName == "Bash" || toolName == "apply_patch" || toolName == "shell" || toolName == "exec_command"
+}
+
+// hookHarness gives legacy/unset environments Claude behavior while every
+// BoxedAi Codex launch explicitly sets BOXEDAI_HARNESS=codex.
+func hookHarness() string {
+	if harness := os.Getenv("BOXEDAI_HARNESS"); harness == "codex" {
+		return harness
+	}
+	return "claude"
 }
 
 // truncateRunes caps s at max runes (not bytes) so a multi-byte UTF-8
@@ -429,11 +468,14 @@ func toolResponseFailed(toolResponse json.RawMessage) bool {
 		return false
 	}
 	var decoded struct {
-		IsError     bool `json:"is_error"`
-		Interrupted bool `json:"interrupted"`
+		IsError     bool   `json:"is_error"`
+		Interrupted bool   `json:"interrupted"`
+		Error       string `json:"error"`
+		Success     *bool  `json:"success"`
+		Status      string `json:"status"`
 	}
 	if err := json.Unmarshal(toolResponse, &decoded); err != nil {
 		return false
 	}
-	return decoded.IsError || decoded.Interrupted
+	return decoded.IsError || decoded.Interrupted || decoded.Error != "" || (decoded.Success != nil && !*decoded.Success) || decoded.Status == "failed" || decoded.Status == "error"
 }

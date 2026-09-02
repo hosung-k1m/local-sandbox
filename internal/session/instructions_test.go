@@ -76,11 +76,7 @@ func TestStageHarnessInstructionsRejectsSymlink(t *testing.T) {
 	}
 }
 
-// TestStageHarnessInstructionsCodexStagesNoSettingsJSON is the regression
-// guard for hook capture being Claude-only (DESIGN.md "Harness hook capture
-// — lefthook / righthook": codex/exec have no hook mechanism in v0.1): codex
-// staging must never write a settings.json, BoxedAi-authored or otherwise.
-func TestStageHarnessInstructionsCodexStagesNoSettingsJSON(t *testing.T) {
+func TestStageHarnessInstructionsCodexStagesHooksJSON(t *testing.T) {
 	home := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(home, ".codex"), 0o700); err != nil {
 		t.Fatal(err)
@@ -95,6 +91,16 @@ func TestStageHarnessInstructionsCodexStagesNoSettingsJSON(t *testing.T) {
 		t.Fatalf("stageHarnessInstructions: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(destination, "settings.json")); !os.IsNotExist(err) {
-		t.Errorf("codex staging must not produce settings.json, stat error = %v", err)
+		t.Errorf("codex staging must not produce Claude settings.json, stat error = %v", err)
+	}
+	hooks, err := os.ReadFile(filepath.Join(destination, codexHooksFileName))
+	if err != nil {
+		t.Fatalf("read staged hooks.json: %v", err)
+	}
+	if string(hooks) != codexHooksJSON {
+		t.Errorf("hooks.json = %s, want BoxedAi-authored Codex hook config", hooks)
+	}
+	if info, err := os.Stat(filepath.Join(destination, codexHooksFileName)); err != nil || info.Mode().Perm() != 0o600 {
+		t.Errorf("hooks.json mode/stat = %v/%v, want 600", info, err)
 	}
 }

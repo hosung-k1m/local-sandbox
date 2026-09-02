@@ -109,7 +109,9 @@ func (vm *VM) harnessArgv(interactive bool) ([]string, error) {
 		argv = append(argv, guestClaudeExecutable, "--debug-file", guestClaudeDebugFile)
 		argv = append(argv, cfg.HarnessArgs...)
 	case "codex":
-		argv = append(argv, "codex")
+		// BoxedAi stages the complete hooks.json in an already isolated VM.
+		// Bypass Codex's interactive trust confirmation so hooks actually run.
+		argv = append(argv, "codex", "--dangerously-bypass-hook-trust")
 		argv = append(argv, cfg.HarnessArgs...)
 	case "exec":
 		argv = append(argv, "sh", "-lc", cfg.Cmd)
@@ -173,11 +175,24 @@ func harnessEnv(cfg Config) ([]string, error) {
 	case "codex":
 		env := []string{
 			"OPENAI_BASE_URL=" + base + "/v1/model/openai",
-			"OPENAI_API_KEY=" + cfg.WorkloadToken,
 			"CODEX_HOME=" + guestCodexConfigDir,
-			// The git bridge reads this pair (codex has no capture hooks in v0.1).
+			// Hooks and the git bridge use this workload-authenticated channel.
 			"BOXEDAI_BROKER_URL=" + base,
 			"BOXEDAI_WORKLOAD_TOKEN=" + cfg.WorkloadToken,
+			"BOXEDAI_HARNESS=codex",
+			"BOXEDAI_SESSION_ID=" + cfg.SessionID,
+			"BOXEDAI_AGENT_ID=" + cfg.AgentID,
+			"OTEL_METRICS_EXPORTER=otlp",
+			"OTEL_LOGS_EXPORTER=otlp",
+			"OTEL_TRACES_EXPORTER=otlp",
+			"OTEL_EXPORTER_OTLP_PROTOCOL=http/json",
+			"OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=" + base + "/v1/telemetry/codex/metrics",
+			"OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=" + base + "/v1/telemetry/codex/logs",
+			"OTEL_EXPORTER_OTLP_TRACES_ENDPOINT=" + base + "/v1/telemetry/codex/traces",
+			"OTEL_EXPORTER_OTLP_HEADERS=Authorization=Bearer " + cfg.WorkloadToken,
+		}
+		if cfg.CodexAuthJSON == "" {
+			env = append(env, "OPENAI_API_KEY="+cfg.WorkloadToken)
 		}
 		githubEnv, err := githubHarnessEnv(cfg)
 		if err != nil {

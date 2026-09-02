@@ -57,8 +57,7 @@ func newRootCmd() *cobra.Command {
 		Use:   "boxedai",
 		Short: "Launch AI coding agents in a sandboxed VM with verifiable audit evidence",
 		Long: "BoxedAi runs Claude Code or Codex inside a disposable Lima Linux VM and " +
-			"produces independently verifiable, human-readable audit evidence.\n\n" +
-			"Run `boxedai build-image` once (or after upgrading) before `run` will work.",
+			"produces independently verifiable, human-readable audit evidence.",
 		// Runtime errors are rendered by Execute; suppress cobra's own error and
 		// usage dump so a failed command does not print usage on every error.
 		SilenceUsage:  true,
@@ -79,8 +78,8 @@ func newRootCmd() *cobra.Command {
 	root.AddCommand(
 		newSetupCmd(),
 		newDoctorCmd(),
-		newRunCmd(),
 		newBuildImageCmd(),
+		newRunCmd(),
 		newSessionsCmd(),
 		newViewCmd(),
 		newDiffCmd(),

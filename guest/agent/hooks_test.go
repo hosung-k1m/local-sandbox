@@ -458,6 +458,73 @@ func TestRunAgentHook_SubagentStopClosesChild(t *testing.T) {
 	}
 }
 
+// TestRunHook_CodexCanonicalEvents exercises the exact Codex names and result
+// shape through the shared event path used by the Agent tab.
+func TestRunHook_CodexCanonicalEvents(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv("BOXEDAI_HARNESS", "codex")
+	t.Setenv(sessionIDEnv, "bx-codex")
+	t.Setenv(agentIDEnv, "ag-primary")
+	fixture := `{"tool_name":"spawn_agent","tool_input":{"message":"inspect hooks","agent_type":"explore"},"tool_response":"{\"agent_id\":\"child-1\",\"nickname\":\"Scout\"}","tool_use_id":"spawn-1"}`
+	if got := runHook("righthook", strings.NewReader(fixture)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	ev := capture.req.Events[0]
+	for k, want := range map[string]any{
+		evidence.AttrHarnessTaskDescription:  "inspect hooks",
+		evidence.AttrHarnessTaskSubagentType: "explore",
+		evidence.AttrAgentSpawnedNativeID:    "child-1",
+		evidence.AttrAgentSpawnedID:          evidence.ChildAgentID("bx-codex", "child-1"),
+	} {
+		if got := ev.Attrs[k]; got != want {
+			t.Errorf("Attrs[%q] = %v, want %v", k, got, want)
+		}
+	}
+	if ev.Body != "task: inspect hooks" {
+		t.Errorf("Body = %q, want task narration", ev.Body)
+	}
+}
+
+func TestRunHook_CodexV2SpawnDoesNotInventChildID(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv("BOXEDAI_HARNESS", "codex")
+	t.Setenv(sessionIDEnv, "bx-codex")
+	fixture := `{"tool_name":"spawn_agent","tool_input":{"message":"inspect hooks","task_name":"exploration"},"tool_response":"{\"task_name\":\"exploration\"}","tool_use_id":"spawn-2"}`
+	if got := runHook("righthook", strings.NewReader(fixture)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	ev := capture.req.Events[0]
+	if _, ok := ev.Attrs[evidence.AttrAgentSpawnedID]; ok {
+		t.Errorf("agent.spawned.id = %v, want absent for Codex v2 task_name-only response", ev.Attrs[evidence.AttrAgentSpawnedID])
+	}
+	if got := ev.Attrs[evidence.AttrHarnessTaskSubagentType]; got != nil {
+		t.Errorf("task subagent type = %v, want absent: task_name is not an agent type", got)
+	}
+}
+
+func TestRunHook_CodexApplyPatchAndLifecycle(t *testing.T) {
+	capture := hookEventServer(t)
+	t.Setenv("BOXEDAI_HARNESS", "codex")
+	t.Setenv(sessionIDEnv, "bx-codex")
+	t.Setenv(agentIDEnv, "ag-primary")
+	if got := runHook("lefthook", strings.NewReader(`{"tool_name":"apply_patch","tool_input":{"command":"*** Begin Patch"},"tool_use_id":"patch-1"}`)); got != 0 {
+		t.Fatalf("runHook = %d, want 0", got)
+	}
+	if body := capture.req.Events[0].Body; body != "bash: *** Begin Patch" {
+		t.Errorf("apply_patch body = %q", body)
+	}
+	capture = hookEventServer(t)
+	t.Setenv("BOXEDAI_HARNESS", "codex")
+	t.Setenv(sessionIDEnv, "bx-codex")
+	t.Setenv(agentIDEnv, "ag-primary")
+	if got := runAgentHook(strings.NewReader(`{"hook_event_name":"SubagentStart","agent_id":"child-1","agent_type":"explore"}`)); got != 0 {
+		t.Fatalf("runAgentHook = %d, want 0", got)
+	}
+	if got := capture.req.Events[0].Attrs[evidence.AttrAgentHarness]; got != "codex" {
+		t.Errorf("agent.harness = %v, want codex", got)
+	}
+}
+
 // TestRunAgentHook_IgnoresUnhandled asserts an agenthook with no agent_id or an
 // unrecognized hook_event_name submits nothing and still exits 0 (fail open).
 func TestRunAgentHook_IgnoresUnhandled(t *testing.T) {

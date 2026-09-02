@@ -11,7 +11,7 @@ import (
 )
 
 // defaultLimactl is used when VM.Binary is unset.
-const defaultLimactl = "./bin/limactl"
+const defaultLimactl = "limactl"
 
 const guestProcessSensorReadyPath = "/run/boxedai/process-sensor-ready"
 
